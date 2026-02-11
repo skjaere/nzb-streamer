@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/checkout@v4
+        with:
+          repository: skjaere/kotlin-compression-utils
+          path: ../kotlin-compression-utils
+
+      - uses: actions/checkout@v4
+        with:
+          repository: skjaere/ktor-nntp-client
+          path: ../ktor-usenet-client
+
+      - uses: actions/checkout@v4
+        with:
+          repository: skjaere/mock-nntp-server
+          path: ../mock-nntp-server
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '25'
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - run: ./gradlew build koverXmlReport
+
+      - uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: build/reports/kover/report.xml
