@@ -12,27 +12,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/checkout@v4
-        with:
-          repository: skjaere/kotlin-compression-utils
-          path: ../kotlin-compression-utils
-
-      - uses: actions/checkout@v4
-        with:
-          repository: skjaere/ktor-nntp-client
-          path: ../ktor-usenet-client
-
-      - uses: actions/checkout@v4
-        with:
-          repository: skjaere/mock-nntp-server
-          path: ../mock-nntp-server
-
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '25'
 
       - uses: gradle/actions/setup-gradle@v4
+
+      - name: Remove composite builds (resolved from JitPack in CI)
+        run: sed -i '/includeBuild/d' settings.gradle.kts
 
       - run: ./gradlew build koverXmlReport
 
