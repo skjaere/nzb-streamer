@@ -22,7 +22,7 @@ java {
 
 dependencies {
     api("io.skjaere:ktor-nntp-client:v0.1.2")
-    api("io.skjaere:kotlin-compression-utils:v0.0.2")
+    api("io.skjaere:kotlin-compression-utils:v0.1.0")
     implementation(libs.kotlinx.coroutines.core)
     implementation(libs.kotlinx.serialization.json)
     implementation(libs.slf4j.api)
