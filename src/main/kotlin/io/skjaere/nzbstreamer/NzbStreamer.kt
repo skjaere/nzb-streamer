@@ -12,6 +12,7 @@ import io.skjaere.nzbstreamer.queue.SegmentQueueService
 import io.skjaere.nzbstreamer.stream.ArchiveStreamingService
 import io.skjaere.nzbstreamer.stream.FileResolveResult
 import io.skjaere.nzbstreamer.stream.NntpStreamingService
+import io.skjaere.nzbstreamer.stream.StreamableFile
 import kotlinx.coroutines.runBlocking
 import java.io.Closeable
 
@@ -50,6 +51,27 @@ class NzbStreamer private constructor(
         range: LongRange? = null
     ): WriterJob {
         return archiveStreamingService.launchStreamFile(metadata.orderedArchiveNzb, splits, range)
+    }
+
+    fun resolveStreamableFiles(metadata: ExtractedMetadata): List<StreamableFile> {
+        return archiveStreamingService.resolveStreamableFiles(metadata.entries, metadata.orderedArchiveNzb)
+    }
+
+    suspend fun streamFile(
+        metadata: ExtractedMetadata,
+        file: StreamableFile,
+        range: LongRange? = null,
+        consume: suspend (ByteReadChannel) -> Unit
+    ) {
+        archiveStreamingService.streamFile(metadata.orderedArchiveNzb, file, range, consume)
+    }
+
+    fun launchStreamFile(
+        metadata: ExtractedMetadata,
+        file: StreamableFile,
+        range: LongRange? = null
+    ): WriterJob {
+        return archiveStreamingService.launchStreamFile(metadata.orderedArchiveNzb, file, range)
     }
 
     suspend fun streamVolume(
