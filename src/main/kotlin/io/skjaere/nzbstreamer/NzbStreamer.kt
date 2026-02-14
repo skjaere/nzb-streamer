@@ -45,7 +45,7 @@ class NzbStreamer private constructor(
     ) {
         val file = metadata.orderedArchiveNzb.files[volumeIndex]
         val queue = SegmentQueueService.createFileQueue(file, volumeIndex, 0L)
-        streamingService.streamSegments(queue, consume)
+        streamingService.streamSegments(queue, consume = consume)
     }
 
     override fun close() {
@@ -59,6 +59,7 @@ class NzbStreamer private constructor(
         var password: String = ""
         var useTls: Boolean = true
         var concurrency: Int = 4
+        var readAheadSegments: Int? = null
     }
 
     class SeekBuilder {
@@ -85,7 +86,8 @@ class NzbStreamer private constructor(
                 username = nb.username,
                 password = nb.password,
                 useTls = nb.useTls,
-                concurrency = nb.concurrency
+                concurrency = nb.concurrency,
+                readAheadSegments = nb.readAheadSegments ?: nb.concurrency
             )
             val seekConfig = SeekConfig(forwardThresholdBytes = seekBuilder.forwardThresholdBytes)
             val streamingService = NntpStreamingService(nntpConfig)
