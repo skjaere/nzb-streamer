@@ -98,7 +98,7 @@ class ArchiveStreamingService(
                 ).collect { emit(it) }
             }
         }
-        streamingService.streamSegments(combinedQueue, consume)
+        streamingService.streamSegments(combinedQueue, consume = consume)
     }
 
     companion object {
