@@ -72,11 +72,10 @@ class NzbEnrichmentService(
 
     private suspend fun downloadPar2(file: NzbFile) {
         logger.info("Downloading PAR2 file: {}", file.yencHeaders?.name)
-        // fileIndex and globalOffset are only metadata on queue items;
-        // they don't affect the actual download behavior, so we pass 0.
         val queue = SegmentQueueService.createFileQueue(file, 0, 0L)
-        val (channel, _) = streamingService.streamSegments(queue)
-        file.par2Data = channel.toByteArray()
+        streamingService.streamSegments(queue) { channel ->
+            file.par2Data = channel.toByteArray()
+        }
         logger.info("Downloaded PAR2 file: {} ({} bytes)", file.yencHeaders?.name, file.par2Data?.size)
     }
 }

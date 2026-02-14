@@ -11,20 +11,13 @@ import io.skjaere.nzbstreamer.queue.SegmentQueueService
 import io.skjaere.nzbstreamer.stream.ArchiveStreamingService
 import io.skjaere.nzbstreamer.stream.FileResolveResult
 import io.skjaere.nzbstreamer.stream.NntpStreamingService
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
-import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.cancel
 import kotlinx.coroutines.runBlocking
 import java.io.Closeable
 
 class NzbStreamer private constructor(
     private val streamingService: NntpStreamingService,
     private val metadataService: ArchiveMetadataService,
-    private val archiveStreamingService: ArchiveStreamingService,
-    private val scope: CoroutineScope,
-    private val ownsScope: Boolean
+    private val archiveStreamingService: ArchiveStreamingService
 ) : Closeable {
 
     suspend fun prepare(nzbBytes: ByteArray): ExtractedMetadata {
@@ -36,32 +29,13 @@ class NzbStreamer private constructor(
         return archiveStreamingService.resolveFile(metadata.entries, metadata.orderedArchiveNzb, path)
     }
 
-    fun streamFile(
-        metadata: ExtractedMetadata,
-        splits: List<SplitInfo>,
-        range: LongRange? = null
-    ): Pair<ByteReadChannel, Job> {
-        return archiveStreamingService.streamFile(metadata.orderedArchiveNzb, splits, range)
-    }
-
     suspend fun streamFile(
         metadata: ExtractedMetadata,
         splits: List<SplitInfo>,
         range: LongRange? = null,
         consume: suspend (ByteReadChannel) -> Unit
     ) {
-        val (channel, job) = streamFile(metadata, splits, range)
-        try {
-            consume(channel)
-        } finally {
-            job.cancel()
-        }
-    }
-
-    fun streamVolume(metadata: ExtractedMetadata, volumeIndex: Int): Pair<ByteReadChannel, Job> {
-        val file = metadata.orderedArchiveNzb.files[volumeIndex]
-        val queue = SegmentQueueService.createFileQueue(file, volumeIndex, 0L)
-        return streamingService.streamSegments(queue)
+        archiveStreamingService.streamFile(metadata.orderedArchiveNzb, splits, range, consume)
     }
 
     suspend fun streamVolume(
@@ -69,19 +43,13 @@ class NzbStreamer private constructor(
         volumeIndex: Int,
         consume: suspend (ByteReadChannel) -> Unit
     ) {
-        val (channel, job) = streamVolume(metadata, volumeIndex)
-        try {
-            consume(channel)
-        } finally {
-            job.cancel()
-        }
+        val file = metadata.orderedArchiveNzb.files[volumeIndex]
+        val queue = SegmentQueueService.createFileQueue(file, volumeIndex, 0L)
+        streamingService.streamSegments(queue, consume)
     }
 
     override fun close() {
         streamingService.close()
-        if (ownsScope) {
-            scope.cancel()
-        }
     }
 
     class NntpBuilder {
@@ -100,7 +68,6 @@ class NzbStreamer private constructor(
     class Builder {
         private var nntpBuilder: NntpBuilder? = null
         private var seekBuilder: SeekBuilder = SeekBuilder()
-        private var scope: CoroutineScope? = null
 
         fun nntp(block: NntpBuilder.() -> Unit) {
             nntpBuilder = NntpBuilder().apply(block)
@@ -108,10 +75,6 @@ class NzbStreamer private constructor(
 
         fun seek(block: SeekBuilder.() -> Unit) {
             seekBuilder = SeekBuilder().apply(block)
-        }
-
-        fun scope(scope: CoroutineScope) {
-            this.scope = scope
         }
 
         fun build(): NzbStreamer {
@@ -125,17 +88,13 @@ class NzbStreamer private constructor(
                 concurrency = nb.concurrency
             )
             val seekConfig = SeekConfig(forwardThresholdBytes = seekBuilder.forwardThresholdBytes)
-
-            val ownsScope = scope == null
-            val effectiveScope = scope ?: CoroutineScope(Dispatchers.IO + SupervisorJob())
-
-            val streamingService = NntpStreamingService(nntpConfig, effectiveScope)
+            val streamingService = NntpStreamingService(nntpConfig)
             runBlocking { streamingService.connect() }
 
             val metadataService = ArchiveMetadataService(streamingService, seekConfig.forwardThresholdBytes)
             val archiveStreamingService = ArchiveStreamingService(streamingService)
 
-            return NzbStreamer(streamingService, metadataService, archiveStreamingService, effectiveScope, ownsScope)
+            return NzbStreamer(streamingService, metadataService, archiveStreamingService)
         }
     }
 
@@ -144,7 +103,7 @@ class NzbStreamer private constructor(
             return Builder().apply(block).build()
         }
 
-        fun fromConfig(nntpConfig: NntpConfig, seekConfig: SeekConfig, scope: CoroutineScope? = null): NzbStreamer {
+        fun fromConfig(nntpConfig: NntpConfig, seekConfig: SeekConfig): NzbStreamer {
             return invoke {
                 nntp {
                     host = nntpConfig.host
@@ -155,7 +114,6 @@ class NzbStreamer private constructor(
                     concurrency = nntpConfig.concurrency
                 }
                 seek { forwardThresholdBytes = seekConfig.forwardThresholdBytes }
-                if (scope != null) scope(scope)
             }
         }
     }

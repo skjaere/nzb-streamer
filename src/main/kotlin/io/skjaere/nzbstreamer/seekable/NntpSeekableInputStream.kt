@@ -1,16 +1,19 @@
 package io.skjaere.nzbstreamer.seekable
 
 import io.ktor.utils.io.*
-import io.ktor.utils.io.jvm.javaio.*
 import io.skjaere.compressionutils.SeekableInputStream
+import kotlinx.io.EOFException
 import io.skjaere.nzbstreamer.nzb.NzbDocument
 import io.skjaere.nzbstreamer.queue.SegmentQueueService
 import io.skjaere.nzbstreamer.stream.NntpStreamingService
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.cancelAndJoin
-import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.suspendCancellableCoroutine
 import org.slf4j.LoggerFactory
-import java.io.InputStream
 
 class NntpSeekableInputStream(
     private val nzb: NzbDocument,
@@ -20,42 +23,42 @@ class NntpSeekableInputStream(
     private val logger = LoggerFactory.getLogger(NntpSeekableInputStream::class.java)
     private val totalSize: Long = SegmentQueueService.getTotalDecodedSize(nzb)
     private var currentPosition: Long = 0
+    private var currentJob: Job? = null
     private var currentChannel: ByteReadChannel? = null
-    private var currentWriterJob: Job? = null
-    private var currentStream: InputStream? = null
 
-    override fun read(buffer: ByteArray, offset: Int, length: Int): Int {
+    override suspend fun read(buffer: ByteArray, offset: Int, length: Int): Int {
         if (currentPosition >= totalSize) return -1
-        ensureStream()
-        val stream = currentStream ?: return -1
-        val bytesRead = stream.read(buffer, offset, length)
+        ensureChannel()
+        val channel = currentChannel ?: return -1
+        val bytesRead = channel.readAvailable(buffer, offset, length)
         if (bytesRead > 0) {
             currentPosition += bytesRead
         }
         return bytesRead
     }
 
-    override fun read(): Int {
+    override suspend fun read(): Int {
         if (currentPosition >= totalSize) return -1
-        ensureStream()
-        val stream = currentStream ?: return -1
-        val b = stream.read()
-        if (b >= 0) {
+        ensureChannel()
+        val channel = currentChannel ?: return -1
+        return try {
+            val b = channel.readByte().toInt() and 0xFF
             currentPosition++
+            b
+        } catch (_: EOFException) {
+            -1
         }
-        return b
     }
 
-    override fun seek(position: Long) {
+    override suspend fun seek(position: Long) {
         if (position == currentPosition) return
 
         val forward = position - currentPosition
-        if (forward in 1..forwardThresholdBytes && currentStream != null) {
-            // Forward seek within threshold: skip bytes
+        if (forward in 1..forwardThresholdBytes && currentChannel != null) {
             logger.debug("Forward skip {} bytes from {} to {}", forward, currentPosition, position)
-            skipBytes(forward)
+            currentChannel!!.discard(forward)
+            currentPosition = position
         } else {
-            // Backward or large forward: reopen stream from position
             logger.debug("Seek from {} to {} (reopening stream)", currentPosition, position)
             closeStream()
             currentPosition = position
@@ -67,47 +70,39 @@ class NntpSeekableInputStream(
     override fun size(): Long = totalSize
 
     override fun close() {
-        closeStream()
+        val job = currentJob
+        currentJob = null
+        currentChannel = null
+        job?.cancel()
     }
 
-    private fun ensureStream() {
-        if (currentStream == null) {
-            openStream(currentPosition)
+    private suspend fun ensureChannel() {
+        if (currentChannel == null) {
+            openChannel(currentPosition)
         }
     }
 
-    private fun openStream(position: Long) {
+    private suspend fun openChannel(position: Long) {
         val remaining = totalSize - position
         if (remaining <= 0) return
 
         val queue = SegmentQueueService.createRangeQueue(nzb, position, remaining)
-        val (channel, job) = streamingService.streamSegments(queue)
-        currentChannel = channel
-        currentWriterJob = job
-        currentStream = channel.toInputStream()
-    }
+        val channelReady = CompletableDeferred<ByteReadChannel>()
 
-    private fun skipBytes(count: Long) {
-        val buf = ByteArray(minOf(count, 8192).toInt())
-        var remaining = count
-        while (remaining > 0) {
-            val toRead = minOf(remaining.toInt(), buf.size)
-            val bytesRead = currentStream!!.read(buf, 0, toRead)
-            if (bytesRead < 0) break
-            remaining -= bytesRead
-            currentPosition += bytesRead
+        val scope = CoroutineScope(currentCoroutineContext() + Job())
+        currentJob = scope.launch {
+            streamingService.streamSegments(queue) { channel ->
+                channelReady.complete(channel)
+                suspendCancellableCoroutine<Unit> { }
+            }
         }
+        currentChannel = channelReady.await()
     }
 
-    private fun closeStream() {
-        val job = currentWriterJob
-        currentWriterJob = null
-        currentChannel?.cancel()
+    private suspend fun closeStream() {
+        val job = currentJob
+        currentJob = null
         currentChannel = null
-        currentStream?.close()
-        currentStream = null
-        if (job != null) {
-            runBlocking { job.cancelAndJoin() }
-        }
+        job?.cancelAndJoin()
     }
 }
