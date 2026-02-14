@@ -6,7 +6,8 @@ data class NntpConfig(
     val username: String,
     val password: String,
     val useTls: Boolean,
-    val concurrency: Int
+    val concurrency: Int,
+    val readAheadSegments: Int = concurrency
 )
 
 data class SeekConfig(
