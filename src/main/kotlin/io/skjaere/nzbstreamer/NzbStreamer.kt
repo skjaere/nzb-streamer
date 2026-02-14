@@ -6,6 +6,7 @@ import io.skjaere.nzbstreamer.config.NntpConfig
 import io.skjaere.nzbstreamer.config.SeekConfig
 import io.skjaere.nzbstreamer.metadata.ArchiveMetadataService
 import io.skjaere.nzbstreamer.metadata.ExtractedMetadata
+import io.skjaere.nzbstreamer.nzb.NzbDocument
 import io.skjaere.nzbstreamer.nzb.NzbParser
 import io.skjaere.nzbstreamer.queue.SegmentQueueService
 import io.skjaere.nzbstreamer.stream.ArchiveStreamingService
@@ -19,6 +20,11 @@ class NzbStreamer private constructor(
     private val metadataService: ArchiveMetadataService,
     private val archiveStreamingService: ArchiveStreamingService
 ) : Closeable {
+
+    suspend fun enrich(nzbBytes: ByteArray): NzbDocument {
+        val nzb = NzbParser.parse(nzbBytes)
+        return metadataService.enrich(nzb)
+    }
 
     suspend fun prepare(nzbBytes: ByteArray): ExtractedMetadata {
         val nzb = NzbParser.parse(nzbBytes)
@@ -38,12 +44,28 @@ class NzbStreamer private constructor(
         archiveStreamingService.streamFile(metadata.orderedArchiveNzb, splits, range, consume)
     }
 
+    fun launchStreamFile(
+        metadata: ExtractedMetadata,
+        splits: List<SplitInfo>,
+        range: LongRange? = null
+    ): WriterJob {
+        return archiveStreamingService.launchStreamFile(metadata.orderedArchiveNzb, splits, range)
+    }
+
     suspend fun streamVolume(
         metadata: ExtractedMetadata,
         volumeIndex: Int,
         consume: suspend (ByteReadChannel) -> Unit
     ) {
-        val file = metadata.orderedArchiveNzb.files[volumeIndex]
+        streamVolume(metadata.orderedArchiveNzb, volumeIndex, consume)
+    }
+
+    suspend fun streamVolume(
+        nzb: NzbDocument,
+        volumeIndex: Int,
+        consume: suspend (ByteReadChannel) -> Unit
+    ) {
+        val file = nzb.files[volumeIndex]
         val queue = SegmentQueueService.createFileQueue(file, volumeIndex, 0L)
         streamingService.streamSegments(queue, consume = consume)
     }
@@ -114,6 +136,7 @@ class NzbStreamer private constructor(
                     password = nntpConfig.password
                     useTls = nntpConfig.useTls
                     concurrency = nntpConfig.concurrency
+                    readAheadSegments = nntpConfig.readAheadSegments
                 }
                 seek { forwardThresholdBytes = seekConfig.forwardThresholdBytes }
             }
