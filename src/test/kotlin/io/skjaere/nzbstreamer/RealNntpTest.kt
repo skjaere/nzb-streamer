@@ -154,8 +154,7 @@ class RealNntpTest {
             concurrency = 3
         )
 
-        val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
-        val streamingService = NntpStreamingService(nntpConfig, scope)
+        val streamingService = NntpStreamingService(nntpConfig)
         streamingService.connect()
 
         val enrichmentService = NzbEnrichmentService(streamingService)
@@ -181,7 +180,6 @@ class RealNntpTest {
             }
         } finally {
             streamingService.close()
-            scope.cancel()
         }
     }
 

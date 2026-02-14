@@ -88,7 +88,7 @@ class ArchiveMetadataService(
         }
     }
 
-    fun extractMetadata(nzb: NzbDocument): ExtractedMetadata {
+    suspend fun extractMetadata(nzb: NzbDocument): ExtractedMetadata {
         val par2Data = nzb.files.firstOrNull { it.par2Data != null }?.par2Data
 
         // Filter to only archive volumes (exclude PAR2 files) for the seekable stream
