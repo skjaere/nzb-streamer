@@ -157,7 +157,7 @@ class ArchiveStreamingService(
             return result
         }
 
-        private fun computeVolumeOffsets(archiveNzb: NzbDocument): List<Long> {
+        internal fun computeVolumeOffsets(archiveNzb: NzbDocument): List<Long> {
             val offsets = mutableListOf<Long>()
             var cumOffset = 0L
             for (file in archiveNzb.files) {
@@ -166,5 +166,97 @@ class ArchiveStreamingService(
             }
             return offsets
         }
+
+        internal fun computeVolumeSizes(archiveNzb: NzbDocument): List<Long> {
+            return archiveNzb.files.map { it.yencHeaders!!.size }
+        }
+    }
+
+    fun resolveStreamableFile(
+        entry: ArchiveFileEntry,
+        archiveNzb: NzbDocument
+    ): StreamableFile? {
+        when (entry) {
+            is RarFileEntry -> {
+                if (entry.isDirectory) return null
+                if (!entry.isUncompressed) return null
+
+                return if (entry.splitParts.isEmpty()) {
+                    // Non-split RAR file — dataPosition is already the local offset within the volume
+                    StreamableFile(
+                        path = entry.path,
+                        totalSize = entry.uncompressedSize,
+                        startVolumeIndex = entry.volumeIndex,
+                        startOffsetInVolume = entry.dataPosition,
+                        continuationHeaderSize = 0,
+                        endOfArchiveSize = 0
+                    )
+                } else {
+                    // Split RAR file - derive overhead values from parsed split parts
+                    val volumeOffsets = computeVolumeOffsets(archiveNzb)
+                    val volumeSizes = computeVolumeSizes(archiveNzb)
+                    val startVolumeIndex = entry.splitParts[0].volumeIndex
+                    val startOffsetInVolume = entry.splitParts[0].dataStartPosition - volumeOffsets[startVolumeIndex]
+
+                    val continuationHeaderSize = if (entry.splitParts.size > 1) {
+                        entry.splitParts[1].dataStartPosition - volumeOffsets[entry.splitParts[1].volumeIndex]
+                    } else {
+                        0L
+                    }
+
+                    val endOfArchiveSize = volumeSizes[startVolumeIndex] -
+                        startOffsetInVolume - entry.splitParts[0].dataSize
+
+                    StreamableFile(
+                        path = entry.path,
+                        totalSize = entry.uncompressedSize,
+                        startVolumeIndex = startVolumeIndex,
+                        startOffsetInVolume = startOffsetInVolume,
+                        continuationHeaderSize = continuationHeaderSize,
+                        endOfArchiveSize = endOfArchiveSize
+                    )
+                }
+            }
+
+            is SevenZipFileEntry -> {
+                if (entry.isDirectory) return null
+                if (entry.method != null && entry.method != "Copy") return null
+
+                return StreamableFile(
+                    path = entry.path,
+                    totalSize = entry.size,
+                    startVolumeIndex = 0,
+                    startOffsetInVolume = entry.dataOffset,
+                    continuationHeaderSize = 0,
+                    endOfArchiveSize = 0
+                )
+            }
+        }
+    }
+
+    fun resolveStreamableFiles(
+        entries: List<ArchiveFileEntry>,
+        archiveNzb: NzbDocument
+    ): List<StreamableFile> {
+        return entries.mapNotNull { resolveStreamableFile(it, archiveNzb) }
+    }
+
+    suspend fun streamFile(
+        archiveNzb: NzbDocument,
+        file: StreamableFile,
+        range: LongRange? = null,
+        consume: suspend (ByteReadChannel) -> Unit
+    ) {
+        val splits = file.toSplits(archiveNzb)
+        streamFile(archiveNzb, splits, range, consume)
+    }
+
+    fun launchStreamFile(
+        archiveNzb: NzbDocument,
+        file: StreamableFile,
+        range: LongRange? = null
+    ): WriterJob {
+        val splits = file.toSplits(archiveNzb)
+        return launchStreamFile(archiveNzb, splits, range)
     }
 }
