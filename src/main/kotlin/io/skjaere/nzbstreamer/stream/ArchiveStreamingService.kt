@@ -34,12 +34,12 @@ class ArchiveStreamingService(
             }
         } ?: return FileResolveResult.NotFound
 
-        val isDirectory = when (entry) {
-            is RarFileEntry -> entry.isDirectory
-            is SevenZipFileEntry -> entry.isDirectory
-        }
-        if (isDirectory) return FileResolveResult.IsDirectory
+        if (entryIsDirectory(entry)) return FileResolveResult.IsDirectory
 
+        return resolveExistingFileEntry(entry, archiveNzb)
+    }
+
+    private fun resolveExistingFileEntry(entry: ArchiveFileEntry, archiveNzb: NzbDocument): FileResolveResult {
         when (entry) {
             is RarFileEntry -> if (!entry.isUncompressed) {
                 return FileResolveResult.Compressed("File is compressed (RAR method=${entry.compressionMethod})")
@@ -49,21 +49,7 @@ class ArchiveStreamingService(
             }
         }
 
-        val splits = when (entry) {
-            is RarFileEntry -> {
-                entry.splitParts.ifEmpty {
-                    val volumeOffsets = computeVolumeOffsets(archiveNzb)
-                    listOf(
-                        SplitInfo(
-                            volumeIndex = entry.volumeIndex,
-                            dataStartPosition = volumeOffsets[entry.volumeIndex] + entry.dataPosition,
-                            dataSize = entry.uncompressedSize
-                        )
-                    )
-                }
-            }
-            is SevenZipFileEntry -> listOf(SplitInfo(0, entry.dataOffset, entry.size))
-        }
+        val splits = getSplitsForEntry(entry, archiveNzb)
 
         val totalSize = when (entry) {
             is RarFileEntry -> entry.uncompressedSize
@@ -71,6 +57,31 @@ class ArchiveStreamingService(
         }
 
         return FileResolveResult.Ok(splits, totalSize)
+    }
+
+    private fun entryIsDirectory(entry: ArchiveFileEntry): Boolean = when (entry) {
+        is RarFileEntry -> entry.isDirectory
+        is SevenZipFileEntry -> entry.isDirectory
+    }
+
+    private fun getSplitsForEntry(
+        entry: ArchiveFileEntry,
+        archiveNzb: NzbDocument
+    ): List<SplitInfo> = when (entry) {
+        is RarFileEntry -> {
+            entry.splitParts.ifEmpty {
+                val volumeOffsets = computeVolumeOffsets(archiveNzb)
+                listOf(
+                    SplitInfo(
+                        volumeIndex = entry.volumeIndex,
+                        dataStartPosition = volumeOffsets[entry.volumeIndex] + entry.dataPosition,
+                        dataSize = entry.uncompressedSize
+                    )
+                )
+            }
+        }
+
+        is SevenZipFileEntry -> listOf(SplitInfo(0, entry.dataOffset, entry.size))
     }
 
     suspend fun streamFile(
@@ -176,61 +187,69 @@ class ArchiveStreamingService(
         entry: ArchiveFileEntry,
         archiveNzb: NzbDocument
     ): StreamableFile? {
-        when (entry) {
-            is RarFileEntry -> {
-                if (entry.isDirectory) return null
-                if (!entry.isUncompressed) return null
+        return when (entry) {
+            is RarFileEntry -> resolveRarFile(entry, archiveNzb)
+            is SevenZipFileEntry -> resolveSevenZipFile(entry)
+        }
+    }
 
-                return if (entry.splitParts.isEmpty()) {
-                    // Non-split RAR file — dataPosition is already the local offset within the volume
-                    StreamableFile(
-                        path = entry.path,
-                        totalSize = entry.uncompressedSize,
-                        startVolumeIndex = entry.volumeIndex,
-                        startOffsetInVolume = entry.dataPosition,
-                        continuationHeaderSize = 0,
-                        endOfArchiveSize = 0
-                    )
-                } else {
-                    // Split RAR file - derive overhead values from parsed split parts
-                    val volumeOffsets = computeVolumeOffsets(archiveNzb)
-                    val volumeSizes = computeVolumeSizes(archiveNzb)
-                    val startVolumeIndex = entry.splitParts[0].volumeIndex
-                    val startOffsetInVolume = entry.splitParts[0].dataStartPosition - volumeOffsets[startVolumeIndex]
+    private fun resolveSevenZipFile(
+        entry: SevenZipFileEntry
+    ): StreamableFile? {
+        if (entry.isDirectory) return null
+        if (entry.method != null && entry.method != "Copy") return null
 
-                    val continuationHeaderSize = if (entry.splitParts.size > 1) {
-                        entry.splitParts[1].dataStartPosition - volumeOffsets[entry.splitParts[1].volumeIndex]
-                    } else {
-                        0L
-                    }
+        return StreamableFile(
+            path = entry.path,
+            totalSize = entry.size,
+            startVolumeIndex = 0,
+            startOffsetInVolume = entry.dataOffset,
+            continuationHeaderSize = 0,
+            endOfArchiveSize = 0
+        )
+    }
 
-                    val endOfArchiveSize = volumeSizes[startVolumeIndex] -
-                        startOffsetInVolume - entry.splitParts[0].dataSize
+    private fun resolveRarFile(
+        entry: RarFileEntry,
+        archiveNzb: NzbDocument
+    ): StreamableFile? {
+        if (entry.isDirectory) return null
+        if (!entry.isUncompressed) return null
 
-                    StreamableFile(
-                        path = entry.path,
-                        totalSize = entry.uncompressedSize,
-                        startVolumeIndex = startVolumeIndex,
-                        startOffsetInVolume = startOffsetInVolume,
-                        continuationHeaderSize = continuationHeaderSize,
-                        endOfArchiveSize = endOfArchiveSize
-                    )
-                }
+        return if (entry.splitParts.isEmpty()) {
+            // Non-split RAR file — dataPosition is already the local offset within the volume
+            StreamableFile(
+                path = entry.path,
+                totalSize = entry.uncompressedSize,
+                startVolumeIndex = entry.volumeIndex,
+                startOffsetInVolume = entry.dataPosition,
+                continuationHeaderSize = 0,
+                endOfArchiveSize = 0
+            )
+        } else {
+            // Split RAR file - derive overhead values from parsed split parts
+            val volumeOffsets = computeVolumeOffsets(archiveNzb)
+            val volumeSizes = computeVolumeSizes(archiveNzb)
+            val startVolumeIndex = entry.splitParts[0].volumeIndex
+            val startOffsetInVolume = entry.splitParts[0].dataStartPosition - volumeOffsets[startVolumeIndex]
+
+            val continuationHeaderSize = if (entry.splitParts.size > 1) {
+                entry.splitParts[1].dataStartPosition - volumeOffsets[entry.splitParts[1].volumeIndex]
+            } else {
+                0L
             }
 
-            is SevenZipFileEntry -> {
-                if (entry.isDirectory) return null
-                if (entry.method != null && entry.method != "Copy") return null
+            val endOfArchiveSize = volumeSizes[startVolumeIndex] -
+                    startOffsetInVolume - entry.splitParts[0].dataSize
 
-                return StreamableFile(
-                    path = entry.path,
-                    totalSize = entry.size,
-                    startVolumeIndex = 0,
-                    startOffsetInVolume = entry.dataOffset,
-                    continuationHeaderSize = 0,
-                    endOfArchiveSize = 0
-                )
-            }
+            StreamableFile(
+                path = entry.path,
+                totalSize = entry.uncompressedSize,
+                startVolumeIndex = startVolumeIndex,
+                startOffsetInVolume = startOffsetInVolume,
+                continuationHeaderSize = continuationHeaderSize,
+                endOfArchiveSize = endOfArchiveSize
+            )
         }
     }
 

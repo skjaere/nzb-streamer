@@ -8,9 +8,10 @@ import io.skjaere.nntp.YencEvent
 import io.skjaere.nzbstreamer.config.NntpConfig
 import io.skjaere.nzbstreamer.queue.SegmentQueueItem
 import kotlinx.coroutines.*
+import kotlinx.coroutines.channels.consumeEach
+import kotlinx.coroutines.channels.produce
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.toList
-import kotlinx.coroutines.sync.Semaphore
 import org.slf4j.LoggerFactory
 import java.io.Closeable
 
@@ -74,38 +75,21 @@ class NntpStreamingService(
             val items = queue.toList()
             if (items.isEmpty()) return@writer
 
-            val deferreds = Array(items.size) { CompletableDeferred<ByteArray>() }
-            val semaphore = Semaphore(readAheadSegments)
-
-            val downloadJob = launch {
-                for ((i, item) in items.withIndex()) {
-                    semaphore.acquire()
-                    launch {
-                        try {
-                            val data = downloadSegment(item.segment.articleId)
-                            deferreds[i].complete(data)
-                        } catch (e: Exception) {
-                            deferreds[i].completeExceptionally(e)
-                        }
-                    }
+            @OptIn(ExperimentalCoroutinesApi::class)
+            produce(capacity = readAheadSegments) {
+                items.forEach { item ->
+                    val deferred = async { downloadSegment(item.segment.articleId) }
+                    send(item to deferred)
                 }
-            }
+            }.consumeEach { (item, deferred) ->
+                val data = deferred.await()
 
-            try {
-                for ((index, item) in items.withIndex()) {
-                    val data = deferreds[index].await()
-
-                    val start = minOf(item.readStart.toInt(), data.size)
-                    val end = minOf(item.readEnd.toInt(), data.size)
-                    if (end > start) {
-                        channel.writeFully(data, start, end)
-                    }
-                    channel.flush()
-
-                    semaphore.release()
+                val start = minOf(item.readStart.toInt(), data.size)
+                val end = minOf(item.readEnd.toInt(), data.size)
+                if (end > start) {
+                    channel.writeFully(data, start, end)
                 }
-            } finally {
-                downloadJob.cancel()
+                channel.flush()
             }
         }
     }
