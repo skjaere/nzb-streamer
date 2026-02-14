@@ -7,7 +7,6 @@ import io.skjaere.compressionutils.SevenZipFileEntry
 import io.skjaere.compressionutils.SplitInfo
 import io.skjaere.nzbstreamer.nzb.NzbDocument
 import io.skjaere.nzbstreamer.queue.SegmentQueueService
-import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.flow
 import org.slf4j.LoggerFactory
 
@@ -74,11 +73,12 @@ class ArchiveStreamingService(
         return FileResolveResult.Ok(splits, totalSize)
     }
 
-    fun streamFile(
+    suspend fun streamFile(
         archiveNzb: NzbDocument,
         splits: List<SplitInfo>,
-        range: LongRange? = null
-    ): Pair<ByteReadChannel, Job> {
+        range: LongRange? = null,
+        consume: suspend (ByteReadChannel) -> Unit
+    ) {
         val effectiveSplits = if (range != null) {
             adjustSplitsForRange(splits, range.first, range.last - range.first + 1)
         } else {
@@ -98,7 +98,7 @@ class ArchiveStreamingService(
                 ).collect { emit(it) }
             }
         }
-        return streamingService.streamSegments(combinedQueue)
+        streamingService.streamSegments(combinedQueue, consume)
     }
 
     companion object {
