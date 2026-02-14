@@ -10,6 +10,7 @@ import io.skjaere.nzbstreamer.queue.SegmentQueueItem
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.toList
+import kotlinx.coroutines.sync.Semaphore
 import org.slf4j.LoggerFactory
 import java.io.Closeable
 
@@ -47,9 +48,10 @@ class NntpStreamingService(
      */
     suspend fun streamSegments(
         queue: Flow<SegmentQueueItem>,
+        readAheadSegments: Int = config.readAheadSegments,
         consume: suspend (ByteReadChannel) -> Unit
     ) {
-        val writerJob = launchSegmentWriter(queue)
+        val writerJob = launchSegmentWriter(queue, readAheadSegments)
         try {
             consume(writerJob.channel)
         } finally {
@@ -57,38 +59,34 @@ class NntpStreamingService(
         }
     }
 
-    private fun launchSegmentWriter(queue: Flow<SegmentQueueItem>): WriterJob {
+    private fun launchSegmentWriter(
+        queue: Flow<SegmentQueueItem>,
+        readAheadSegments: Int
+    ): WriterJob {
         return scope.writer(autoFlush = false) {
             val items = queue.toList()
             if (items.isEmpty()) return@writer
 
-            val windowSize = config.concurrency
-            val deferreds = HashMap<Int, CompletableDeferred<ByteArray>>()
-            val jobs = HashMap<Int, Job>()
+            val deferreds = Array(items.size) { CompletableDeferred<ByteArray>() }
+            val semaphore = Semaphore(readAheadSegments)
 
-            fun submitDownload(index: Int) {
-                val item = items[index]
-                val deferred = CompletableDeferred<ByteArray>()
-                deferreds[index] = deferred
-                jobs[index] = launch {
-                    try {
-                        val data = downloadSegment(item.segment.articleId)
-                        deferred.complete(data)
-                    } catch (e: Exception) {
-                        deferred.completeExceptionally(e)
+            val downloadJob = launch {
+                for ((i, item) in items.withIndex()) {
+                    semaphore.acquire()
+                    launch {
+                        try {
+                            val data = downloadSegment(item.segment.articleId)
+                            deferreds[i].complete(data)
+                        } catch (e: Exception) {
+                            deferreds[i].completeExceptionally(e)
+                        }
                     }
                 }
             }
 
-            var nextToSubmit = minOf(windowSize, items.size)
-            for (i in 0 until nextToSubmit) {
-                submitDownload(i)
-            }
-
             try {
                 for ((index, item) in items.withIndex()) {
-                    val data = deferreds.remove(index)!!.await()
-                    jobs.remove(index)
+                    val data = deferreds[index].await()
 
                     val start = minOf(item.readStart.toInt(), data.size)
                     val end = minOf(item.readEnd.toInt(), data.size)
@@ -97,14 +95,10 @@ class NntpStreamingService(
                     }
                     channel.flush()
 
-                    if (nextToSubmit < items.size) {
-                        submitDownload(nextToSubmit)
-                        nextToSubmit++
-                    }
+                    semaphore.release()
                 }
-            } catch (e: Exception) {
-                jobs.values.forEach { it.cancel() }
-                throw e
+            } finally {
+                downloadJob.cancel()
             }
         }
     }
