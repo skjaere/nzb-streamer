@@ -70,9 +70,13 @@ class ArchiveMetadataService(
     private val logger = LoggerFactory.getLogger(ArchiveMetadataService::class.java)
     private val enrichmentService = NzbEnrichmentService(streamingService)
 
-    suspend fun prepare(nzb: NzbDocument): ExtractedMetadata {
+    suspend fun enrich(nzb: NzbDocument): NzbDocument {
         enrichmentService.enrich(nzb)
-        val enrichedNzb = NzbDocument(nzb.files.filter { it.yencHeaders != null })
+        return NzbDocument(nzb.files.filter { it.yencHeaders != null })
+    }
+
+    suspend fun prepare(nzb: NzbDocument): ExtractedMetadata {
+        val enrichedNzb = enrich(nzb)
         return if (enrichedNzb.files.isEmpty()) {
             ExtractedMetadata(
                 response = NzbMetadataResponse(
