@@ -60,12 +60,12 @@ object SegmentQueueService {
 
     private fun getFileDecodedSize(file: NzbFile): Long {
         return file.yencHeaders?.size
-            ?: throw IllegalStateException("File not enriched: yencHeaders is null")
+            ?: error("File not enriched: yencHeaders is null")
     }
 
     private fun getPartSize(file: NzbFile): Long {
         val headers = file.yencHeaders
-            ?: throw IllegalStateException("File not enriched: yencHeaders is null")
+            ?: error("File not enriched: yencHeaders is null")
         // For single-part articles, partEnd is null — the part size equals the file size
         return headers.partEnd ?: headers.size
     }
