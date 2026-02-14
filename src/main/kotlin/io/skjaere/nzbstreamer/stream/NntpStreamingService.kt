@@ -59,6 +59,13 @@ class NntpStreamingService(
         }
     }
 
+    fun launchStreamSegments(
+        queue: Flow<SegmentQueueItem>,
+        readAheadSegments: Int = config.readAheadSegments
+    ): WriterJob {
+        return launchSegmentWriter(queue, readAheadSegments)
+    }
+
     private fun launchSegmentWriter(
         queue: Flow<SegmentQueueItem>,
         readAheadSegments: Int
