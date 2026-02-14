@@ -101,6 +101,27 @@ class ArchiveStreamingService(
         streamingService.streamSegments(combinedQueue, consume = consume)
     }
 
+    fun launchStreamFile(
+        archiveNzb: NzbDocument,
+        splits: List<SplitInfo>,
+        range: LongRange? = null
+    ): WriterJob {
+        val effectiveSplits = if (range != null) {
+            adjustSplitsForRange(splits, range.first, range.last - range.first + 1)
+        } else {
+            splits
+        }
+
+        val combinedQueue = flow {
+            for (split in effectiveSplits) {
+                SegmentQueueService.createRangeQueue(
+                    archiveNzb, split.dataStartPosition, split.dataSize
+                ).collect { emit(it) }
+            }
+        }
+        return streamingService.launchStreamSegments(combinedQueue)
+    }
+
     companion object {
         internal fun adjustSplitsForRange(
             splits: List<SplitInfo>,
