@@ -19,9 +19,6 @@ jobs:
 
       - uses: gradle/actions/setup-gradle@v4
 
-      - name: Remove composite builds (resolved from JitPack in CI)
-        run: sed -i '/includeBuild/d' settings.gradle.kts
-
       - run: ./gradlew build koverXmlReport
 
       - uses: codecov/codecov-action@v5
