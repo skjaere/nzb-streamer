@@ -10,6 +10,7 @@ import io.skjaere.nzbstreamer.queue.SegmentQueueItem
 import kotlinx.coroutines.*
 import kotlinx.coroutines.channels.consumeEach
 import kotlinx.coroutines.channels.produce
+import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.toList
 import org.slf4j.LoggerFactory
@@ -49,10 +50,11 @@ class NntpStreamingService(
      */
     suspend fun streamSegments(
         queue: Flow<SegmentQueueItem>,
+        concurrency: Int = config.concurrency,
         readAheadSegments: Int = config.readAheadSegments,
         consume: suspend (ByteReadChannel) -> Unit
     ) {
-        val writerJob = launchSegmentWriter(queue, readAheadSegments)
+        val writerJob = launchSegmentWriter(queue, concurrency, readAheadSegments)
         try {
             consume(writerJob.channel)
         } finally {
@@ -62,23 +64,34 @@ class NntpStreamingService(
 
     fun launchStreamSegments(
         queue: Flow<SegmentQueueItem>,
+        concurrency: Int = config.concurrency,
         readAheadSegments: Int = config.readAheadSegments
     ): WriterJob {
-        return launchSegmentWriter(queue, readAheadSegments)
+        return launchSegmentWriter(queue, concurrency, readAheadSegments)
     }
 
     private fun launchSegmentWriter(
         queue: Flow<SegmentQueueItem>,
+        concurrency: Int,
         readAheadSegments: Int
     ): WriterJob {
         return scope.writer(autoFlush = false) {
             val items = queue.toList()
             if (items.isEmpty()) return@writer
 
+            val downloadSemaphore = Semaphore(concurrency)
+
             @OptIn(ExperimentalCoroutinesApi::class)
             produce(capacity = readAheadSegments) {
                 items.forEach { item ->
-                    val deferred = async { downloadSegment(item.segment.articleId) }
+                    downloadSemaphore.acquire()
+                    val deferred = async {
+                        try {
+                            downloadSegment(item.segment.articleId)
+                        } finally {
+                            downloadSemaphore.release()
+                        }
+                    }
                     send(item to deferred)
                 }
             }.consumeEach { (item, deferred) ->
