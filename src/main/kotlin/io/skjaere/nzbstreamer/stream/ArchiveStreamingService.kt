@@ -134,38 +134,32 @@ class ArchiveStreamingService(
     }
 
     companion object {
+        private fun splitOverlapsRange(
+            fileOffset: Long,
+            split: SplitInfo,
+            rangeStart: Long,
+            rangeEnd: Long
+        ): Boolean = fileOffset + split.dataSize > rangeStart && fileOffset < rangeEnd
+
         internal fun adjustSplitsForRange(
             splits: List<SplitInfo>,
             rangeStart: Long,
             rangeLength: Long
         ): List<SplitInfo> {
             val rangeEnd = rangeStart + rangeLength
-            val result = mutableListOf<SplitInfo>()
-            var fileOffset = 0L
 
-            for (split in splits) {
-                val splitEnd = fileOffset + split.dataSize
-
-                if (splitEnd <= rangeStart || fileOffset >= rangeEnd) {
-                    fileOffset = splitEnd
-                    continue
-                }
-
-                val trimStart = maxOf(0L, rangeStart - fileOffset)
-                val trimEnd = minOf(split.dataSize, rangeEnd - fileOffset)
-
-                result.add(
+            return splits.runningFold(0L) { offset, split -> offset + split.dataSize }
+                .zip(splits)
+                .filter { (fileOffset, split) -> splitOverlapsRange(fileOffset, split, rangeStart, rangeEnd) }
+                .map { (fileOffset, split) ->
+                    val trimStart = maxOf(0L, rangeStart - fileOffset)
+                    val trimEnd = minOf(split.dataSize, rangeEnd - fileOffset)
                     SplitInfo(
                         volumeIndex = split.volumeIndex,
                         dataStartPosition = split.dataStartPosition + trimStart,
                         dataSize = trimEnd - trimStart
                     )
-                )
-
-                fileOffset = splitEnd
-            }
-
-            return result
+                }
         }
 
         internal fun computeVolumeOffsets(archiveNzb: NzbDocument): List<Long> {
