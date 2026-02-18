@@ -1,5 +1,27 @@
 # Changelog
 
+## [0.3.0](https://github.com/skjaere/nzb-streamer/compare/v0.2.0...v0.3.0) (2026-02-18)
+
+
+### Features
+
+* adding a segment read ahead buffer ([125003f](https://github.com/skjaere/nzb-streamer/commit/125003fbf21d43e23c79128d5dfbb0fe58b3e305))
+* initial commit ([3f2ff35](https://github.com/skjaere/nzb-streamer/commit/3f2ff35a1843e2f1e88fa0ad9bbd5cfec73f3864))
+* streamlining streaming path ([d711c5a](https://github.com/skjaere/nzb-streamer/commit/d711c5aed4e15e6d516fe01fda63412863e56de5))
+* supporting streaming of archive volumes ([c29a618](https://github.com/skjaere/nzb-streamer/commit/c29a61830163d9157f960927fd990e102a08c576))
+
+
+### Bug Fixes
+
+* adding missing file ([2984bff](https://github.com/skjaere/nzb-streamer/commit/2984bff920feb6cfdae8b7d267ca74c6005484fa))
+* bumping kotlin-compression-utils to v0.2.0 and adding release please config ([6cbaf5e](https://github.com/skjaere/nzb-streamer/commit/6cbaf5ec4802916c8fcb3dd2bb430da03acb62da))
+* fixing package name of kotlin-compression-utils ([57a27f1](https://github.com/skjaere/nzb-streamer/commit/57a27f10ab0f4bf7765b192acc3ad5edbd84ee85))
+* fixing package name of ktor-nntp-client ([b7bb572](https://github.com/skjaere/nzb-streamer/commit/b7bb5723ae31a9e94154957bad82c4f04e8f37cd))
+* refactoring ([70c18cc](https://github.com/skjaere/nzb-streamer/commit/70c18cc389b0c969efe4d4ec855c288d2f2de857))
+* refactoring ArchiveStreamingService.kt ([d904ae0](https://github.com/skjaere/nzb-streamer/commit/d904ae06945a7255ecb895c5ef8713d138bb092f))
+* refactoring structured concurrency ([358a40c](https://github.com/skjaere/nzb-streamer/commit/358a40c401ec34d043b5cf55fc30c9d492f706f7))
+* separating read ahead and concurrency setting ([a0b8a76](https://github.com/skjaere/nzb-streamer/commit/a0b8a762c39c5bf18e0458a3023ca8a16cdb065c))
+
 ## [0.2.0](https://github.com/skjaere/nzb-streamer/compare/v0.1.0...v0.2.0) (2026-02-15)
 
 
