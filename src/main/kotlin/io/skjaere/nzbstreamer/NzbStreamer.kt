@@ -4,8 +4,10 @@ import io.ktor.utils.io.*
 import io.skjaere.compressionutils.SplitInfo
 import io.skjaere.nzbstreamer.config.NntpConfig
 import io.skjaere.nzbstreamer.config.SeekConfig
+import io.skjaere.nzbstreamer.enrichment.EnrichmentResult
 import io.skjaere.nzbstreamer.metadata.ArchiveMetadataService
 import io.skjaere.nzbstreamer.metadata.ExtractedMetadata
+import io.skjaere.nzbstreamer.metadata.PrepareResult
 import io.skjaere.nzbstreamer.nzb.NzbDocument
 import io.skjaere.nzbstreamer.nzb.NzbParser
 import io.skjaere.nzbstreamer.queue.SegmentQueueService
@@ -22,12 +24,12 @@ class NzbStreamer private constructor(
     private val archiveStreamingService: ArchiveStreamingService
 ) : Closeable {
 
-    suspend fun enrich(nzbBytes: ByteArray): NzbDocument {
+    suspend fun enrich(nzbBytes: ByteArray): EnrichmentResult {
         val nzb = NzbParser.parse(nzbBytes)
         return metadataService.enrich(nzb)
     }
 
-    suspend fun prepare(nzbBytes: ByteArray): ExtractedMetadata {
+    suspend fun prepare(nzbBytes: ByteArray): PrepareResult {
         val nzb = NzbParser.parse(nzbBytes)
         return metadataService.prepare(nzb)
     }
