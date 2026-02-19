@@ -5,6 +5,7 @@ import io.skjaere.compressionutils.ArchiveService
 import io.skjaere.compressionutils.RarFileEntry
 import io.skjaere.compressionutils.SevenZipFileEntry
 import io.skjaere.compressionutils.VolumeMetaData
+import io.skjaere.nzbstreamer.enrichment.EnrichmentResult
 import io.skjaere.nzbstreamer.enrichment.NzbEnrichmentService
 import io.skjaere.nzbstreamer.nzb.NzbDocument
 import io.skjaere.nzbstreamer.seekable.NntpSeekableInputStream
@@ -70,25 +71,40 @@ class ArchiveMetadataService(
     private val logger = LoggerFactory.getLogger(ArchiveMetadataService::class.java)
     private val enrichmentService = NzbEnrichmentService(streamingService)
 
-    suspend fun enrich(nzb: NzbDocument): NzbDocument {
-        enrichmentService.enrich(nzb)
-        return NzbDocument(nzb.files.filter { it.yencHeaders != null })
+    suspend fun enrich(nzb: NzbDocument): EnrichmentResult {
+        val result = enrichmentService.enrich(nzb)
+        if (result is EnrichmentResult.Success) {
+            return EnrichmentResult.Success(
+                NzbDocument(result.enrichedNzb.files.filter { it.yencHeaders != null })
+            )
+        }
+        return result
     }
 
-    suspend fun prepare(nzb: NzbDocument): ExtractedMetadata {
-        val enrichedNzb = enrich(nzb)
-        return if (enrichedNzb.files.isEmpty()) {
-            ExtractedMetadata(
-                response = NzbMetadataResponse(
-                    volumes = emptyList(),
-                    obfuscated = false,
-                    entries = emptyList()
-                ),
-                orderedArchiveNzb = NzbDocument(emptyList()),
-                entries = emptyList()
-            )
-        } else {
-            extractMetadata(enrichedNzb)
+    suspend fun prepare(nzb: NzbDocument): PrepareResult {
+        return when (val result = enrich(nzb)) {
+            is EnrichmentResult.Success -> {
+                val enrichedNzb = result.enrichedNzb
+                if (enrichedNzb.files.isEmpty()) {
+                    PrepareResult.Success(
+                        ExtractedMetadata(
+                            response = NzbMetadataResponse(
+                                volumes = emptyList(),
+                                obfuscated = false,
+                                entries = emptyList()
+                            ),
+                            orderedArchiveNzb = NzbDocument(emptyList()),
+                            entries = emptyList()
+                        )
+                    )
+                } else {
+                    PrepareResult.Success(extractMetadata(enrichedNzb))
+                }
+            }
+            is EnrichmentResult.MissingArticles ->
+                PrepareResult.MissingArticles(result.message, result.cause)
+            is EnrichmentResult.Failure ->
+                PrepareResult.Failure(result.message, result.cause)
         }
     }
 

@@ -1,18 +1,28 @@
 package io.skjaere.nzbstreamer.stream
 
-import io.ktor.network.selector.*
-import io.ktor.utils.io.*
+import io.ktor.network.selector.SelectorManager
+import io.ktor.utils.io.ByteReadChannel
+import io.ktor.utils.io.WriterJob
+import io.ktor.utils.io.toByteArray
+import io.ktor.utils.io.writeFully
+import io.ktor.utils.io.writer
 import io.skjaere.nntp.NntpClient
 import io.skjaere.nntp.NntpClientPool
 import io.skjaere.nntp.YencEvent
 import io.skjaere.nzbstreamer.config.NntpConfig
 import io.skjaere.nzbstreamer.queue.SegmentQueueItem
-import kotlinx.coroutines.*
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.async
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.channels.consumeEach
 import kotlinx.coroutines.channels.produce
-import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.toList
+import kotlinx.coroutines.sync.Semaphore
 import org.slf4j.LoggerFactory
 import java.io.Closeable
 
@@ -32,7 +42,7 @@ class NntpStreamingService(
             useTls = config.useTls,
             username = config.username.ifEmpty { null },
             password = config.password.ifEmpty { null },
-            maxConnections = config.concurrency,
+            maxConnections = config.concurrency,//TODO: separate concurrency and maxConnections
             scope = scope
         )
         pool.connect()

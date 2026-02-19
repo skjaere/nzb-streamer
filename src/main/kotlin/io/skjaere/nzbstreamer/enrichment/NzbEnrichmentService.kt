@@ -1,6 +1,8 @@
 package io.skjaere.nzbstreamer.enrichment
 
 import io.ktor.utils.io.*
+import io.skjaere.nntp.ArticleNotFoundException
+import io.skjaere.nntp.NntpException
 import io.skjaere.nntp.YencEvent
 import io.skjaere.nzbstreamer.nzb.NzbDocument
 import io.skjaere.nzbstreamer.nzb.NzbFile
@@ -17,41 +19,64 @@ class NzbEnrichmentService(
 ) {
     private val logger = LoggerFactory.getLogger(NzbEnrichmentService::class.java)
 
-    suspend fun enrich(nzb: NzbDocument) {
-        coroutineScope {
-            nzb.files.map { file ->
-                async {
-                    try {
+    suspend fun enrich(nzb: NzbDocument): EnrichmentResult {
+        try {
+            coroutineScope {
+                nzb.files.map { file ->
+                    async {
                         enrichFile(file)
-                    } catch (e: Exception) {
-                        logger.error("Failed to enrich file: {}", file.subject, e)
                     }
-                }
-            }.awaitAll()
+                }.awaitAll()
+            }
+        } catch (e: ArticleNotFoundException) {
+            logger.warn("Article not found during enrichment: {}", e.message)
+            return EnrichmentResult.MissingArticles(
+                e.message ?: "Article not found",
+                e
+            )
+        } catch (e: NntpException) {
+            logger.error("NNTP failure during enrichment: {}", e.message, e)
+            return EnrichmentResult.Failure(
+                e.message ?: "NNTP failure",
+                e
+            )
         }
+
         val enrichedCount = nzb.files.count { it.yencHeaders != null }
         logger.info("Enriched {} of {} files", enrichedCount, nzb.files.size)
 
         // After enrichment, download the base PAR2 file (contains recovery set metadata).
         // Skip .volXXX+YYY.par2 recovery volume files — they contain recovery blocks
         // and can be very large (tens of MB each), causing OOM if loaded into memory.
-        coroutineScope {
-            nzb.files
-                .filter { file ->
-                    val name = file.yencHeaders?.name ?: return@filter false
-                    name.endsWith(".par2", ignoreCase = true)
-                            && !name.contains(".vol", ignoreCase = true)
-                }
-                .map { file ->
-                    async {
-                        try {
-                            downloadPar2(file)
-                        } catch (e: Exception) {
-                            logger.error("Failed to download PAR2 file: {}", file.yencHeaders?.name, e)
-                        }
+        try {
+            coroutineScope {
+                nzb.files
+                    .filter { file ->
+                        val name = file.yencHeaders?.name ?: return@filter false
+                        name.endsWith(".par2", ignoreCase = true)
+                                && !name.contains(".vol", ignoreCase = true)
                     }
-                }.awaitAll()
+                    .map { file ->
+                        async {
+                            downloadPar2(file)
+                        }
+                    }.awaitAll()
+            }
+        } catch (e: ArticleNotFoundException) {
+            logger.warn("PAR2 article not found: {}", e.message)
+            return EnrichmentResult.MissingArticles(
+                e.message ?: "PAR2 article not found",
+                e
+            )
+        } catch (e: NntpException) {
+            logger.error("NNTP failure during PAR2 download: {}", e.message, e)
+            return EnrichmentResult.Failure(
+                e.message ?: "NNTP failure during PAR2 download",
+                e
+            )
         }
+
+        return EnrichmentResult.Success(nzb)
     }
 
     private suspend fun enrichFile(file: NzbFile) {
