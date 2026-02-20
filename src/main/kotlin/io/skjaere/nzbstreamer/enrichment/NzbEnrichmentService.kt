@@ -11,6 +11,7 @@ import io.skjaere.nzbstreamer.stream.NntpStreamingService
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
+import io.skjaere.compressionutils.Par2Parser
 import org.slf4j.LoggerFactory
 import kotlin.math.min
 
@@ -52,9 +53,8 @@ class NzbEnrichmentService(
             coroutineScope {
                 nzb.files
                     .filter { file ->
-                        val name = file.yencHeaders?.name ?: return@filter false
-                        name.endsWith(".par2", ignoreCase = true)
-                                && !name.contains(".vol", ignoreCase = true)
+                        val first16kb = file.first16kb ?: return@filter false
+                        Par2Parser.isPar2(first16kb) && Par2Parser.hasFileDescriptions(first16kb)
                     }
                     .map { file ->
                         async {
