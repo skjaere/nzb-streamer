@@ -105,6 +105,7 @@ class NzbStreamer private constructor(
         var password: String = ""
         var useTls: Boolean = true
         var concurrency: Int = 4
+        var maxConnections: Int = 8
         var readAheadSegments: Int? = null
     }
 
@@ -133,7 +134,8 @@ class NzbStreamer private constructor(
                 password = nb.password,
                 useTls = nb.useTls,
                 concurrency = nb.concurrency,
-                readAheadSegments = nb.readAheadSegments ?: nb.concurrency
+                maxConnections = nb.maxConnections,
+                readAheadSegments = nb.readAheadSegments ?: (nb.concurrency * 3)
             )
             val seekConfig = SeekConfig(forwardThresholdBytes = seekBuilder.forwardThresholdBytes)
             val streamingService = NntpStreamingService(nntpConfig)
@@ -160,6 +162,7 @@ class NzbStreamer private constructor(
                     password = nntpConfig.password
                     useTls = nntpConfig.useTls
                     concurrency = nntpConfig.concurrency
+                    maxConnections = nntpConfig.maxConnections
                     readAheadSegments = nntpConfig.readAheadSegments
                 }
                 seek { forwardThresholdBytes = seekConfig.forwardThresholdBytes }
