@@ -2,6 +2,8 @@ package io.skjaere.nzbstreamer.metadata
 
 import io.skjaere.compressionutils.ArchiveFileEntry
 import io.skjaere.compressionutils.ArchiveService
+import io.skjaere.compressionutils.ListFilesResult
+import io.skjaere.compressionutils.Par2Parser
 import io.skjaere.compressionutils.RarFileEntry
 import io.skjaere.compressionutils.SevenZipFileEntry
 import io.skjaere.compressionutils.VolumeMetaData
@@ -13,7 +15,6 @@ import io.skjaere.nzbstreamer.stream.NntpStreamingService
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import org.slf4j.LoggerFactory
-import java.io.IOException
 
 @Serializable
 data class NzbMetadataResponse(
@@ -23,11 +24,21 @@ data class NzbMetadataResponse(
     val entries: List<ArchiveFileEntryResponse>
 )
 
-data class ExtractedMetadata(
-    val response: NzbMetadataResponse,
-    val orderedArchiveNzb: NzbDocument,
-    val entries: List<ArchiveFileEntry>
-)
+sealed interface ExtractedMetadata {
+    val response: NzbMetadataResponse
+    val orderedArchiveNzb: NzbDocument
+
+    data class Archive(
+        override val response: NzbMetadataResponse,
+        override val orderedArchiveNzb: NzbDocument,
+        val entries: List<ArchiveFileEntry>
+    ) : ExtractedMetadata
+
+    data class Raw(
+        override val response: NzbMetadataResponse,
+        override val orderedArchiveNzb: NzbDocument
+    ) : ExtractedMetadata
+}
 
 @Serializable
 sealed interface ArchiveFileEntryResponse
@@ -88,22 +99,17 @@ class ArchiveMetadataService(
                 val enrichedNzb = result.enrichedNzb
                 if (enrichedNzb.files.isEmpty()) {
                     PrepareResult.Success(
-                        ExtractedMetadata(
+                        ExtractedMetadata.Raw(
                             response = NzbMetadataResponse(
                                 volumes = emptyList(),
                                 obfuscated = false,
                                 entries = emptyList()
                             ),
-                            orderedArchiveNzb = NzbDocument(emptyList()),
-                            entries = emptyList()
+                            orderedArchiveNzb = NzbDocument(emptyList())
                         )
                     )
                 } else {
-                    try {
-                        PrepareResult.Success(extractMetadata(enrichedNzb))
-                    } catch (e: IOException) {
-                        PrepareResult.UnsupportedArchive(e.message ?: "Unsupported archive type", e)
-                    }
+                    PrepareResult.Success(extractMetadata(enrichedNzb))
                 }
             }
             is EnrichmentResult.MissingArticles ->
@@ -119,8 +125,8 @@ class ArchiveMetadataService(
         // Filter to only archive volumes (exclude PAR2 files) for the seekable stream
         // and volume metadata. PAR2 data is passed separately.
         val archiveFiles = nzb.files.filter { file ->
-            val name = file.yencHeaders?.name ?: return@filter false
-            !name.endsWith(".par2", ignoreCase = true)
+            val first16kb = file.first16kb
+            first16kb == null || !Par2Parser.isPar2(first16kb)
         }
 
         val volumes = archiveFiles.map { file ->
@@ -145,8 +151,23 @@ class ArchiveMetadataService(
         val seekableStream = NntpSeekableInputStream(
             orderedArchiveNzb, streamingService, forwardThresholdBytes
         )
-        val rawEntries = seekableStream.use { stream ->
+        val listFilesResult = seekableStream.use { stream ->
             ArchiveService.listFiles(stream, orderedVolumes, par2Data)
+        }
+
+        val rawEntries = when (listFilesResult) {
+            is ListFilesResult.Success -> listFilesResult.entries
+            is ListFilesResult.UnsupportedFormat -> {
+                logger.info("No supported archive format detected; returning volumes without archive entries")
+                return ExtractedMetadata.Raw(
+                    response = NzbMetadataResponse(
+                        volumes = orderedVolumes.map { it.filename },
+                        obfuscated = obfuscated,
+                        entries = emptyList()
+                    ),
+                    orderedArchiveNzb = orderedArchiveNzb
+                )
+            }
         }
 
         val response = NzbMetadataResponse(
@@ -155,7 +176,7 @@ class ArchiveMetadataService(
             entries = rawEntries.map { it.toResponse() }
         )
 
-        return ExtractedMetadata(
+        return ExtractedMetadata.Archive(
             response = response,
             orderedArchiveNzb = orderedArchiveNzb,
             entries = rawEntries

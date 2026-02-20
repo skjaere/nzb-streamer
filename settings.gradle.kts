@@ -12,3 +12,11 @@ if (file("../ktor-nntp-client").exists()) {
     }
 }
 
+if (file("../kotlin-compression-utils").exists()) {
+    includeBuild("../kotlin-compression-utils") {
+        dependencySubstitution {
+            substitute(module("com.github.skjaere:kotlin-compression-utils")).using(project(":"))
+        }
+    }
+}
+
