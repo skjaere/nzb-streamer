@@ -1,6 +1,7 @@
 package io.skjaere.nzbstreamer
 
 import io.ktor.utils.io.*
+import io.skjaere.compressionutils.Par2Parser
 import io.skjaere.compressionutils.SplitInfo
 import io.skjaere.nzbstreamer.config.NntpConfig
 import io.skjaere.nzbstreamer.config.SeekConfig
@@ -35,7 +36,30 @@ class NzbStreamer private constructor(
     }
 
     fun resolveFile(metadata: ExtractedMetadata, path: String): FileResolveResult {
-        return archiveStreamingService.resolveFile(metadata.entries, metadata.orderedArchiveNzb, path)
+        return when (metadata) {
+            is ExtractedMetadata.Archive ->
+                archiveStreamingService.resolveFile(metadata.entries, metadata.orderedArchiveNzb, path)
+            is ExtractedMetadata.Raw -> resolveRawFile(metadata, path)
+        }
+    }
+
+    private fun resolveRawFile(metadata: ExtractedMetadata.Raw, path: String): FileResolveResult {
+        val nzb = metadata.orderedArchiveNzb
+        val index = nzb.files.indexOfFirst { file ->
+            file.yencHeaders?.name == path && !isPar2(file.first16kb)
+        }
+        if (index < 0) return FileResolveResult.NotFound
+        val size = nzb.files[index].yencHeaders!!.size
+        return FileResolveResult.Ok(
+            splits = listOf(
+                SplitInfo(
+                    volumeIndex = index,
+                    dataStartPosition = ArchiveStreamingService.computeVolumeOffsets(nzb)[index],
+                    dataSize = size
+                )
+            ),
+            totalSize = size
+        )
     }
 
     suspend fun streamFile(
@@ -56,7 +80,26 @@ class NzbStreamer private constructor(
     }
 
     fun resolveStreamableFiles(metadata: ExtractedMetadata): List<StreamableFile> {
-        return archiveStreamingService.resolveStreamableFiles(metadata.entries, metadata.orderedArchiveNzb)
+        return when (metadata) {
+            is ExtractedMetadata.Archive ->
+                archiveStreamingService.resolveStreamableFiles(metadata.entries, metadata.orderedArchiveNzb)
+            is ExtractedMetadata.Raw -> resolveRawStreamableFiles(metadata)
+        }
+    }
+
+    private fun resolveRawStreamableFiles(metadata: ExtractedMetadata.Raw): List<StreamableFile> {
+        return metadata.orderedArchiveNzb.files.mapIndexedNotNull { index, file ->
+            if (isPar2(file.first16kb)) return@mapIndexedNotNull null
+            val headers = file.yencHeaders ?: return@mapIndexedNotNull null
+            StreamableFile(
+                path = headers.name,
+                totalSize = headers.size,
+                startVolumeIndex = index,
+                startOffsetInVolume = 0,
+                continuationHeaderSize = 0,
+                endOfArchiveSize = 0
+            )
+        }
     }
 
     suspend fun streamFile(
@@ -96,6 +139,10 @@ class NzbStreamer private constructor(
 
     override fun close() {
         streamingService.close()
+    }
+
+    private fun isPar2(first16kb: ByteArray?): Boolean {
+        return first16kb != null && Par2Parser.isPar2(first16kb)
     }
 
     class NntpBuilder {
