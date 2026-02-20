@@ -42,11 +42,14 @@ class NntpStreamingService(
             useTls = config.useTls,
             username = config.username.ifEmpty { null },
             password = config.password.ifEmpty { null },
-            maxConnections = config.concurrency,//TODO: separate concurrency and maxConnections
+            maxConnections = config.maxConnections,
             scope = scope
         )
         pool.connect()
-        logger.info("NNTP connection pool initialized with {} connections", config.concurrency)
+        logger.info(
+            "NNTP connection pool initialized with {} connections, per-stream concurrency={}",
+            config.maxConnections, config.concurrency
+        )
     }
 
     suspend fun <T> withClient(block: suspend (NntpClient) -> T): T {
@@ -112,7 +115,6 @@ class NntpStreamingService(
                 if (end > start) {
                     channel.writeFully(data, start, end)
                 }
-                channel.flush()
             }
         }
     }
