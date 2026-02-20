@@ -13,6 +13,7 @@ import io.skjaere.nzbstreamer.stream.NntpStreamingService
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import org.slf4j.LoggerFactory
+import java.io.IOException
 
 @Serializable
 data class NzbMetadataResponse(
@@ -98,7 +99,11 @@ class ArchiveMetadataService(
                         )
                     )
                 } else {
-                    PrepareResult.Success(extractMetadata(enrichedNzb))
+                    try {
+                        PrepareResult.Success(extractMetadata(enrichedNzb))
+                    } catch (e: IOException) {
+                        PrepareResult.UnsupportedArchive(e.message ?: "Unsupported archive type", e)
+                    }
                 }
             }
             is EnrichmentResult.MissingArticles ->
