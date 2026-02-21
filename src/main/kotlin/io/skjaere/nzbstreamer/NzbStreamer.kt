@@ -45,9 +45,7 @@ class NzbStreamer private constructor(
 
     private fun resolveRawFile(metadata: ExtractedMetadata.Raw, path: String): FileResolveResult {
         val nzb = metadata.orderedArchiveNzb
-        val index = nzb.files.indexOfFirst { file ->
-            file.yencHeaders?.name == path && !isPar2(file.first16kb)
-        }
+        val index = metadata.response.volumes.indexOfFirst { it == path }
         if (index < 0) return FileResolveResult.NotFound
         val size = nzb.files[index].yencHeaders!!.size
         return FileResolveResult.Ok(
@@ -89,10 +87,9 @@ class NzbStreamer private constructor(
 
     private fun resolveRawStreamableFiles(metadata: ExtractedMetadata.Raw): List<StreamableFile> {
         return metadata.orderedArchiveNzb.files.mapIndexedNotNull { index, file ->
-            if (isPar2(file.first16kb)) return@mapIndexedNotNull null
             val headers = file.yencHeaders ?: return@mapIndexedNotNull null
             StreamableFile(
-                path = headers.name,
+                path = metadata.response.volumes[index],
                 totalSize = headers.size,
                 startVolumeIndex = index,
                 startOffsetInVolume = 0,
@@ -108,7 +105,16 @@ class NzbStreamer private constructor(
         range: LongRange? = null,
         consume: suspend (ByteReadChannel) -> Unit
     ) {
-        archiveStreamingService.streamFile(metadata.orderedArchiveNzb, file, range, consume)
+        streamFile(metadata.orderedArchiveNzb, file, range, consume)
+    }
+
+    suspend fun streamFile(
+        nzbDocument: NzbDocument,
+        file: StreamableFile,
+        range: LongRange? = null,
+        consume: suspend (ByteReadChannel) -> Unit
+    ) {
+        archiveStreamingService.streamFile(nzbDocument, file, range, consume)
     }
 
     fun launchStreamFile(
@@ -116,7 +122,15 @@ class NzbStreamer private constructor(
         file: StreamableFile,
         range: LongRange? = null
     ): WriterJob {
-        return archiveStreamingService.launchStreamFile(metadata.orderedArchiveNzb, file, range)
+        return launchStreamFile(metadata.orderedArchiveNzb, file, range)
+    }
+
+    fun launchStreamFile(
+        nzbDocument: NzbDocument,
+        file: StreamableFile,
+        range: LongRange? = null
+    ): WriterJob {
+        return archiveStreamingService.launchStreamFile(nzbDocument, file, range)
     }
 
     suspend fun streamVolume(
