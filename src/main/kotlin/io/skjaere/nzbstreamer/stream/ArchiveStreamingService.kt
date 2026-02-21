@@ -5,6 +5,7 @@ import io.skjaere.compressionutils.ArchiveFileEntry
 import io.skjaere.compressionutils.RarFileEntry
 import io.skjaere.compressionutils.SevenZipFileEntry
 import io.skjaere.compressionutils.SplitInfo
+import io.skjaere.compressionutils.TranslatedFileEntry
 import io.skjaere.nzbstreamer.nzb.NzbDocument
 import io.skjaere.nzbstreamer.queue.SegmentQueueService
 import kotlinx.coroutines.flow.flow
@@ -27,14 +28,10 @@ class ArchiveStreamingService(
         archiveNzb: NzbDocument,
         path: String
     ): FileResolveResult {
-        val entry = entries.firstOrNull { entry ->
-            when (entry) {
-                is RarFileEntry -> entry.path == path
-                is SevenZipFileEntry -> entry.path == path
-            }
-        } ?: return FileResolveResult.NotFound
+        val entry = entries.firstOrNull { it.path == path }
+            ?: return FileResolveResult.NotFound
 
-        if (entryIsDirectory(entry)) return FileResolveResult.IsDirectory
+        if (entry.isDirectory) return FileResolveResult.IsDirectory
 
         return resolveExistingFileEntry(entry, archiveNzb)
     }
@@ -47,21 +44,12 @@ class ArchiveStreamingService(
             is SevenZipFileEntry -> if (entry.method != null && entry.method != "Copy") {
                 return FileResolveResult.Compressed("File is compressed (7z method=${entry.method})")
             }
+            is TranslatedFileEntry -> { /* always uncompressed — already validated during translation */ }
         }
 
         val splits = getSplitsForEntry(entry, archiveNzb)
 
-        val totalSize = when (entry) {
-            is RarFileEntry -> entry.uncompressedSize
-            is SevenZipFileEntry -> entry.size
-        }
-
-        return FileResolveResult.Ok(splits, totalSize)
-    }
-
-    private fun entryIsDirectory(entry: ArchiveFileEntry): Boolean = when (entry) {
-        is RarFileEntry -> entry.isDirectory
-        is SevenZipFileEntry -> entry.isDirectory
+        return FileResolveResult.Ok(splits, entry.size)
     }
 
     private fun getSplitsForEntry(
@@ -82,6 +70,8 @@ class ArchiveStreamingService(
         }
 
         is SevenZipFileEntry -> listOf(SplitInfo(0, entry.dataOffset, entry.size))
+
+        is TranslatedFileEntry -> entry.splitParts
     }
 
     suspend fun streamFile(
@@ -184,6 +174,7 @@ class ArchiveStreamingService(
         return when (entry) {
             is RarFileEntry -> resolveRarFile(entry, archiveNzb)
             is SevenZipFileEntry -> resolveSevenZipFile(entry)
+            is TranslatedFileEntry -> null // StreamableFile cannot represent pre-computed nested splits
         }
     }
 

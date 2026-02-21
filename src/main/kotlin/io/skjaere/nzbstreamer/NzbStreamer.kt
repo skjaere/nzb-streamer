@@ -39,6 +39,8 @@ class NzbStreamer private constructor(
         return when (metadata) {
             is ExtractedMetadata.Archive ->
                 archiveStreamingService.resolveFile(metadata.entries, metadata.orderedArchiveNzb, path)
+            is ExtractedMetadata.NestedArchive ->
+                archiveStreamingService.resolveFile(metadata.innerEntries, metadata.orderedArchiveNzb, path)
             is ExtractedMetadata.Raw -> resolveRawFile(metadata, path)
         }
     }
@@ -81,6 +83,8 @@ class NzbStreamer private constructor(
         return when (metadata) {
             is ExtractedMetadata.Archive ->
                 archiveStreamingService.resolveStreamableFiles(metadata.entries, metadata.orderedArchiveNzb)
+            is ExtractedMetadata.NestedArchive ->
+                emptyList() // StreamableFile cannot represent pre-computed splits from nested archives
             is ExtractedMetadata.Raw -> resolveRawStreamableFiles(metadata)
         }
     }
