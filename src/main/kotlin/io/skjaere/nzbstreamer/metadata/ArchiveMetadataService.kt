@@ -6,6 +6,7 @@ import io.skjaere.compressionutils.ListFilesResult
 import io.skjaere.compressionutils.Par2Parser
 import io.skjaere.compressionutils.RarFileEntry
 import io.skjaere.compressionutils.SevenZipFileEntry
+import io.skjaere.compressionutils.TranslatedFileEntry
 import io.skjaere.compressionutils.VolumeMetaData
 import io.skjaere.nzbstreamer.enrichment.EnrichmentResult
 import io.skjaere.nzbstreamer.enrichment.NzbEnrichmentService
@@ -37,6 +38,13 @@ sealed interface ExtractedMetadata {
     data class Raw(
         override val response: NzbMetadataResponse,
         override val orderedArchiveNzb: NzbDocument
+    ) : ExtractedMetadata
+
+    data class NestedArchive(
+        override val response: NzbMetadataResponse,
+        override val orderedArchiveNzb: NzbDocument,
+        val innerEntries: List<ArchiveFileEntry>,
+        val outerEntries: List<ArchiveFileEntry>
     ) : ExtractedMetadata
 }
 
@@ -76,12 +84,23 @@ data class SevenZipFileEntryResponse(
     val crc32: Long? = null
 ) : ArchiveFileEntryResponse
 
+@Serializable
+@SerialName("translated")
+data class TranslatedFileEntryResponse(
+    val path: String,
+    val size: Long,
+    val isDirectory: Boolean,
+    val splitParts: List<SplitInfoResponse>,
+    val crc32: Long? = null
+) : ArchiveFileEntryResponse
+
 class ArchiveMetadataService(
     private val streamingService: NntpStreamingService,
     private val forwardThresholdBytes: Long
 ) {
     private val logger = LoggerFactory.getLogger(ArchiveMetadataService::class.java)
     private val enrichmentService = NzbEnrichmentService(streamingService)
+    private val nestedArchiveService = NestedArchiveMetadataService(streamingService, forwardThresholdBytes)
 
     suspend fun enrich(nzb: NzbDocument): EnrichmentResult {
         val result = enrichmentService.enrich(nzb)
@@ -170,6 +189,22 @@ class ArchiveMetadataService(
             }
         }
 
+        // Check for nested archive (e.g., 7z containing RAR volumes)
+        val innerArchiveFiles = rawEntries.filter { entry ->
+            !entry.isDirectory && ArchiveService.fileHasKnownExtension(entry.path)
+        }
+
+        if (innerArchiveFiles.isNotEmpty() && nestedArchiveService.looksLikeNestedArchive(innerArchiveFiles, rawEntries)) {
+            logger.info("Detected nested archive with {} inner archive files", innerArchiveFiles.size)
+            return nestedArchiveService.extractNestedMetadata(
+                outerEntries = rawEntries,
+                innerArchiveEntries = innerArchiveFiles,
+                orderedArchiveNzb = orderedArchiveNzb,
+                orderedVolumes = orderedVolumes,
+                obfuscated = obfuscated
+            )
+        }
+
         val response = NzbMetadataResponse(
             volumes = orderedVolumes.map { it.filename },
             obfuscated = obfuscated,
@@ -184,7 +219,7 @@ class ArchiveMetadataService(
     }
 }
 
-private fun ArchiveFileEntry.toResponse(): ArchiveFileEntryResponse {
+internal fun ArchiveFileEntry.toResponse(): ArchiveFileEntryResponse {
     return when (this) {
         is RarFileEntry -> RarFileEntryResponse(
             path = path,
@@ -210,6 +245,19 @@ private fun ArchiveFileEntry.toResponse(): ArchiveFileEntryResponse {
             packedSize = packedSize,
             isDirectory = isDirectory,
             method = method,
+            crc32 = crc32
+        )
+        is TranslatedFileEntry -> TranslatedFileEntryResponse(
+            path = path,
+            size = size,
+            isDirectory = isDirectory,
+            splitParts = splitParts.map {
+                SplitInfoResponse(
+                    volumeIndex = it.volumeIndex,
+                    dataStartPosition = it.dataStartPosition,
+                    dataSize = it.dataSize
+                )
+            },
             crc32 = crc32
         )
     }
