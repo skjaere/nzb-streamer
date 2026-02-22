@@ -1,8 +1,10 @@
 package io.skjaere.nzbstreamer.seekable
 
-import io.ktor.utils.io.*
+import io.ktor.utils.io.ByteReadChannel
+import io.ktor.utils.io.discard
+import io.ktor.utils.io.readAvailable
+import io.ktor.utils.io.readByte
 import io.skjaere.compressionutils.SeekableInputStream
-import kotlinx.io.EOFException
 import io.skjaere.nzbstreamer.nzb.NzbDocument
 import io.skjaere.nzbstreamer.queue.SegmentQueueService
 import io.skjaere.nzbstreamer.stream.NntpStreamingService
@@ -12,7 +14,9 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.io.EOFException
 import org.slf4j.LoggerFactory
 
 class NntpSeekableInputStream(
@@ -69,11 +73,13 @@ class NntpSeekableInputStream(
 
     override fun size(): Long = totalSize
 
-    override fun close() {
+    override fun close() { // TODO: close() should be suspendable
         val job = currentJob
         currentJob = null
         currentChannel = null
-        job?.cancel()
+        if (job != null) {
+            runBlocking { job.cancelAndJoin() }
+        }
     }
 
     private suspend fun ensureChannel() {
