@@ -174,7 +174,7 @@ class ArchiveStreamingService(
         return when (entry) {
             is RarFileEntry -> resolveRarFile(entry, archiveNzb)
             is SevenZipFileEntry -> resolveSevenZipFile(entry)
-            is TranslatedFileEntry -> null // StreamableFile cannot represent pre-computed nested splits
+            is TranslatedFileEntry -> resolveTranslatedFile(entry)
         }
     }
 
@@ -236,6 +236,21 @@ class ArchiveStreamingService(
                 endOfArchiveSize = endOfArchiveSize
             )
         }
+    }
+
+    private fun resolveTranslatedFile(entry: TranslatedFileEntry): StreamableFile? {
+        if (entry.isDirectory) return null
+        if (entry.splitParts.isEmpty()) return null
+
+        return StreamableFile(
+            path = entry.path,
+            totalSize = entry.size,
+            startVolumeIndex = 0,
+            startOffsetInVolume = 0,
+            continuationHeaderSize = 0,
+            endOfArchiveSize = 0,
+            preComputedSplits = entry.splitParts
+        )
     }
 
     fun resolveStreamableFiles(

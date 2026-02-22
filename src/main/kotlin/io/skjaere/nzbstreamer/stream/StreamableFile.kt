@@ -9,10 +9,12 @@ data class StreamableFile(
     val startVolumeIndex: Int,
     val startOffsetInVolume: Long,
     val continuationHeaderSize: Long,  // 0 for non-split / 7z
-    val endOfArchiveSize: Long         // 0 for non-split / 7z
+    val endOfArchiveSize: Long,        // 0 for non-split / 7z
+    val preComputedSplits: List<SplitInfo>? = null  // used when inference can't reproduce correct splits
 )
 
 fun StreamableFile.toSplits(archiveNzb: NzbDocument): List<SplitInfo> {
+    if (preComputedSplits != null) return preComputedSplits
 
     val volumeOffsets = ArchiveStreamingService.computeVolumeOffsets(archiveNzb)
     val volumeSizes = ArchiveStreamingService.computeVolumeSizes(archiveNzb)
