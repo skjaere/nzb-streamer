@@ -16,6 +16,7 @@ import io.skjaere.nzbstreamer.stream.ArchiveStreamingService
 import io.skjaere.nzbstreamer.stream.FileResolveResult
 import io.skjaere.nzbstreamer.stream.NntpStreamingService
 import io.skjaere.nzbstreamer.stream.StreamableFile
+import io.skjaere.nzbstreamer.stream.toSplits
 import kotlinx.coroutines.runBlocking
 import java.io.Closeable
 
@@ -84,7 +85,16 @@ class NzbStreamer private constructor(
             is ExtractedMetadata.Archive ->
                 archiveStreamingService.resolveStreamableFiles(metadata.entries, metadata.orderedArchiveNzb)
             is ExtractedMetadata.NestedArchive ->
-                emptyList() // StreamableFile cannot represent pre-computed splits from nested archives
+                metadata.innerEntries.filterNot { it.isDirectory }.map { entry ->
+                    StreamableFile(
+                        path = entry.path,
+                        totalSize = entry.size,
+                        startVolumeIndex = 0,
+                        startOffsetInVolume = 0,
+                        continuationHeaderSize = 0,
+                        endOfArchiveSize = 0
+                    )
+                }
             is ExtractedMetadata.Raw -> resolveRawStreamableFiles(metadata)
         }
     }
@@ -109,7 +119,8 @@ class NzbStreamer private constructor(
         range: LongRange? = null,
         consume: suspend (ByteReadChannel) -> Unit
     ) {
-        streamFile(metadata.orderedArchiveNzb, file, range, consume)
+        val splits = resolveFileSplits(metadata, file)
+        archiveStreamingService.streamFile(metadata.orderedArchiveNzb, splits, range, consume)
     }
 
     suspend fun streamFile(
@@ -126,7 +137,8 @@ class NzbStreamer private constructor(
         file: StreamableFile,
         range: LongRange? = null
     ): WriterJob {
-        return launchStreamFile(metadata.orderedArchiveNzb, file, range)
+        val splits = resolveFileSplits(metadata, file)
+        return archiveStreamingService.launchStreamFile(metadata.orderedArchiveNzb, splits, range)
     }
 
     fun launchStreamFile(
@@ -135,6 +147,22 @@ class NzbStreamer private constructor(
         range: LongRange? = null
     ): WriterJob {
         return archiveStreamingService.launchStreamFile(nzbDocument, file, range)
+    }
+
+    /**
+     * Resolves splits for a [StreamableFile]. For nested archives, the StreamableFile
+     * carries only path+size (its volume fields are placeholders), so we resolve splits
+     * from the metadata's inner entries instead of using [StreamableFile.toSplits].
+     */
+    private fun resolveFileSplits(metadata: ExtractedMetadata, file: StreamableFile): List<SplitInfo> {
+        return when (metadata) {
+            is ExtractedMetadata.NestedArchive -> {
+                val result = resolveFile(metadata, file.path)
+                require(result is FileResolveResult.Ok) { "Cannot resolve nested file: ${file.path}" }
+                result.splits
+            }
+            else -> file.toSplits(metadata.orderedArchiveNzb)
+        }
     }
 
     suspend fun streamVolume(

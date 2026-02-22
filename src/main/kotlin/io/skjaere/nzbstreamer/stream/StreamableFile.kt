@@ -13,6 +13,7 @@ data class StreamableFile(
 )
 
 fun StreamableFile.toSplits(archiveNzb: NzbDocument): List<SplitInfo> {
+
     val volumeOffsets = ArchiveStreamingService.computeVolumeOffsets(archiveNzb)
     val volumeSizes = ArchiveStreamingService.computeVolumeSizes(archiveNzb)
     val parts = mutableListOf<SplitInfo>()

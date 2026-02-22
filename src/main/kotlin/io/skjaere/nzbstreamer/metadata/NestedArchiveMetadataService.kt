@@ -42,11 +42,11 @@ class NestedArchiveMetadataService(
         orderedVolumes: List<VolumeMetaData>,
         obfuscated: Boolean
     ): ExtractedMetadata {
-        val (resolvedInnerVolumes, innerVolumeSizes, outerDataOffsets) =
+        val (resolvedInnerVolumes, innerVolumeSizes, outerChunks) =
             resolveInnerVolumes(innerArchiveEntries, orderedArchiveNzb)
 
         val innerRawEntries = parseInnerArchive(
-            resolvedInnerVolumes, innerVolumeSizes, outerDataOffsets, orderedArchiveNzb
+            resolvedInnerVolumes, innerVolumeSizes, outerChunks, orderedArchiveNzb
         ) ?: run {
             logger.info("Inner archive format not supported; falling back to outer entries")
             return ExtractedMetadata.Archive(
@@ -61,7 +61,7 @@ class NestedArchiveMetadataService(
         }
 
         return buildNestedResult(
-            innerRawEntries, innerVolumeSizes, outerDataOffsets,
+            innerRawEntries, innerVolumeSizes, outerChunks,
             outerEntries, orderedArchiveNzb, orderedVolumes, obfuscated
         )
     }
@@ -69,7 +69,7 @@ class NestedArchiveMetadataService(
     private data class ResolvedInnerVolumes(
         val volumes: List<VolumeMetaData>,
         val sizes: List<Long>,
-        val outerDataOffsets: List<Long>
+        val outerChunks: List<List<SplitInfo>>
     )
 
     private fun resolveInnerVolumes(
@@ -87,7 +87,7 @@ class NestedArchiveMetadataService(
         return ResolvedInnerVolumes(
             volumes = resolvedInnerVolumes,
             sizes = resolvedInnerVolumes.map { it.size },
-            outerDataOffsets = orderedInnerArchiveEntries.map { getEntryDataOffset(it, outerVolumeOffsets) }
+            outerChunks = orderedInnerArchiveEntries.map { getEntryChunks(it, outerVolumeOffsets) }
         )
     }
 
@@ -98,15 +98,15 @@ class NestedArchiveMetadataService(
     private suspend fun parseInnerArchive(
         resolvedInnerVolumes: List<VolumeMetaData>,
         innerVolumeSizes: List<Long>,
-        outerDataOffsets: List<Long>,
+        outerChunks: List<List<SplitInfo>>,
         orderedArchiveNzb: NzbDocument
     ): List<ArchiveFileEntry>? {
         val volumesWithHeaders = NntpSeekableInputStream(
             orderedArchiveNzb, streamingService, forwardThresholdBytes
         ).use { stream ->
-            resolvedInnerVolumes.zip(outerDataOffsets).map { (vol, outerOffset) ->
+            resolvedInnerVolumes.zip(outerChunks).map { (vol, chunks) ->
                 val first16kb = ByteArray(minOf(16384, vol.size).toInt())
-                stream.seek(outerOffset)
+                stream.seek(chunks[0].dataStartPosition)
                 var totalRead = 0
                 while (totalRead < first16kb.size) {
                     val n = stream.read(first16kb, totalRead, first16kb.size - totalRead)
@@ -120,7 +120,7 @@ class NestedArchiveMetadataService(
         val innerListResult = NestedSeekableInputStream(
             outerStream = NntpSeekableInputStream(orderedArchiveNzb, streamingService, forwardThresholdBytes),
             innerVolumeSizes = innerVolumeSizes,
-            outerDataOffsets = outerDataOffsets
+            outerChunks = outerChunks
         ).use { stream ->
             ArchiveService.listFiles(stream, volumesWithHeaders)
         }
@@ -134,7 +134,7 @@ class NestedArchiveMetadataService(
     private fun buildNestedResult(
         innerRawEntries: List<ArchiveFileEntry>,
         innerVolumeSizes: List<Long>,
-        outerDataOffsets: List<Long>,
+        outerChunks: List<List<SplitInfo>>,
         outerEntries: List<ArchiveFileEntry>,
         orderedArchiveNzb: NzbDocument,
         orderedVolumes: List<VolumeMetaData>,
@@ -150,7 +150,7 @@ class NestedArchiveMetadataService(
         }
 
         val translatedEntries = translateInnerEntries(
-            innerRawEntries, innerCumOffsets, innerVolumeSizes, outerDataOffsets
+            innerRawEntries, innerCumOffsets, innerVolumeSizes, outerChunks
         )
 
         val allResponseEntries = translatedEntries.map { it.toResponse() } +
@@ -171,21 +171,22 @@ class NestedArchiveMetadataService(
     }
 
     /**
-     * Gets the absolute data offset of an entry in the outer concatenated stream.
+     * Gets the chunks describing where an entry's data lives in the outer concatenated stream.
      */
-    private fun getEntryDataOffset(
+    private fun getEntryChunks(
         entry: ArchiveFileEntry,
         outerVolumeOffsets: List<Long>
-    ): Long = when (entry) {
+    ): List<SplitInfo> = when (entry) {
         is RarFileEntry -> {
             if (entry.splitParts.isNotEmpty()) {
-                entry.splitParts[0].dataStartPosition
+                entry.splitParts
             } else {
-                outerVolumeOffsets[entry.volumeIndex] + entry.dataPosition
+                listOf(SplitInfo(0, outerVolumeOffsets[entry.volumeIndex] + entry.dataPosition, entry.size))
             }
         }
-        is SevenZipFileEntry -> entry.dataOffset
-        is TranslatedFileEntry -> entry.splitParts[0].dataStartPosition
+
+        is SevenZipFileEntry -> listOf(SplitInfo(0, entry.dataOffset, entry.size))
+        is TranslatedFileEntry -> entry.splitParts
     }
 
     /**
@@ -195,17 +196,23 @@ class NestedArchiveMetadataService(
         innerEntries: List<ArchiveFileEntry>,
         innerCumOffsets: List<Long>,
         innerVolumeSizes: List<Long>,
-        outerDataOffsets: List<Long>
+        outerChunks: List<List<SplitInfo>>
     ): List<ArchiveFileEntry> = innerEntries.map { entry ->
         when (entry) {
             is RarFileEntry -> {
                 val translatedSplits = if (entry.splitParts.isNotEmpty()) {
                     entry.splitParts.flatMap { split ->
-                        translateRange(split.dataStartPosition, split.dataSize, innerCumOffsets, innerVolumeSizes, outerDataOffsets)
+                        translateRange(
+                            split.dataStartPosition,
+                            split.dataSize,
+                            innerCumOffsets,
+                            innerVolumeSizes,
+                            outerChunks
+                        )
                     }
                 } else {
                     val innerAbsPos = innerCumOffsets[entry.volumeIndex] + entry.dataPosition
-                    translateRange(innerAbsPos, entry.uncompressedSize, innerCumOffsets, innerVolumeSizes, outerDataOffsets)
+                    translateRange(innerAbsPos, entry.uncompressedSize, innerCumOffsets, innerVolumeSizes, outerChunks)
                 }
                 TranslatedFileEntry(
                     path = entry.path,
@@ -215,9 +222,10 @@ class NestedArchiveMetadataService(
                     crc32 = entry.crc32
                 )
             }
+
             is SevenZipFileEntry -> {
                 val translatedSplits = translateRange(
-                    entry.dataOffset, entry.size, innerCumOffsets, innerVolumeSizes, outerDataOffsets
+                    entry.dataOffset, entry.size, innerCumOffsets, innerVolumeSizes, outerChunks
                 )
                 TranslatedFileEntry(
                     path = entry.path,
@@ -227,6 +235,7 @@ class NestedArchiveMetadataService(
                     crc32 = entry.crc32
                 )
             }
+
             is TranslatedFileEntry -> entry // already translated
         }
     }
@@ -234,14 +243,15 @@ class NestedArchiveMetadataService(
     /**
      * Translates a contiguous byte range in the inner concatenated stream
      * into one or more [SplitInfo] entries with outer stream positions.
-     * Handles ranges that cross inner volume boundaries.
+     * Handles ranges that cross inner volume boundaries, and walks each
+     * volume's chunks to handle non-contiguous outer data (e.g., RAR splits).
      */
     internal fun translateRange(
         startPos: Long,
         size: Long,
         innerCumOffsets: List<Long>,
         innerVolumeSizes: List<Long>,
-        outerDataOffsets: List<Long>
+        outerChunks: List<List<SplitInfo>>
     ): List<SplitInfo> {
         val splits = mutableListOf<SplitInfo>()
         var remaining = size
@@ -251,18 +261,31 @@ class NestedArchiveMetadataService(
             val volIndex = findVolumeIndex(pos, innerCumOffsets)
             val localOffset = pos - innerCumOffsets[volIndex]
             val availableInVol = innerVolumeSizes[volIndex] - localOffset
-            val chunkSize = minOf(remaining, availableInVol)
+            val takeFromVol = minOf(remaining, availableInVol)
 
-            splits.add(
-                SplitInfo(
-                    volumeIndex = 0, // volume index is meaningless for translated splits
-                    dataStartPosition = outerDataOffsets[volIndex] + localOffset,
-                    dataSize = chunkSize
+            // Walk chunks within this volume to map localOffset → outer positions
+            var chunkLocalPos = localOffset
+            var volRemaining = takeFromVol
+            for (chunk in outerChunks[volIndex]) {
+                if (chunkLocalPos >= chunk.dataSize) {
+                    chunkLocalPos -= chunk.dataSize
+                    continue
+                }
+                val takeFromChunk = minOf(volRemaining, chunk.dataSize - chunkLocalPos)
+                splits.add(
+                    SplitInfo(
+                        volumeIndex = 0,
+                        dataStartPosition = chunk.dataStartPosition + chunkLocalPos,
+                        dataSize = takeFromChunk
+                    )
                 )
-            )
+                volRemaining -= takeFromChunk
+                chunkLocalPos = 0 // subsequent chunks start from beginning
+                if (volRemaining <= 0) break
+            }
 
-            remaining -= chunkSize
-            pos += chunkSize
+            remaining -= takeFromVol
+            pos += takeFromVol
         }
 
         return splits
