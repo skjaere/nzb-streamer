@@ -11,6 +11,8 @@ import io.skjaere.compressionutils.VolumeMetaData
 import io.skjaere.nzbstreamer.config.PrepareConfig
 import io.skjaere.nzbstreamer.enrichment.EnrichmentResult
 import io.skjaere.nzbstreamer.enrichment.NzbEnrichmentService
+import io.skjaere.nzbstreamer.enrichment.VerificationResult
+import io.skjaere.nzbstreamer.enrichment.VerificationService
 import io.skjaere.nzbstreamer.nzb.NzbDocument
 import io.skjaere.nzbstreamer.seekable.NntpSeekableInputStream
 import io.skjaere.nzbstreamer.stream.NntpStreamingService
@@ -102,7 +104,8 @@ class ArchiveMetadataService(
     concurrency: Int = 1
 ) {
     private val logger = LoggerFactory.getLogger(ArchiveMetadataService::class.java)
-    private val enrichmentService = NzbEnrichmentService(streamingService, concurrency)
+    private val enrichmentService = NzbEnrichmentService(streamingService)
+    private val verificationService = VerificationService(streamingService, concurrency)
     private val nestedArchiveService = NestedArchiveMetadataService(streamingService, forwardThresholdBytes)
 
     suspend fun enrich(nzb: NzbDocument): EnrichmentResult {
@@ -121,12 +124,12 @@ class ArchiveMetadataService(
                 val enrichedNzb = result.enrichedNzb
 
                 if (prepareConfig.verifySegments) {
-                    when (val v = enrichmentService.verifySegments(enrichedNzb)) {
-                        is EnrichmentResult.MissingArticles ->
+                    when (val v = verificationService.verifySegments(enrichedNzb)) {
+                        is VerificationResult.MissingArticles ->
                             return PrepareResult.MissingArticles(v.message, v.cause)
-                        is EnrichmentResult.Failure ->
+                        is VerificationResult.Failure ->
                             return PrepareResult.Failure(v.message, v.cause)
-                        is EnrichmentResult.Success -> { /* continue */ }
+                        is VerificationResult.Success -> { /* continue */ }
                     }
                 }
 

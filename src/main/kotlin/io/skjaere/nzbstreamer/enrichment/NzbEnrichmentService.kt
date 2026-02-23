@@ -3,7 +3,6 @@ package io.skjaere.nzbstreamer.enrichment
 import io.ktor.utils.io.*
 import io.skjaere.nntp.ArticleNotFoundException
 import io.skjaere.nntp.NntpException
-import io.skjaere.nntp.StatResult
 import io.skjaere.nntp.YencEvent
 import io.skjaere.nzbstreamer.nzb.NzbDocument
 import io.skjaere.nzbstreamer.nzb.NzbFile
@@ -12,14 +11,12 @@ import io.skjaere.nzbstreamer.stream.NntpStreamingService
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
-import kotlinx.coroutines.sync.Semaphore
 import io.skjaere.compressionutils.Par2Parser
 import org.slf4j.LoggerFactory
 import kotlin.math.min
 
 class NzbEnrichmentService(
-    private val streamingService: NntpStreamingService,
-    private val concurrency: Int = 1
+    private val streamingService: NntpStreamingService
 ) {
     private val logger = LoggerFactory.getLogger(NzbEnrichmentService::class.java)
 
@@ -105,60 +102,5 @@ class NzbEnrichmentService(
             file.par2Data = channel.toByteArray()
         }
         logger.info("Downloaded PAR2 file: {} ({} bytes)", file.yencHeaders?.name, file.par2Data?.size)
-    }
-
-    suspend fun verifySegments(nzb: NzbDocument): EnrichmentResult {
-        val segmentsToVerify = nzb.files.flatMap { file ->
-            file.segments.drop(1) // first segment already verified by enrichment
-        }
-
-        if (segmentsToVerify.isEmpty()) {
-            logger.info("No additional segments to verify")
-            return EnrichmentResult.Success(nzb)
-        }
-
-        logger.info("Verifying {} additional segments", segmentsToVerify.size)
-
-        val missingArticles = mutableListOf<String>()
-        try {
-            coroutineScope {
-                val semaphore = Semaphore(concurrency)
-                segmentsToVerify.map { segment ->
-                    async {
-                        semaphore.acquire()
-                        try {
-                            val result = streamingService.withClient { client ->
-                                client.stat("<${segment.articleId}>")
-                            }
-                            if (result is StatResult.NotFound) {
-                                synchronized(missingArticles) {
-                                    missingArticles.add(segment.articleId)
-                                }
-                            }
-                        } finally {
-                            semaphore.release()
-                        }
-                    }
-                }.awaitAll()
-            }
-        } catch (e: NntpException) {
-            logger.error("NNTP failure during segment verification: {}", e.message, e)
-            return EnrichmentResult.Failure(
-                e.message ?: "NNTP failure during segment verification",
-                e
-            )
-        }
-
-        if (missingArticles.isNotEmpty()) {
-            val message = "Missing ${missingArticles.size} articles: ${missingArticles.joinToString(", ")}"
-            logger.warn(message)
-            return EnrichmentResult.MissingArticles(
-                message,
-                ArticleNotFoundException("Missing articles: ${missingArticles.joinToString(", ")}")
-            )
-        }
-
-        logger.info("All {} segments verified successfully", segmentsToVerify.size)
-        return EnrichmentResult.Success(nzb)
     }
 }
