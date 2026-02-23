@@ -8,6 +8,7 @@ import io.skjaere.compressionutils.RarFileEntry
 import io.skjaere.compressionutils.SevenZipFileEntry
 import io.skjaere.compressionutils.TranslatedFileEntry
 import io.skjaere.compressionutils.VolumeMetaData
+import io.skjaere.nzbstreamer.config.PrepareConfig
 import io.skjaere.nzbstreamer.enrichment.EnrichmentResult
 import io.skjaere.nzbstreamer.enrichment.NzbEnrichmentService
 import io.skjaere.nzbstreamer.nzb.NzbDocument
@@ -96,10 +97,12 @@ data class TranslatedFileEntryResponse(
 
 class ArchiveMetadataService(
     private val streamingService: NntpStreamingService,
-    private val forwardThresholdBytes: Long
+    private val forwardThresholdBytes: Long,
+    private val prepareConfig: PrepareConfig = PrepareConfig(),
+    concurrency: Int = 1
 ) {
     private val logger = LoggerFactory.getLogger(ArchiveMetadataService::class.java)
-    private val enrichmentService = NzbEnrichmentService(streamingService)
+    private val enrichmentService = NzbEnrichmentService(streamingService, concurrency)
     private val nestedArchiveService = NestedArchiveMetadataService(streamingService, forwardThresholdBytes)
 
     suspend fun enrich(nzb: NzbDocument): EnrichmentResult {
@@ -116,6 +119,17 @@ class ArchiveMetadataService(
         return when (val result = enrich(nzb)) {
             is EnrichmentResult.Success -> {
                 val enrichedNzb = result.enrichedNzb
+
+                if (prepareConfig.verifySegments) {
+                    when (val v = enrichmentService.verifySegments(enrichedNzb)) {
+                        is EnrichmentResult.MissingArticles ->
+                            return PrepareResult.MissingArticles(v.message, v.cause)
+                        is EnrichmentResult.Failure ->
+                            return PrepareResult.Failure(v.message, v.cause)
+                        is EnrichmentResult.Success -> { /* continue */ }
+                    }
+                }
+
                 if (enrichedNzb.files.isEmpty()) {
                     PrepareResult.Success(
                         ExtractedMetadata.Raw(
