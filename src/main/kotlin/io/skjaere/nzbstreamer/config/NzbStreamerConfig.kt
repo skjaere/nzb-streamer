@@ -14,3 +14,7 @@ data class NntpConfig(
 data class SeekConfig(
     val forwardThresholdBytes: Long
 )
+
+data class PrepareConfig(
+    val verifySegments: Boolean = false
+)

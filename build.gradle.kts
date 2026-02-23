@@ -30,6 +30,8 @@ dependencies {
     testImplementation(libs.kotlin.test)
     testImplementation(libs.junit.jupiter)
     testImplementation(libs.kotlinx.coroutines.test)
+    testImplementation(libs.testcontainers)
+    testImplementation("io.skjaere.mocknntp:mock-nntp-server")
 }
 
 tasks.test {
