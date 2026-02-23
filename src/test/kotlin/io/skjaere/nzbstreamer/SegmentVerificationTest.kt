@@ -7,6 +7,8 @@ import io.skjaere.nzbstreamer.config.NntpConfig
 import io.skjaere.nzbstreamer.config.PrepareConfig
 import io.skjaere.nzbstreamer.enrichment.EnrichmentResult
 import io.skjaere.nzbstreamer.enrichment.NzbEnrichmentService
+import io.skjaere.nzbstreamer.enrichment.VerificationResult
+import io.skjaere.nzbstreamer.enrichment.VerificationService
 import io.skjaere.nzbstreamer.metadata.ArchiveMetadataService
 import io.skjaere.nzbstreamer.metadata.PrepareResult
 import io.skjaere.nzbstreamer.nzb.NzbDocument
@@ -93,7 +95,8 @@ class SegmentVerificationTest {
 
         val streamingService = createStreamingService(socket.localPort)
         streamingService.use {
-            val enrichmentService = NzbEnrichmentService(streamingService, concurrency = 1)
+            val enrichmentService = NzbEnrichmentService(streamingService)
+            val verificationService = VerificationService(streamingService, concurrency = 1)
             val nzb = createMultiSegmentNzb(
                 "file1" to listOf("seg1@test", "seg2@test", "seg3@test")
             )
@@ -101,8 +104,8 @@ class SegmentVerificationTest {
             val enrichResult = enrichmentService.enrich(nzb)
             assertIs<EnrichmentResult.Success>(enrichResult)
 
-            val verifyResult = enrichmentService.verifySegments(enrichResult.enrichedNzb)
-            assertIs<EnrichmentResult.Success>(verifyResult)
+            val verifyResult = verificationService.verifySegments(enrichResult.enrichedNzb)
+            assertIs<VerificationResult.Success>(verifyResult)
         }
     }
 
@@ -114,7 +117,8 @@ class SegmentVerificationTest {
 
         val streamingService = createStreamingService(socket.localPort)
         streamingService.use {
-            val enrichmentService = NzbEnrichmentService(streamingService, concurrency = 1)
+            val enrichmentService = NzbEnrichmentService(streamingService)
+            val verificationService = VerificationService(streamingService, concurrency = 1)
             val nzb = createMultiSegmentNzb(
                 "file1" to listOf("seg1@test", "missing@test")
             )
@@ -122,8 +126,8 @@ class SegmentVerificationTest {
             val enrichResult = enrichmentService.enrich(nzb)
             assertIs<EnrichmentResult.Success>(enrichResult)
 
-            val verifyResult = enrichmentService.verifySegments(enrichResult.enrichedNzb)
-            assertIs<EnrichmentResult.MissingArticles>(verifyResult)
+            val verifyResult = verificationService.verifySegments(enrichResult.enrichedNzb)
+            assertIs<VerificationResult.MissingArticles>(verifyResult)
             assertTrue(verifyResult.message.contains("missing@test"))
         }
     }
@@ -135,7 +139,8 @@ class SegmentVerificationTest {
 
         val streamingService = createStreamingService(socket.localPort)
         streamingService.use {
-            val enrichmentService = NzbEnrichmentService(streamingService, concurrency = 1)
+            val enrichmentService = NzbEnrichmentService(streamingService)
+            val verificationService = VerificationService(streamingService, concurrency = 1)
             val nzb = createMultiSegmentNzb(
                 "file1" to listOf("seg1@test")
             )
@@ -143,8 +148,8 @@ class SegmentVerificationTest {
             val enrichResult = enrichmentService.enrich(nzb)
             assertIs<EnrichmentResult.Success>(enrichResult)
 
-            val verifyResult = enrichmentService.verifySegments(enrichResult.enrichedNzb)
-            assertIs<EnrichmentResult.Success>(verifyResult)
+            val verifyResult = verificationService.verifySegments(enrichResult.enrichedNzb)
+            assertIs<VerificationResult.Success>(verifyResult)
         }
     }
 
@@ -202,7 +207,8 @@ class SegmentVerificationTest {
 
         val streamingService = createStreamingService(socket.localPort)
         streamingService.use {
-            val enrichmentService = NzbEnrichmentService(streamingService, concurrency = 1)
+            val enrichmentService = NzbEnrichmentService(streamingService)
+            val verificationService = VerificationService(streamingService, concurrency = 1)
             val nzb = createMultiSegmentNzb(
                 "file1" to listOf("seg1@test", "seg2@test")
             )
@@ -214,8 +220,8 @@ class SegmentVerificationTest {
             serverScope.cancel()
             socket.close()
 
-            val verifyResult = enrichmentService.verifySegments(enrichResult.enrichedNzb)
-            assertIs<EnrichmentResult.Failure>(verifyResult)
+            val verifyResult = verificationService.verifySegments(enrichResult.enrichedNzb)
+            assertIs<VerificationResult.Failure>(verifyResult)
             assertIs<NntpConnectionException>(verifyResult.cause)
         }
     }

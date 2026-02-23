@@ -7,6 +7,8 @@ import io.skjaere.nzbstreamer.config.NntpConfig
 import io.skjaere.nzbstreamer.config.PrepareConfig
 import io.skjaere.nzbstreamer.config.SeekConfig
 import io.skjaere.nzbstreamer.enrichment.EnrichmentResult
+import io.skjaere.nzbstreamer.enrichment.VerificationResult
+import io.skjaere.nzbstreamer.enrichment.VerificationService
 import io.skjaere.nzbstreamer.metadata.ArchiveMetadataService
 import io.skjaere.nzbstreamer.metadata.ExtractedMetadata
 import io.skjaere.nzbstreamer.metadata.PrepareResult
@@ -23,8 +25,13 @@ import java.io.Closeable
 class NzbStreamer private constructor(
     private val streamingService: NntpStreamingService,
     private val metadataService: ArchiveMetadataService,
+    private val verificationService: VerificationService,
     private val archiveStreamingService: ArchiveStreamingService
 ) : Closeable {
+
+    suspend fun verifySegments(nzb: NzbDocument): VerificationResult {
+        return verificationService.verifySegments(nzb)
+    }
 
     suspend fun enrich(nzbBytes: ByteArray): EnrichmentResult {
         val nzb = NzbParser.parse(nzbBytes)
@@ -220,9 +227,10 @@ class NzbStreamer private constructor(
             val metadataService = ArchiveMetadataService(
                 streamingService, seekConfig.forwardThresholdBytes, prepareConfig, nntpConfig.concurrency
             )
+            val verificationService = VerificationService(streamingService, nntpConfig.concurrency)
             val archiveStreamingService = ArchiveStreamingService(streamingService)
 
-            return NzbStreamer(streamingService, metadataService, archiveStreamingService)
+            return NzbStreamer(streamingService, metadataService, verificationService, archiveStreamingService)
         }
     }
 
