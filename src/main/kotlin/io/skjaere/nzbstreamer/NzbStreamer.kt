@@ -79,7 +79,7 @@ class NzbStreamer private constructor(
         archiveStreamingService.streamFile(metadata.orderedArchiveNzb, splits, range, consume)
     }
 
-    fun launchStreamFile(
+    suspend fun launchStreamFile(
         metadata: ExtractedMetadata,
         splits: List<SplitInfo>,
         range: LongRange? = null
@@ -129,7 +129,7 @@ class NzbStreamer private constructor(
         archiveStreamingService.streamFile(nzbDocument, file, range, consume)
     }
 
-    fun launchStreamFile(
+    suspend fun launchStreamFile(
         metadata: ExtractedMetadata,
         file: StreamableFile,
         range: LongRange? = null
@@ -137,7 +137,7 @@ class NzbStreamer private constructor(
         return archiveStreamingService.launchStreamFile(metadata.orderedArchiveNzb, file, range)
     }
 
-    fun launchStreamFile(
+    suspend fun launchStreamFile(
         nzbDocument: NzbDocument,
         file: StreamableFile,
         range: LongRange? = null
