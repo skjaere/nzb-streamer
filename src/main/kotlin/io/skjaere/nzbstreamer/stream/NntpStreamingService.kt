@@ -20,6 +20,7 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.channels.consumeEach
 import kotlinx.coroutines.channels.produce
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.toList
 import kotlinx.coroutines.sync.Semaphore
@@ -58,16 +59,17 @@ class NntpStreamingService(
 
     /**
      * Streams segments concurrently and passes the resulting [ByteReadChannel] to [consume].
-     * The writer coroutine's lifecycle is tied to the calling coroutine via [coroutineScope] —
-     * if the caller is cancelled, all in-flight downloads are cancelled automatically.
+     * Uses structured concurrency via [coroutineScope] — exceptions from segment downloads
+     * propagate directly to the caller, and cancellation of the caller cancels all in-flight
+     * downloads automatically.
      */
     suspend fun streamSegments(
         queue: Flow<SegmentQueueItem>,
         concurrency: Int = config.concurrency,
         readAheadSegments: Int = config.readAheadSegments,
         consume: suspend (ByteReadChannel) -> Unit
-    ) {
-        val writerJob = launchSegmentWriter(queue, concurrency, readAheadSegments)
+    ) = coroutineScope {
+        val writerJob = launchStreamSegments(queue, concurrency, readAheadSegments)
         try {
             consume(writerJob.channel)
         } finally {
@@ -75,20 +77,17 @@ class NntpStreamingService(
         }
     }
 
-    fun launchStreamSegments(
+    /**
+     * Launches segment streaming as a child of the caller's coroutine scope, returning a [WriterJob]
+     * whose channel can be read independently. The caller manages the job's lifecycle.
+     */
+    suspend fun launchStreamSegments(
         queue: Flow<SegmentQueueItem>,
         concurrency: Int = config.concurrency,
         readAheadSegments: Int = config.readAheadSegments
     ): WriterJob {
-        return launchSegmentWriter(queue, concurrency, readAheadSegments)
-    }
-
-    private fun launchSegmentWriter(
-        queue: Flow<SegmentQueueItem>,
-        concurrency: Int,
-        readAheadSegments: Int
-    ): WriterJob {
-        return scope.writer(autoFlush = false) {
+        val callerScope = CoroutineScope(currentCoroutineContext())
+        return callerScope.writer(autoFlush = false) {
             val items = queue.toList()
             if (items.isEmpty()) return@writer
 
