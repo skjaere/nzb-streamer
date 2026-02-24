@@ -253,12 +253,25 @@ class NestedArchiveMetadataService(
         innerVolumeSizes: List<Long>,
         outerChunks: List<List<SplitInfo>>
     ): List<SplitInfo> {
+        if (size <= 0) return emptyList()
+        val totalInnerSize = innerCumOffsets.last()
+        if (startPos >= totalInnerSize) return emptyList()
+
+        // Clamp to what actually exists in the inner stream — prevents
+        // infinite loop when size > remaining data (e.g. uncompressedSize
+        // passed for a compressed entry).
+        val effectiveSize = minOf(size, totalInnerSize - startPos)
         val splits = mutableListOf<SplitInfo>()
-        var remaining = size
+        var remaining = effectiveSize
         var pos = startPos
+        var volIndex = findVolumeIndex(pos, innerCumOffsets)
 
         while (remaining > 0) {
-            val volIndex = findVolumeIndex(pos, innerCumOffsets)
+            // Advance volume index forward (pos only increases)
+            while (volIndex < innerVolumeSizes.size - 1 && pos >= innerCumOffsets[volIndex + 1]) {
+                volIndex++
+            }
+
             val localOffset = pos - innerCumOffsets[volIndex]
             val availableInVol = innerVolumeSizes[volIndex] - localOffset
             val takeFromVol = minOf(remaining, availableInVol)
@@ -267,6 +280,7 @@ class NestedArchiveMetadataService(
             var chunkLocalPos = localOffset
             var volRemaining = takeFromVol
             for (chunk in outerChunks[volIndex]) {
+                if (volRemaining <= 0) break
                 if (chunkLocalPos >= chunk.dataSize) {
                     chunkLocalPos -= chunk.dataSize
                     continue
@@ -281,7 +295,6 @@ class NestedArchiveMetadataService(
                 )
                 volRemaining -= takeFromChunk
                 chunkLocalPos = 0 // subsequent chunks start from beginning
-                if (volRemaining <= 0) break
             }
 
             remaining -= takeFromVol
