@@ -102,7 +102,7 @@ class ArchiveStreamingService(
         streamingService.streamSegments(combinedQueue, consume = consume)
     }
 
-    fun launchStreamFile(
+    suspend fun launchStreamFile(
         archiveNzb: NzbDocument,
         splits: List<SplitInfo>,
         range: LongRange? = null
@@ -270,7 +270,7 @@ class ArchiveStreamingService(
         streamFile(archiveNzb, splits, range, consume)
     }
 
-    fun launchStreamFile(
+    suspend fun launchStreamFile(
         archiveNzb: NzbDocument,
         file: StreamableFile,
         range: LongRange? = null
