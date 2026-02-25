@@ -31,7 +31,7 @@ dependencies {
     testImplementation(libs.junit.jupiter)
     testImplementation(libs.kotlinx.coroutines.test)
     testImplementation(libs.testcontainers)
-    testImplementation("io.skjaere.mocknntp:mock-nntp-server")
+    testImplementation("com.github.skjaere:mock-nntp-server:v0.2.0")
 }
 
 tasks.test {
