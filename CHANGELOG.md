@@ -1,5 +1,30 @@
 # Changelog
 
+## [0.4.0](https://github.com/skjaere/nzb-streamer/compare/v0.3.0...v0.4.0) (2026-02-25)
+
+
+### Features
+
+* adding support for nested archives ([89b711a](https://github.com/skjaere/nzb-streamer/commit/89b711af6d1ff38d5a38b00834387eb68a611f49))
+* supporting checking if all segments are present before import ([0778191](https://github.com/skjaere/nzb-streamer/commit/077819134e3cbb71bf3d73ace651b643555d536b))
+* supporting pre-computed splits for nested archives ([98f76a4](https://github.com/skjaere/nzb-streamer/commit/98f76a405d736fe3c9715298a1d31bdc04eccb26))
+
+
+### Bug Fixes
+
+* fix:  ([436895e](https://github.com/skjaere/nzb-streamer/commit/436895e740441c7e272374e5e73d25552e73ec8d))
+* add missing VerificationResult and VerificationService source files ([7bada9b](https://github.com/skjaere/nzb-streamer/commit/7bada9b08c21dbd6c0812f60ae4273a15c56e7c0))
+* bumping kotlin-compression-utils to 0.3.0 ([1453d54](https://github.com/skjaere/nzb-streamer/commit/1453d54cbfeb1b5adebf75f5a43f227398740668))
+* bumping kotlin-compression-utils to 0.3.1 ([25ec896](https://github.com/skjaere/nzb-streamer/commit/25ec896b8d58fda183281bce118dfb17f6512ac3))
+* bumping ktor-nntp-client to 0.2.0 ([b7266b4](https://github.com/skjaere/nzb-streamer/commit/b7266b461126febd927f6e825e5e1afb0664590d))
+* fixing bug rar-in-rar streaming ([c75825b](https://github.com/skjaere/nzb-streamer/commit/c75825bbfb8a1d8d2a6c0ffd3f68023bce00748d))
+* handling unsupported archives ([8826801](https://github.com/skjaere/nzb-streamer/commit/8826801e7562d0a3f026996e3655339165665771))
+* refactoring segment verification ([b87b90a](https://github.com/skjaere/nzb-streamer/commit/b87b90adc45601bf0f477a1a7ee83725fb65bd68))
+* returning proper response object from enrishment service ([5615d47](https://github.com/skjaere/nzb-streamer/commit/5615d47df7ab620c9437365a3b0cf408a6701a27))
+* separating concurrency and max connection settings ([140e98c](https://github.com/skjaere/nzb-streamer/commit/140e98cd2366d171d669e4c4623e00c7704b7cb5))
+* supporting nested archives within 7zip archives ([8e79476](https://github.com/skjaere/nzb-streamer/commit/8e79476c9ba53445235ba9f347a70fa6364135f8))
+* supporting non-archive nzbs ([24a265f](https://github.com/skjaere/nzb-streamer/commit/24a265fa0a7ef105795ce790ee34220130c780dd))
+
 ## [0.3.0](https://github.com/skjaere/nzb-streamer/compare/v0.2.0...v0.3.0) (2026-02-18)
 
 
