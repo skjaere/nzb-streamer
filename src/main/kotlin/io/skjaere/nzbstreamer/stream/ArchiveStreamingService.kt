@@ -102,7 +102,7 @@ class ArchiveStreamingService(
                 ).collect { emit(it) }
             }
         }
-        streamingService.streamSegments(combinedQueue, consume = consume)
+        streamingService.streamSegments(combinedQueue, name = namedSplits.name, consume = consume)
     }
 
     suspend fun launchStreamFile(
@@ -123,7 +123,7 @@ class ArchiveStreamingService(
                 ).collect { emit(it) }
             }
         }
-        return streamingService.launchStreamSegments(combinedQueue)
+        return streamingService.launchStreamSegments(combinedQueue, name = namedSplits.name)
     }
 
     companion object {

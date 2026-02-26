@@ -6,6 +6,7 @@ import io.ktor.utils.io.WriterJob
 import io.ktor.utils.io.toByteArray
 import io.ktor.utils.io.writeFully
 import io.ktor.utils.io.writer
+import io.micrometer.core.instrument.Counter
 import io.micrometer.core.instrument.Metrics
 import io.micrometer.core.instrument.Timer
 import io.skjaere.nntp.NntpClient
@@ -28,6 +29,7 @@ import kotlinx.coroutines.flow.toList
 import kotlinx.coroutines.sync.Semaphore
 import org.slf4j.LoggerFactory
 import java.io.Closeable
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicLong
 
 class NntpStreamingService(
@@ -43,6 +45,7 @@ class NntpStreamingService(
     private val segmentDownloadTimer = registry.timer("nzb.segments.download.duration")
     private val segmentsFailed = registry.counter("nzb.segments.failed")
     private val activeStreams = AtomicLong(0).also { registry.gauge("nzb.streams.active", it) }
+    private val streamCounters = ConcurrentHashMap<String, Counter>()
 
     suspend fun connect() {
         val selectorManager = SelectorManager(Dispatchers.IO)
@@ -79,12 +82,16 @@ class NntpStreamingService(
         queue: Flow<SegmentQueueItem>,
         concurrency: Int = config.concurrency,
         readAheadSegments: Int = config.readAheadSegments,
+        name: String = "unknown",
         consume: suspend (ByteReadChannel) -> Unit
     ) {
+        val counter = streamCounters.computeIfAbsent(name) {
+            registry.counter("nzb.streams.bytes", "name", name)
+        }
         activeStreams.incrementAndGet()
         try {
             coroutineScope {
-                val writerJob = launchStreamSegments(queue, concurrency, readAheadSegments)
+                val writerJob = launchStreamSegments(queue, concurrency, readAheadSegments, counter)
                 try {
                     consume(writerJob.channel)
                 } finally {
@@ -103,7 +110,20 @@ class NntpStreamingService(
     suspend fun launchStreamSegments(
         queue: Flow<SegmentQueueItem>,
         concurrency: Int = config.concurrency,
-        readAheadSegments: Int = config.readAheadSegments
+        readAheadSegments: Int = config.readAheadSegments,
+        name: String = "unknown"
+    ): WriterJob {
+        val counter = streamCounters.computeIfAbsent(name) {
+            registry.counter("nzb.streams.bytes", "name", name)
+        }
+        return launchStreamSegments(queue, concurrency, readAheadSegments, counter)
+    }
+
+    private suspend fun launchStreamSegments(
+        queue: Flow<SegmentQueueItem>,
+        concurrency: Int,
+        readAheadSegments: Int,
+        counter: Counter
     ): WriterJob {
         val callerScope = CoroutineScope(currentCoroutineContext())
         return callerScope.writer(autoFlush = false) {
@@ -132,6 +152,7 @@ class NntpStreamingService(
                 val end = minOf(item.readEnd.toInt(), data.size)
                 if (end > start) {
                     channel.writeFully(data, start, end)
+                    counter.increment((end - start).toDouble())
                 }
             }
         }

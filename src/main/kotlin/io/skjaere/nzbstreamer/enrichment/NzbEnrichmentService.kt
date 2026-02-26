@@ -107,7 +107,7 @@ class NzbEnrichmentService(
     private suspend fun downloadPar2(file: NzbFile) {
         logger.debug("Downloading PAR2 file: {}", file.yencHeaders?.name)
         val queue = SegmentQueueService.createFileQueue(file, 0, 0L)
-        streamingService.streamSegments(queue) { channel ->
+        streamingService.streamSegments(queue, name = "par2:${file.yencHeaders?.name}") { channel ->
             file.par2Data = channel.toByteArray()
         }
         logger.debug("Downloaded PAR2 file: {} ({} bytes)", file.yencHeaders?.name, file.par2Data?.size)
