@@ -224,7 +224,7 @@ class ArchiveStreamingServiceTest {
             val entries = listOf(rarEntry("file.txt", 500, dataPosition = 100, volumeIndex = 0))
             val nzb = archiveNzb(5000)
             val result = service.resolveFile(entries, nzb, "file.txt")
-            assertIs<FileResolveResult.Ok>(result)
+            assertIs<FileResolveResult.Streamable>(result)
             assertEquals(500, result.totalSize)
             assertEquals(1, result.splits.size)
             assertEquals(SplitInfo(0, 100, 500), result.splits[0])
@@ -235,7 +235,7 @@ class ArchiveStreamingServiceTest {
             val entries = listOf(sevenZipEntry("file.bin", 2048, dataOffset = 512, method = "Copy"))
             val nzb = archiveNzb(10000)
             val result = service.resolveFile(entries, nzb, "file.bin")
-            assertIs<FileResolveResult.Ok>(result)
+            assertIs<FileResolveResult.Streamable>(result)
             assertEquals(2048, result.totalSize)
             assertEquals(listOf(SplitInfo(0, 512, 2048)), result.splits)
         }
@@ -245,7 +245,7 @@ class ArchiveStreamingServiceTest {
             val entries = listOf(sevenZipEntry("file.bin", 2048, dataOffset = 512, method = null))
             val nzb = archiveNzb(10000)
             val result = service.resolveFile(entries, nzb, "file.bin")
-            assertIs<FileResolveResult.Ok>(result)
+            assertIs<FileResolveResult.Streamable>(result)
         }
 
         @Test
@@ -257,7 +257,7 @@ class ArchiveStreamingServiceTest {
             val entries = listOf(rarEntry("large.bin", 5000, splitParts = splitParts))
             val nzb = archiveNzb(4000, 4000)
             val result = service.resolveFile(entries, nzb, "large.bin")
-            assertIs<FileResolveResult.Ok>(result)
+            assertIs<FileResolveResult.Streamable>(result)
             assertEquals(5000, result.totalSize)
             assertEquals(splitParts, result.splits)
         }

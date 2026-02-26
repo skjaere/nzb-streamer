@@ -12,7 +12,10 @@ import kotlinx.coroutines.flow.flow
 import org.slf4j.LoggerFactory
 
 sealed interface FileResolveResult {
-    data class Ok(val splits: List<SplitInfo>, val totalSize: Long) : FileResolveResult
+    data class Streamable(val namedSplits: NamedSplits) : FileResolveResult {
+        val splits get() = namedSplits.splits
+        val totalSize get() = namedSplits.totalSize
+    }
     data object NotFound : FileResolveResult
     data object IsDirectory : FileResolveResult
     data class Compressed(val description: String) : FileResolveResult
@@ -49,7 +52,7 @@ class ArchiveStreamingService(
 
         val splits = getSplitsForEntry(entry, archiveNzb)
 
-        return FileResolveResult.Ok(splits, entry.size)
+        return FileResolveResult.Streamable(NamedSplits(splits, entry.size, entry.path))
     }
 
     private fun getSplitsForEntry(
@@ -76,14 +79,14 @@ class ArchiveStreamingService(
 
     suspend fun streamFile(
         archiveNzb: NzbDocument,
-        splits: List<SplitInfo>,
+        namedSplits: NamedSplits,
         range: LongRange? = null,
         consume: suspend (ByteReadChannel) -> Unit
     ) {
         val effectiveSplits = if (range != null) {
-            adjustSplitsForRange(splits, range.first, range.last - range.first + 1)
+            adjustSplitsForRange(namedSplits.splits, range.first, range.last - range.first + 1)
         } else {
-            splits
+            namedSplits.splits
         }
 
         logger.debug(
@@ -104,13 +107,13 @@ class ArchiveStreamingService(
 
     suspend fun launchStreamFile(
         archiveNzb: NzbDocument,
-        splits: List<SplitInfo>,
+        namedSplits: NamedSplits,
         range: LongRange? = null
     ): WriterJob {
         val effectiveSplits = if (range != null) {
-            adjustSplitsForRange(splits, range.first, range.last - range.first + 1)
+            adjustSplitsForRange(namedSplits.splits, range.first, range.last - range.first + 1)
         } else {
-            splits
+            namedSplits.splits
         }
 
         val combinedQueue = flow {
@@ -266,8 +269,8 @@ class ArchiveStreamingService(
         range: LongRange? = null,
         consume: suspend (ByteReadChannel) -> Unit
     ) {
-        val splits = file.toSplits(archiveNzb)
-        streamFile(archiveNzb, splits, range, consume)
+        val namedSplits = NamedSplits(file.toSplits(archiveNzb), file.totalSize, file.path)
+        streamFile(archiveNzb, namedSplits, range, consume = consume)
     }
 
     suspend fun launchStreamFile(
@@ -275,7 +278,7 @@ class ArchiveStreamingService(
         file: StreamableFile,
         range: LongRange? = null
     ): WriterJob {
-        val splits = file.toSplits(archiveNzb)
-        return launchStreamFile(archiveNzb, splits, range)
+        val namedSplits = NamedSplits(file.toSplits(archiveNzb), file.totalSize, file.path)
+        return launchStreamFile(archiveNzb, namedSplits, range)
     }
 }

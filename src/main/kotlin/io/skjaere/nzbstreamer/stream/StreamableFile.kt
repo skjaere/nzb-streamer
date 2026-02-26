@@ -3,6 +3,12 @@ package io.skjaere.nzbstreamer.stream
 import io.skjaere.compressionutils.SplitInfo
 import io.skjaere.nzbstreamer.nzb.NzbDocument
 
+data class NamedSplits(
+    val splits: List<SplitInfo>,
+    val totalSize: Long,
+    val name: String = "unknown"
+)
+
 data class StreamableFile(
     val path: String,
     val totalSize: Long,
