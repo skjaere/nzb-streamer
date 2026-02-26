@@ -17,6 +17,7 @@ import io.skjaere.nzbstreamer.nzb.NzbParser
 import io.skjaere.nzbstreamer.queue.SegmentQueueService
 import io.skjaere.nzbstreamer.stream.ArchiveStreamingService
 import io.skjaere.nzbstreamer.stream.FileResolveResult
+import io.skjaere.nzbstreamer.stream.NamedSplits
 import io.skjaere.nzbstreamer.stream.NntpStreamingService
 import io.skjaere.nzbstreamer.stream.StreamableFile
 import kotlinx.coroutines.runBlocking
@@ -58,33 +59,36 @@ class NzbStreamer private constructor(
         val index = metadata.response.volumes.indexOfFirst { it == path }
         if (index < 0) return FileResolveResult.NotFound
         val size = nzb.files[index].yencHeaders!!.size
-        return FileResolveResult.Ok(
-            splits = listOf(
-                SplitInfo(
-                    volumeIndex = index,
-                    dataStartPosition = ArchiveStreamingService.computeVolumeOffsets(nzb)[index],
-                    dataSize = size
-                )
-            ),
-            totalSize = size
+        return FileResolveResult.Streamable(
+            NamedSplits(
+                splits = listOf(
+                    SplitInfo(
+                        volumeIndex = index,
+                        dataStartPosition = ArchiveStreamingService.computeVolumeOffsets(nzb)[index],
+                        dataSize = size
+                    )
+                ),
+                totalSize = size,
+                name = path
+            )
         )
     }
 
     suspend fun streamFile(
         metadata: ExtractedMetadata,
-        splits: List<SplitInfo>,
+        namedSplits: NamedSplits,
         range: LongRange? = null,
         consume: suspend (ByteReadChannel) -> Unit
     ) {
-        archiveStreamingService.streamFile(metadata.orderedArchiveNzb, splits, range, consume)
+        archiveStreamingService.streamFile(metadata.orderedArchiveNzb, namedSplits, range, consume = consume)
     }
 
     suspend fun launchStreamFile(
         metadata: ExtractedMetadata,
-        splits: List<SplitInfo>,
+        namedSplits: NamedSplits,
         range: LongRange? = null
     ): WriterJob {
-        return archiveStreamingService.launchStreamFile(metadata.orderedArchiveNzb, splits, range)
+        return archiveStreamingService.launchStreamFile(metadata.orderedArchiveNzb, namedSplits, range)
     }
 
     fun resolveStreamableFiles(metadata: ExtractedMetadata): List<StreamableFile> {

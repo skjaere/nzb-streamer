@@ -8,3 +8,6 @@ build/
 # Environment
 .env
 /.idea/
+
+# Tests
+src/test/kotlin/io/skjaere/nzbstreamer/NzbStreamerRawFileTest.kt
