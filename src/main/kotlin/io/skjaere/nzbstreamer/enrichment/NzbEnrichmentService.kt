@@ -1,6 +1,8 @@
 package io.skjaere.nzbstreamer.enrichment
 
 import io.ktor.utils.io.*
+import io.micrometer.core.instrument.Metrics
+import io.micrometer.core.instrument.Timer
 import io.skjaere.nntp.ArticleNotFoundException
 import io.skjaere.nntp.NntpException
 import io.skjaere.nntp.YencEvent
@@ -20,8 +22,12 @@ class NzbEnrichmentService(
     private val streamingService: NntpStreamingService
 ) {
     private val logger = LoggerFactory.getLogger(NzbEnrichmentService::class.java)
+    private val registry = Metrics.globalRegistry
+    private val enrichmentTimer = registry.timer("nzb.enrichment.duration")
+    private val enrichmentFiles = registry.counter("nzb.enrichment.files")
 
     suspend fun enrich(nzb: NzbDocument): EnrichmentResult {
+        val sample = Timer.start(registry)
         try {
             coroutineScope {
                 nzb.files.map { file ->
@@ -77,6 +83,8 @@ class NzbEnrichmentService(
             )
         }
 
+        sample.stop(enrichmentTimer)
+        enrichmentFiles.increment(nzb.files.size.toDouble())
         return EnrichmentResult.Success(nzb)
     }
 
