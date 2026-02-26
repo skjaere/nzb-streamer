@@ -7,6 +7,7 @@ data class NntpConfig(
     val password: String,
     val useTls: Boolean,
     val concurrency: Int,
+    val verificationConcurrency: Int = concurrency,
     val maxConnections: Int = concurrency,
     val readAheadSegments: Int = concurrency * 3
 )

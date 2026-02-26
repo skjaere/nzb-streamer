@@ -182,6 +182,7 @@ class NzbStreamer private constructor(
         var password: String = ""
         var useTls: Boolean = true
         var concurrency: Int = 4
+        var verificationConcurrency: Int? = null
         var maxConnections: Int = 8
         var readAheadSegments: Int? = null
     }
@@ -220,6 +221,7 @@ class NzbStreamer private constructor(
                 password = nb.password,
                 useTls = nb.useTls,
                 concurrency = nb.concurrency,
+                verificationConcurrency = nb.verificationConcurrency ?: nb.concurrency,
                 maxConnections = nb.maxConnections,
                 readAheadSegments = nb.readAheadSegments ?: (nb.concurrency * 3)
             )
@@ -231,7 +233,7 @@ class NzbStreamer private constructor(
             val metadataService = ArchiveMetadataService(
                 streamingService, seekConfig.forwardThresholdBytes, prepareConfig, nntpConfig.concurrency
             )
-            val verificationService = VerificationService(streamingService, nntpConfig.concurrency)
+            val verificationService = VerificationService(streamingService, nntpConfig.verificationConcurrency)
             val archiveStreamingService = ArchiveStreamingService(streamingService)
 
             return NzbStreamer(streamingService, metadataService, verificationService, archiveStreamingService)
@@ -256,6 +258,7 @@ class NzbStreamer private constructor(
                     password = nntpConfig.password
                     useTls = nntpConfig.useTls
                     concurrency = nntpConfig.concurrency
+                    verificationConcurrency = nntpConfig.verificationConcurrency
                     maxConnections = nntpConfig.maxConnections
                     readAheadSegments = nntpConfig.readAheadSegments
                 }
