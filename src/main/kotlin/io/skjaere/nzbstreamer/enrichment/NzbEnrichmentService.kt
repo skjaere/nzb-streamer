@@ -45,7 +45,7 @@ class NzbEnrichmentService(
         }
 
         val enrichedCount = nzb.files.count { it.yencHeaders != null }
-        logger.info("Enriched {} of {} files", enrichedCount, nzb.files.size)
+        logger.debug("Enriched {} of {} files", enrichedCount, nzb.files.size)
 
         // After enrichment, download the base PAR2 file (contains recovery set metadata).
         // Skip .volXXX+YYY.par2 recovery volume files — they contain recovery blocks
@@ -97,11 +97,11 @@ class NzbEnrichmentService(
     }
 
     private suspend fun downloadPar2(file: NzbFile) {
-        logger.info("Downloading PAR2 file: {}", file.yencHeaders?.name)
+        logger.debug("Downloading PAR2 file: {}", file.yencHeaders?.name)
         val queue = SegmentQueueService.createFileQueue(file, 0, 0L)
         streamingService.streamSegments(queue) { channel ->
             file.par2Data = channel.toByteArray()
         }
-        logger.info("Downloaded PAR2 file: {} ({} bytes)", file.yencHeaders?.name, file.par2Data?.size)
+        logger.debug("Downloaded PAR2 file: {} ({} bytes)", file.yencHeaders?.name, file.par2Data?.size)
     }
 }

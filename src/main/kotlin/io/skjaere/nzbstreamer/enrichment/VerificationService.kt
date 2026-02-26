@@ -24,11 +24,11 @@ class VerificationService(
         }
 
         if (segmentsToVerify.isEmpty()) {
-            logger.info("No additional segments to verify")
+            logger.debug("No additional segments to verify")
             return VerificationResult.Success
         }
 
-        logger.info("Verifying {} additional segments", segmentsToVerify.size)
+        logger.debug("Verifying {} additional segments", segmentsToVerify.size)
 
         val missingArticles = mutableListOf<String>()
         try {
@@ -69,7 +69,7 @@ class VerificationService(
             )
         }
 
-        logger.info("All {} segments verified successfully", segmentsToVerify.size)
+        logger.debug("All {} segments verified successfully", segmentsToVerify.size)
         return VerificationResult.Success
     }
 }

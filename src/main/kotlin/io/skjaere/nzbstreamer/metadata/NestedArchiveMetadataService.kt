@@ -48,7 +48,7 @@ class NestedArchiveMetadataService(
         val innerRawEntries = parseInnerArchive(
             resolvedInnerVolumes, innerVolumeSizes, outerChunks, orderedArchiveNzb
         ) ?: run {
-            logger.info("Inner archive format not supported; falling back to outer entries")
+            logger.debug("Inner archive format not supported; falling back to outer entries")
             return ExtractedMetadata.Archive(
                 response = NzbMetadataResponse(
                     volumes = orderedVolumes.map { it.filename },

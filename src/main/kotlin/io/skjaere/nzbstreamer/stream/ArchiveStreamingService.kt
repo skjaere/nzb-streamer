@@ -86,7 +86,7 @@ class ArchiveStreamingService(
             splits
         }
 
-        logger.info(
+        logger.debug(
             "Streaming {} splits (range={})",
             effectiveSplits.size,
             range?.let { "${it.first}-${it.last}" } ?: "full"
