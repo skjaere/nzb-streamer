@@ -6,6 +6,8 @@ import io.ktor.utils.io.WriterJob
 import io.ktor.utils.io.toByteArray
 import io.ktor.utils.io.writeFully
 import io.ktor.utils.io.writer
+import io.micrometer.core.instrument.Metrics
+import io.micrometer.core.instrument.Timer
 import io.skjaere.nntp.NntpClient
 import io.skjaere.nntp.NntpClientPool
 import io.skjaere.nntp.YencEvent
@@ -26,6 +28,7 @@ import kotlinx.coroutines.flow.toList
 import kotlinx.coroutines.sync.Semaphore
 import org.slf4j.LoggerFactory
 import java.io.Closeable
+import java.util.concurrent.atomic.AtomicLong
 
 class NntpStreamingService(
     private val config: NntpConfig
@@ -33,6 +36,13 @@ class NntpStreamingService(
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private val logger = LoggerFactory.getLogger(NntpStreamingService::class.java)
     private lateinit var pool: NntpClientPool
+
+    private val registry = Metrics.globalRegistry
+    private val segmentsDownloaded = registry.counter("nzb.segments.downloaded")
+    private val segmentsBytes = registry.counter("nzb.segments.bytes")
+    private val segmentDownloadTimer = registry.timer("nzb.segments.download.duration")
+    private val segmentsFailed = registry.counter("nzb.segments.failed")
+    private val activeStreams = AtomicLong(0).also { registry.gauge("nzb.streams.active", it) }
 
     suspend fun connect() {
         val selectorManager = SelectorManager(Dispatchers.IO)
@@ -46,7 +56,6 @@ class NntpStreamingService(
             maxConnections = config.maxConnections,
             scope = scope
         )
-        pool.connect()
         logger.info(
             "NNTP connection pool initialized with {} connections, per-stream concurrency={}",
             config.maxConnections, config.concurrency
@@ -71,12 +80,19 @@ class NntpStreamingService(
         concurrency: Int = config.concurrency,
         readAheadSegments: Int = config.readAheadSegments,
         consume: suspend (ByteReadChannel) -> Unit
-    ) = coroutineScope {
-        val writerJob = launchStreamSegments(queue, concurrency, readAheadSegments)
+    ) {
+        activeStreams.incrementAndGet()
         try {
-            consume(writerJob.channel)
+            coroutineScope {
+                val writerJob = launchStreamSegments(queue, concurrency, readAheadSegments)
+                try {
+                    consume(writerJob.channel)
+                } finally {
+                    writerJob.job.cancel()
+                }
+            }
         } finally {
-            writerJob.job.cancel()
+            activeStreams.decrementAndGet()
         }
     }
 
@@ -122,13 +138,22 @@ class NntpStreamingService(
     }
 
     private suspend fun downloadSegment(articleId: String): ByteArray {
+        val sample = Timer.start(registry)
         var result: ByteArray? = null
         pool.bodyYenc("<$articleId>", NntpPriority.STREAMING.value).collect { event ->
             if (event is YencEvent.Body) {
                 result = event.data.toByteArray()
             }
         }
-        return result ?: throw IllegalStateException("No body received for <$articleId>")
+        sample.stop(segmentDownloadTimer)
+        val data = result
+        if (data != null) {
+            segmentsDownloaded.increment()
+            segmentsBytes.increment(data.size.toDouble())
+            return data
+        }
+        segmentsFailed.increment()
+        throw IllegalStateException("No body received for <$articleId>")
     }
 
     override fun close() {

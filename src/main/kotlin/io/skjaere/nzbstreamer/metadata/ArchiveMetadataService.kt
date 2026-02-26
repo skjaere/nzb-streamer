@@ -1,5 +1,7 @@
 package io.skjaere.nzbstreamer.metadata
 
+import io.micrometer.core.instrument.Metrics
+import io.micrometer.core.instrument.Timer
 import io.skjaere.compressionutils.ArchiveFileEntry
 import io.skjaere.compressionutils.ArchiveService
 import io.skjaere.compressionutils.ListFilesResult
@@ -22,6 +24,8 @@ class ArchiveMetadataService(
     concurrency: Int = 1
 ) {
     private val logger = LoggerFactory.getLogger(ArchiveMetadataService::class.java)
+    private val registry = Metrics.globalRegistry
+    private val prepareTimer = registry.timer("nzb.prepare.duration")
     private val enrichmentService = NzbEnrichmentService(streamingService)
     private val verificationService = VerificationService(streamingService, concurrency)
     private val nestedArchiveService = NestedArchiveMetadataService(streamingService, forwardThresholdBytes)
@@ -37,44 +41,49 @@ class ArchiveMetadataService(
     }
 
     suspend fun prepare(nzb: NzbDocument): PrepareResult {
-        return when (val result = enrich(nzb)) {
-            is EnrichmentResult.Success -> {
-                val enrichedNzb = result.enrichedNzb
+        val sample = Timer.start(registry)
+        try {
+            return when (val result = enrich(nzb)) {
+                is EnrichmentResult.Success -> {
+                    val enrichedNzb = result.enrichedNzb
 
-                if (prepareConfig.verifySegments) {
-                    when (val v = verificationService.verifySegments(enrichedNzb)) {
-                        is VerificationResult.MissingArticles ->
-                            return PrepareResult.MissingArticles(v.message, v.cause)
+                    if (prepareConfig.verifySegments) {
+                        when (val v = verificationService.verifySegments(enrichedNzb)) {
+                            is VerificationResult.MissingArticles ->
+                                return PrepareResult.MissingArticles(v.message, v.cause)
 
-                        is VerificationResult.Failure ->
-                            return PrepareResult.Failure(v.message, v.cause)
+                            is VerificationResult.Failure ->
+                                return PrepareResult.Failure(v.message, v.cause)
 
-                        is VerificationResult.Success -> { /* continue */
+                            is VerificationResult.Success -> { /* continue */
+                            }
                         }
+                    }
+
+                    if (enrichedNzb.files.isEmpty()) {
+                        PrepareResult.Success(
+                            ExtractedMetadata.Raw(
+                                response = NzbMetadataResponse(
+                                    volumes = emptyList(),
+                                    obfuscated = false,
+                                    entries = emptyList()
+                                ),
+                                orderedArchiveNzb = NzbDocument(emptyList())
+                            )
+                        )
+                    } else {
+                        PrepareResult.Success(extractMetadata(enrichedNzb))
                     }
                 }
 
-                if (enrichedNzb.files.isEmpty()) {
-                    PrepareResult.Success(
-                        ExtractedMetadata.Raw(
-                            response = NzbMetadataResponse(
-                                volumes = emptyList(),
-                                obfuscated = false,
-                                entries = emptyList()
-                            ),
-                            orderedArchiveNzb = NzbDocument(emptyList())
-                        )
-                    )
-                } else {
-                    PrepareResult.Success(extractMetadata(enrichedNzb))
-                }
+                is EnrichmentResult.MissingArticles ->
+                    PrepareResult.MissingArticles(result.message, result.cause)
+
+                is EnrichmentResult.Failure ->
+                    PrepareResult.Failure(result.message, result.cause)
             }
-
-            is EnrichmentResult.MissingArticles ->
-                PrepareResult.MissingArticles(result.message, result.cause)
-
-            is EnrichmentResult.Failure ->
-                PrepareResult.Failure(result.message, result.cause)
+        } finally {
+            sample.stop(prepareTimer)
         }
     }
 

@@ -1,5 +1,7 @@
 package io.skjaere.nzbstreamer.enrichment
 
+import io.micrometer.core.instrument.Metrics
+import io.micrometer.core.instrument.Timer
 import io.skjaere.nntp.ArticleNotFoundException
 import io.skjaere.nntp.NntpException
 import io.skjaere.nntp.StatResult
@@ -17,13 +19,19 @@ class VerificationService(
     private val concurrency: Int = 1
 ) {
     private val logger = LoggerFactory.getLogger(VerificationService::class.java)
+    private val registry = Metrics.globalRegistry
+    private val verificationTimer = registry.timer("nzb.verification.duration")
+    private val verificationSegments = registry.counter("nzb.verification.segments")
+    private val verificationMissing = registry.counter("nzb.verification.missing")
 
     suspend fun verifySegments(nzb: NzbDocument): VerificationResult {
+        val sample = Timer.start(registry)
         val segmentsToVerify = nzb.files.flatMap { file ->
             file.segments
         }
 
         if (segmentsToVerify.isEmpty()) {
+            sample.stop(verificationTimer)
             logger.debug("No additional segments to verify")
             return VerificationResult.Success
         }
@@ -60,7 +68,11 @@ class VerificationService(
             )
         }
 
+        sample.stop(verificationTimer)
+        verificationSegments.increment(segmentsToVerify.size.toDouble())
+
         if (missingArticles.isNotEmpty()) {
+            verificationMissing.increment(missingArticles.size.toDouble())
             val message = "Missing ${missingArticles.size} articles: ${missingArticles.joinToString(", ")}"
             logger.warn(message)
             return VerificationResult.MissingArticles(
