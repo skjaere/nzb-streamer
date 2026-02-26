@@ -118,7 +118,7 @@ class ArchiveMetadataService(
             archiveFiles[volumes.indexOfFirst { it.first16kb === vol.first16kb }]
         }
 
-        logger.info("Extracting metadata from {} volumes (obfuscated={})", orderedVolumes.size, obfuscated)
+        logger.debug("Extracting metadata from {} volumes (obfuscated={})", orderedVolumes.size, obfuscated)
 
         return ResolvedVolumes(
             orderedArchiveNzb = NzbDocument(orderedArchiveFiles),
@@ -138,7 +138,7 @@ class ArchiveMetadataService(
         return when (listFilesResult) {
             is ListFilesResult.Success -> listFilesResult.entries
             is ListFilesResult.UnsupportedFormat -> {
-                logger.info("No supported archive format detected; returning volumes without archive entries")
+                logger.debug("No supported archive format detected; returning volumes without archive entries")
                 null
             }
         }
@@ -157,7 +157,7 @@ class ArchiveMetadataService(
         if (innerArchiveFiles.isNotEmpty() &&
             nestedArchiveService.looksLikeNestedArchive(innerArchiveFiles, rawEntries)
         ) {
-            logger.info("Detected nested archive with {} inner archive files", innerArchiveFiles.size)
+            logger.debug("Detected nested archive with {} inner archive files", innerArchiveFiles.size)
             return nestedArchiveService.extractNestedMetadata(
                 outerEntries = rawEntries,
                 innerArchiveEntries = innerArchiveFiles,
