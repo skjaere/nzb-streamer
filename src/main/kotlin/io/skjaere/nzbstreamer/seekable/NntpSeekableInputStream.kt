@@ -97,7 +97,7 @@ class NntpSeekableInputStream(
 
         val scope = CoroutineScope(currentCoroutineContext() + Job())
         currentJob = scope.launch {
-            streamingService.streamSegments(queue) { channel ->
+            streamingService.streamSegments(queue, name = "seek") { channel ->
                 channelReady.complete(channel)
                 suspendCancellableCoroutine<Unit> { }
             }

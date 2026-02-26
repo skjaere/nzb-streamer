@@ -164,7 +164,7 @@ class NzbStreamer private constructor(
     ) {
         val file = nzb.files[volumeIndex]
         val queue = SegmentQueueService.createFileQueue(file, volumeIndex, 0L)
-        streamingService.streamSegments(queue, consume = consume)
+        streamingService.streamSegments(queue, name = "volume-$volumeIndex", consume = consume)
     }
 
     override fun close() {
