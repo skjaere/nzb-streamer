@@ -53,8 +53,11 @@ class NntpStreamingService(
         )
     }
 
-    suspend fun <T> withClient(block: suspend (NntpClient) -> T): T {
-        return pool.withClient(block)
+    suspend fun <T> withClient(
+        priority: NntpPriority = NntpPriority.HEALTH_CHECK,
+        block: suspend (NntpClient) -> T
+    ): T {
+        return pool.withClient(priority.value, block)
     }
 
     /**
@@ -120,7 +123,7 @@ class NntpStreamingService(
 
     private suspend fun downloadSegment(articleId: String): ByteArray {
         var result: ByteArray? = null
-        pool.bodyYenc("<$articleId>").collect { event ->
+        pool.bodyYenc("<$articleId>", NntpPriority.STREAMING.value).collect { event ->
             if (event is YencEvent.Body) {
                 result = event.data.toByteArray()
             }
