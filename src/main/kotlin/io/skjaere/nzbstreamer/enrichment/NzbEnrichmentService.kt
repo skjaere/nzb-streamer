@@ -7,6 +7,7 @@ import io.skjaere.nntp.YencEvent
 import io.skjaere.nzbstreamer.nzb.NzbDocument
 import io.skjaere.nzbstreamer.nzb.NzbFile
 import io.skjaere.nzbstreamer.queue.SegmentQueueService
+import io.skjaere.nzbstreamer.stream.NntpPriority
 import io.skjaere.nzbstreamer.stream.NntpStreamingService
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
@@ -81,7 +82,7 @@ class NzbEnrichmentService(
 
     private suspend fun enrichFile(file: NzbFile) {
         val firstSegment = file.segments.first()
-        streamingService.withClient { client ->
+        streamingService.withClient(NntpPriority.PREPARE) { client ->
             client.bodyYenc("<${firstSegment.articleId}>").collect { event ->
                 when (event) {
                     is YencEvent.Headers -> file.yencHeaders = event.yencHeaders
