@@ -6,7 +6,6 @@ import io.skjaere.nntp.ArticleNotFoundException
 import io.skjaere.nntp.NntpException
 import io.skjaere.nntp.StatResult
 import io.skjaere.nzbstreamer.nzb.NzbDocument
-import io.skjaere.nzbstreamer.stream.NntpPriority
 import io.skjaere.nzbstreamer.stream.NntpStreamingService
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
@@ -46,9 +45,7 @@ class VerificationService(
                     async {
                         semaphore.acquire()
                         try {
-                            val result = streamingService.withClient(NntpPriority.HEALTH_CHECK) { client ->
-                                client.stat("<${segment.articleId}>")
-                            }
+                            val result = streamingService.statAcrossPools("<${segment.articleId}>")
                             if (result is StatResult.NotFound) {
                                 synchronized(missingArticles) {
                                     missingArticles.add(segment.articleId)
