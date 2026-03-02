@@ -6,6 +6,7 @@ import io.skjaere.compressionutils.SplitInfo
 import io.skjaere.nzbstreamer.config.NntpConfig
 import io.skjaere.nzbstreamer.config.PrepareConfig
 import io.skjaere.nzbstreamer.config.SeekConfig
+import io.skjaere.nzbstreamer.config.StreamingConfig
 import io.skjaere.nzbstreamer.enrichment.EnrichmentResult
 import io.skjaere.nzbstreamer.enrichment.VerificationResult
 import io.skjaere.nzbstreamer.enrichment.VerificationService
@@ -181,10 +182,16 @@ class NzbStreamer private constructor(
         var username: String = ""
         var password: String = ""
         var useTls: Boolean = true
-        var concurrency: Int = 4
-        var verificationConcurrency: Int? = null
         var maxConnections: Int = 8
-        var readAheadSegments: Int? = null
+
+        internal fun toConfig(): NntpConfig = NntpConfig(
+            host = host,
+            port = port,
+            username = username,
+            password = password,
+            useTls = useTls,
+            maxConnections = maxConnections
+        )
     }
 
     class SeekBuilder {
@@ -196,12 +203,16 @@ class NzbStreamer private constructor(
     }
 
     class Builder {
-        private var nntpBuilder: NntpBuilder? = null
+        private val poolBuilders = mutableListOf<NntpBuilder>()
         private var seekBuilder: SeekBuilder = SeekBuilder()
         private var prepareBuilder: PrepareBuilder = PrepareBuilder()
+        var concurrency: Int = 4
+        var verificationConcurrency: Int? = null
+        var readAheadSegments: Int? = null
 
+        /** Add an NNTP pool. First pool added is the primary; subsequent pools are fill/fallback. */
         fun nntp(block: NntpBuilder.() -> Unit) {
-            nntpBuilder = NntpBuilder().apply(block)
+            poolBuilders.add(NntpBuilder().apply(block))
         }
 
         fun seek(block: SeekBuilder.() -> Unit) {
@@ -213,27 +224,22 @@ class NzbStreamer private constructor(
         }
 
         fun build(): NzbStreamer {
-            val nb = nntpBuilder ?: error("nntp {} block is required")
-            val nntpConfig = NntpConfig(
-                host = nb.host,
-                port = nb.port,
-                username = nb.username,
-                password = nb.password,
-                useTls = nb.useTls,
-                concurrency = nb.concurrency,
-                verificationConcurrency = nb.verificationConcurrency ?: nb.concurrency,
-                maxConnections = nb.maxConnections,
-                readAheadSegments = nb.readAheadSegments ?: (nb.concurrency * 3)
+            require(poolBuilders.isNotEmpty()) { "At least one nntp {} block is required" }
+            val configs = poolBuilders.map { it.toConfig() }
+            val streamingConfig = StreamingConfig(
+                concurrency = concurrency,
+                verificationConcurrency = verificationConcurrency ?: concurrency,
+                readAheadSegments = readAheadSegments ?: (concurrency * 3)
             )
             val seekConfig = SeekConfig(forwardThresholdBytes = seekBuilder.forwardThresholdBytes)
             val prepareConfig = PrepareConfig(verifySegments = prepareBuilder.verifySegments)
-            val streamingService = NntpStreamingService(nntpConfig)
+            val streamingService = NntpStreamingService(configs, streamingConfig)
             runBlocking { streamingService.connect() }
 
             val metadataService = ArchiveMetadataService(
-                streamingService, seekConfig.forwardThresholdBytes, prepareConfig, nntpConfig.concurrency
+                streamingService, seekConfig.forwardThresholdBytes, prepareConfig, streamingConfig.concurrency
             )
-            val verificationService = VerificationService(streamingService, nntpConfig.verificationConcurrency)
+            val verificationService = VerificationService(streamingService, streamingConfig.verificationConcurrency)
             val archiveStreamingService = ArchiveStreamingService(streamingService)
 
             return NzbStreamer(streamingService, metadataService, verificationService, archiveStreamingService)
@@ -246,25 +252,36 @@ class NzbStreamer private constructor(
         }
 
         fun fromConfig(
-            nntpConfig: NntpConfig,
+            nntpConfigs: List<NntpConfig>,
+            streamingConfig: StreamingConfig = StreamingConfig(),
             seekConfig: SeekConfig,
             prepareConfig: PrepareConfig = PrepareConfig()
         ): NzbStreamer {
             return invoke {
-                nntp {
-                    host = nntpConfig.host
-                    port = nntpConfig.port
-                    username = nntpConfig.username
-                    password = nntpConfig.password
-                    useTls = nntpConfig.useTls
-                    concurrency = nntpConfig.concurrency
-                    verificationConcurrency = nntpConfig.verificationConcurrency
-                    maxConnections = nntpConfig.maxConnections
-                    readAheadSegments = nntpConfig.readAheadSegments
+                concurrency = streamingConfig.concurrency
+                verificationConcurrency = streamingConfig.verificationConcurrency
+                readAheadSegments = streamingConfig.readAheadSegments
+                nntpConfigs.forEach { config ->
+                    nntp {
+                        host = config.host
+                        port = config.port
+                        username = config.username
+                        password = config.password
+                        useTls = config.useTls
+                        maxConnections = config.maxConnections
+                    }
                 }
                 seek { forwardThresholdBytes = seekConfig.forwardThresholdBytes }
                 prepare { verifySegments = prepareConfig.verifySegments }
             }
         }
+
+        /** Single-pool convenience overload. */
+        fun fromConfig(
+            nntpConfig: NntpConfig,
+            streamingConfig: StreamingConfig = StreamingConfig(),
+            seekConfig: SeekConfig,
+            prepareConfig: PrepareConfig = PrepareConfig()
+        ): NzbStreamer = fromConfig(listOf(nntpConfig), streamingConfig, seekConfig, prepareConfig)
     }
 }

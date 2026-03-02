@@ -79,7 +79,7 @@ class NzbEnrichmentServiceTest {
             username = "",
             password = "",
             useTls = false,
-            concurrency = 1
+            maxConnections = 1
         )
         val service = NntpStreamingService(config)
         runBlocking { service.connect() }

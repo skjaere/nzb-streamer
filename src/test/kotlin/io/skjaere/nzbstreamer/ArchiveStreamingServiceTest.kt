@@ -26,7 +26,7 @@ class ArchiveStreamingServiceTest {
 
     private val dummyConfig = NntpConfig(
         host = "localhost", port = 119, username = "", password = "",
-        useTls = false, concurrency = 1
+        useTls = false
     )
 
     private val service = ArchiveStreamingService(

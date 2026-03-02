@@ -6,9 +6,12 @@ data class NntpConfig(
     val username: String,
     val password: String,
     val useTls: Boolean,
-    val concurrency: Int,
+    val maxConnections: Int = 8
+)
+
+data class StreamingConfig(
+    val concurrency: Int = 4,
     val verificationConcurrency: Int = concurrency,
-    val maxConnections: Int = concurrency,
     val readAheadSegments: Int = concurrency * 3
 )
 
