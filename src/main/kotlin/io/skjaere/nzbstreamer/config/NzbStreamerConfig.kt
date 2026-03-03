@@ -6,7 +6,8 @@ data class NntpConfig(
     val username: String,
     val password: String,
     val useTls: Boolean,
-    val maxConnections: Int = 8
+    val maxConnections: Int = 8,
+    val priority: Int = 0
 )
 
 data class StreamingConfig(

@@ -33,16 +33,25 @@ import org.slf4j.LoggerFactory
 import java.io.Closeable
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.locks.ReentrantReadWriteLock
+import kotlin.concurrent.read
+import kotlin.concurrent.write
 
 class NntpStreamingService(
-    private val configs: List<NntpConfig>,
+    initialConfigs: List<NntpConfig>,
     private val streamingConfig: StreamingConfig = StreamingConfig()
 ) : Closeable {
     constructor(config: NntpConfig) : this(listOf(config))
 
+    private data class PoolEntry(val config: NntpConfig, val pool: NntpClientPool)
+
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private val logger = LoggerFactory.getLogger(NntpStreamingService::class.java)
-    private lateinit var pools: List<NntpClientPool>
+    private val pools = mutableListOf<PoolEntry>()
+    private lateinit var selectorManager: SelectorManager
+    private val poolLock = ReentrantReadWriteLock()
+
+    private val initialConfigs = initialConfigs.toList()
 
     private val registry = Metrics.globalRegistry
     private val segmentsDownloaded = registry.counter("nzb.segments.downloaded")
@@ -54,24 +63,54 @@ class NntpStreamingService(
     private val streamCounters = ConcurrentHashMap<String, Counter>()
 
     suspend fun connect() {
-        val selectorManager = SelectorManager(Dispatchers.IO)
-        pools = configs.mapIndexed { index, config ->
-            NntpClientPool(
-                host = config.host,
-                port = config.port,
-                selectorManager = selectorManager,
-                useTls = config.useTls,
-                username = config.username.ifEmpty { null },
-                password = config.password.ifEmpty { null },
-                maxConnections = config.maxConnections,
-                scope = scope
-            ).also {
-                logger.info(
-                    "NNTP pool[{}] initialized: {}:{} maxConnections={}",
-                    index, config.host, config.port, config.maxConnections
-                )
-            }
+        selectorManager = SelectorManager(Dispatchers.IO)
+        initialConfigs.forEachIndexed { index, config ->
+            pools.add(PoolEntry(config, createPool(config)))
+            logger.info(
+                "NNTP pool[{}] initialized: {}:{} maxConnections={}",
+                index, config.host, config.port, config.maxConnections
+            )
         }
+    }
+
+    private fun createPool(config: NntpConfig): NntpClientPool {
+        return NntpClientPool(
+            host = config.host,
+            port = config.port,
+            selectorManager = selectorManager,
+            useTls = config.useTls,
+            username = config.username.ifEmpty { null },
+            password = config.password.ifEmpty { null },
+            maxConnections = config.maxConnections,
+            scope = scope
+        )
+    }
+
+    fun addPool(config: NntpConfig) {
+        poolLock.write {
+            pools.add(PoolEntry(config, createPool(config)))
+            logger.info(
+                "NNTP pool added at runtime: {}:{} maxConnections={} (total pools: {})",
+                config.host, config.port, config.maxConnections, pools.size
+            )
+        }
+    }
+
+    fun removePool(host: String, port: Int) {
+        poolLock.write {
+            val index = pools.indexOfFirst { it.config.host == host && it.config.port == port }
+            require(index >= 0) { "No pool found for $host:$port" }
+            val entry = pools.removeAt(index)
+            entry.pool.close()
+            logger.info(
+                "NNTP pool removed at runtime: {}:{} (total pools: {})",
+                host, port, pools.size
+            )
+        }
+    }
+
+    fun getPoolConfigs(): List<NntpConfig> {
+        return poolLock.read { pools.map { it.config } }
     }
 
     /**
@@ -82,16 +121,17 @@ class NntpStreamingService(
         logPrefix: String,
         block: suspend (pool: NntpClientPool) -> T
     ): T {
+        val snapshot = poolLock.read { pools.toList() }
         var lastException: ArticleNotFoundException? = null
-        return pools.withIndex().firstNotNullOfOrNull { (index, pool) ->
+        return snapshot.withIndex().firstNotNullOfOrNull { (index, entry) ->
             try {
-                block(pool)
+                block(entry.pool)
             } catch (e: ArticleNotFoundException) {
                 lastException = e
-                if (index < pools.size - 1) {
+                if (index < snapshot.size - 1) {
                     logger.debug(
                         "{} not found on pool[{}] ({}:{}), trying pool[{}]",
-                        logPrefix, index, configs[index].host, configs[index].port, index + 1
+                        logPrefix, index, entry.config.host, entry.config.port, index + 1
                     )
                     segmentsFallback.increment()
                 }
@@ -106,15 +146,16 @@ class NntpStreamingService(
     ): T = withFallback("Article") { pool -> pool.withClient(priority.value, block) }
 
     suspend fun statAcrossPools(articleId: String): StatResult {
-        return pools.withIndex().firstNotNullOfOrNull { (index, pool) ->
-            val result = pool.withClient(NntpPriority.HEALTH_CHECK.value) { it.stat(articleId) }
+        val snapshot = poolLock.read { pools.toList() }
+        return snapshot.withIndex().firstNotNullOfOrNull { (index, entry) ->
+            val result = entry.pool.withClient(NntpPriority.HEALTH_CHECK.value) { it.stat(articleId) }
             when (result) {
                 is StatResult.Found -> result
                 is StatResult.NotFound -> {
-                    if (index < pools.size - 1) {
+                    if (index < snapshot.size - 1) {
                         logger.debug(
                             "STAT {} not found on pool[{}] ({}:{}), trying pool[{}]",
-                            articleId, index, configs[index].host, configs[index].port, index + 1
+                            articleId, index, entry.config.host, entry.config.port, index + 1
                         )
                     }
                     null
@@ -211,10 +252,11 @@ class NntpStreamingService(
 
     private suspend fun downloadSegment(articleId: String): ByteArray {
         val sample = Timer.start(registry)
-        val data = pools.withIndex().firstNotNullOfOrNull { (index, pool) ->
+        val snapshot = poolLock.read { pools.toList() }
+        val data = snapshot.withIndex().firstNotNullOfOrNull { (index, entry) ->
             try {
                 var result: ByteArray? = null
-                pool.bodyYenc("<$articleId>", NntpPriority.STREAMING.value).collect { event ->
+                entry.pool.bodyYenc("<$articleId>", NntpPriority.STREAMING.value).collect { event ->
                     if (event is YencEvent.Body) {
                         result = event.data.toByteArray()
                     }
@@ -225,10 +267,10 @@ class NntpStreamingService(
                     }
                 }
             } catch (e: ArticleNotFoundException) {
-                if (index < pools.size - 1) {
+                if (index < snapshot.size - 1) {
                     logger.debug(
                         "Segment <{}> not found on pool[{}] ({}:{}), trying pool[{}]",
-                        articleId, index, configs[index].host, configs[index].port, index + 1
+                        articleId, index, entry.config.host, entry.config.port, index + 1
                     )
                     segmentsFallback.increment()
                 }
@@ -247,8 +289,8 @@ class NntpStreamingService(
     }
 
     override fun close() {
-        if (::pools.isInitialized) {
-            pools.forEach { it.close() }
+        poolLock.read {
+            pools.forEach { it.pool.close() }
         }
         scope.cancel()
     }

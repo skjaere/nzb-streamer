@@ -168,6 +168,18 @@ class NzbStreamer private constructor(
         streamingService.streamSegments(queue, name = "volume-$volumeIndex", consume = consume)
     }
 
+    fun addPool(config: NntpConfig) {
+        streamingService.addPool(config)
+    }
+
+    fun removePool(host: String, port: Int) {
+        streamingService.removePool(host, port)
+    }
+
+    fun getPoolConfigs(): List<NntpConfig> {
+        return streamingService.getPoolConfigs()
+    }
+
     override fun close() {
         streamingService.close()
     }
