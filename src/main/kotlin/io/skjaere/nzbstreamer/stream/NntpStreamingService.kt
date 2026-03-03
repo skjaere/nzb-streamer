@@ -88,6 +88,9 @@ class NntpStreamingService(
 
     fun addPool(config: NntpConfig) {
         poolLock.write {
+            require(pools.none { it.config.host == config.host && it.config.port == config.port }) {
+                "Pool already exists for ${config.host}:${config.port}"
+            }
             pools.add(PoolEntry(config, createPool(config)))
             logger.info(
                 "NNTP pool added at runtime: {}:{} maxConnections={} (total pools: {})",
@@ -96,15 +99,15 @@ class NntpStreamingService(
         }
     }
 
-    fun removePool(host: String, port: Int) {
+    fun removePool(config: NntpConfig) {
         poolLock.write {
-            val index = pools.indexOfFirst { it.config.host == host && it.config.port == port }
-            require(index >= 0) { "No pool found for $host:$port" }
+            val index = pools.indexOfFirst { it.config == config }
+            require(index >= 0) { "No pool found for ${config.host}:${config.port}" }
             val entry = pools.removeAt(index)
             entry.pool.close()
             logger.info(
                 "NNTP pool removed at runtime: {}:{} (total pools: {})",
-                host, port, pools.size
+                config.host, config.port, pools.size
             )
         }
     }

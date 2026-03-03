@@ -172,8 +172,8 @@ class NzbStreamer private constructor(
         streamingService.addPool(config)
     }
 
-    fun removePool(host: String, port: Int) {
-        streamingService.removePool(host, port)
+    fun removePool(config: NntpConfig) {
+        streamingService.removePool(config)
     }
 
     fun getPoolConfigs(): List<NntpConfig> {
