@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.7.0](https://github.com/skjaere/nzb-streamer/compare/v0.6.0...v0.7.0) (2026-03-04)
+
+
+### Features
+
+* change removePool signature to take NntpConfig and guard against duplicate host:port ([7917063](https://github.com/skjaere/nzb-streamer/commit/7917063c0a24cced241958228b21107d3226bb9d))
+* multi pool support ([8a9a860](https://github.com/skjaere/nzb-streamer/commit/8a9a8608c3b4b1503dc1b1517edcdc4db1eeb6f5))
+* runtime NNTP pool add/remove ([b7bd15d](https://github.com/skjaere/nzb-streamer/commit/b7bd15dc67e11315294028bb2001c9e0e07d4055))
+
+
+### Bug Fixes
+
+* bump kotlin-compression-utils to 0.3.2 ([a77dad1](https://github.com/skjaere/nzb-streamer/commit/a77dad172138c3f92959ac423ae73483fbc3d289))
+
 ## [0.6.0](https://github.com/skjaere/nzb-streamer/compare/v0.5.0...v0.6.0) (2026-02-27)
 
 
