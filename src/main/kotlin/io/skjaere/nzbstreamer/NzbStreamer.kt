@@ -236,7 +236,6 @@ class NzbStreamer private constructor(
         }
 
         fun build(): NzbStreamer {
-            require(poolBuilders.isNotEmpty()) { "At least one nntp {} block is required" }
             val configs = poolBuilders.map { it.toConfig() }
             val streamingConfig = StreamingConfig(
                 concurrency = concurrency,
