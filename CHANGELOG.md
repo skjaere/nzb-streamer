@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.7.3](https://github.com/skjaere/nzb-streamer/compare/v0.7.2...v0.7.3) (2026-03-18)
+
+
+### Bug Fixes
+
+* disable external DTD loading in NzbParser to prevent UnknownHostException
+
 ## [0.7.2](https://github.com/skjaere/nzb-streamer/compare/v0.7.1...v0.7.2) (2026-03-18)
 
 
