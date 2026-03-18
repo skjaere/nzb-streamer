@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.7.2](https://github.com/skjaere/nzb-streamer/compare/v0.7.1...v0.7.2) (2026-03-18)
+
+
+### Bug Fixes
+
+* allow NzbStreamer to be created with zero pools ([2b33c15](https://github.com/skjaere/nzb-streamer/commit/2b33c15681a6c094034100f7e33e4e054adba482))
+* bump ktor-nntp-client to 0.4.2 ([b682308](https://github.com/skjaere/nzb-streamer/commit/b6823088af36a488fec4c7565e6ddaaca4aab695))
+
 ## [0.7.1](https://github.com/skjaere/nzb-streamer/compare/v0.7.0...v0.7.1) (2026-03-13)
 
 
