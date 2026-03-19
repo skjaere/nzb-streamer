@@ -12,6 +12,7 @@ import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.sync.Semaphore
 import org.slf4j.LoggerFactory
+import java.util.concurrent.atomic.AtomicReference
 
 class VerificationService(
     private val streamingService: NntpStreamingService,
@@ -37,19 +38,20 @@ class VerificationService(
 
         logger.debug("Verifying {} additional segments", segmentsToVerify.size)
 
-        val missingArticles = mutableListOf<String>()
+        val firstMissing = AtomicReference<String>(null)
+        var checkedCount = 0
         try {
             coroutineScope {
                 val semaphore = Semaphore(concurrency)
                 segmentsToVerify.map { segment ->
                     async {
+                        if (firstMissing.get() != null) return@async
                         semaphore.acquire()
                         try {
+                            if (firstMissing.get() != null) return@async
                             val result = streamingService.statAcrossPools("<${segment.articleId}>")
                             if (result is StatResult.NotFound) {
-                                synchronized(missingArticles) {
-                                    missingArticles.add(segment.articleId)
-                                }
+                                firstMissing.compareAndSet(null, segment.articleId)
                             }
                         } finally {
                             semaphore.release()
@@ -57,6 +59,7 @@ class VerificationService(
                     }
                 }.awaitAll()
             }
+            checkedCount = segmentsToVerify.size
         } catch (e: NntpException) {
             logger.error("NNTP failure during segment verification: {}", e.message, e)
             return VerificationResult.Failure(
@@ -66,15 +69,16 @@ class VerificationService(
         }
 
         sample.stop(verificationTimer)
-        verificationSegments.increment(segmentsToVerify.size.toDouble())
+        verificationSegments.increment(checkedCount.toDouble())
 
-        if (missingArticles.isNotEmpty()) {
-            verificationMissing.increment(missingArticles.size.toDouble())
-            val message = "Missing ${missingArticles.size} articles: ${missingArticles.joinToString(", ")}"
+        val missingArticleId = firstMissing.get()
+        if (missingArticleId != null) {
+            verificationMissing.increment(1.0)
+            val message = "Missing article: $missingArticleId"
             logger.warn(message)
             return VerificationResult.MissingArticles(
                 message,
-                ArticleNotFoundException("Missing articles: ${missingArticles.joinToString(", ")}")
+                ArticleNotFoundException("Missing article: $missingArticleId")
             )
         }
 
