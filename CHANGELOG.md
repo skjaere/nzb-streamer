@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.7.4](https://github.com/skjaere/nzb-streamer/compare/v0.7.3...v0.7.4) (2026-03-19)
+
+
+### Bug Fixes
+
+* short-circuit segment verification on first missing article
+
 ## [0.7.3](https://github.com/skjaere/nzb-streamer/compare/v0.7.2...v0.7.3) (2026-03-18)
 
 
