@@ -215,28 +215,18 @@ class ArchiveStreamingService(
                 endOfArchiveSize = 0
             )
         } else {
-            // Split RAR file - derive overhead values from parsed split parts
-            val volumeOffsets = computeVolumeOffsets(archiveNzb)
-            val volumeSizes = computeVolumeSizes(archiveNzb)
-            val startVolumeIndex = entry.splitParts[0].volumeIndex
-            val startOffsetInVolume = entry.splitParts[0].dataStartPosition - volumeOffsets[startVolumeIndex]
-
-            val continuationHeaderSize = if (entry.splitParts.size > 1) {
-                entry.splitParts[1].dataStartPosition - volumeOffsets[entry.splitParts[1].volumeIndex]
-            } else {
-                0L
-            }
-
-            val endOfArchiveSize = volumeSizes[startVolumeIndex] -
-                    startOffsetInVolume - entry.splitParts[0].dataSize
-
+            // Split RAR file — use pre-computed splits directly.
+            // RAR5 volumes can have varying overhead (headers, end-of-archive sections)
+            // across volumes, so reconstructing positions from uniform overhead values
+            // produces incorrect byte ranges. The parser's split positions are authoritative.
             StreamableFile(
                 path = entry.path,
                 totalSize = entry.uncompressedSize,
-                startVolumeIndex = startVolumeIndex,
-                startOffsetInVolume = startOffsetInVolume,
-                continuationHeaderSize = continuationHeaderSize,
-                endOfArchiveSize = endOfArchiveSize
+                startVolumeIndex = entry.splitParts[0].volumeIndex,
+                startOffsetInVolume = 0,
+                continuationHeaderSize = 0,
+                endOfArchiveSize = 0,
+                preComputedSplits = entry.splitParts
             )
         }
     }
