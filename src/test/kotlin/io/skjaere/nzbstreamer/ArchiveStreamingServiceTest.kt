@@ -315,10 +315,9 @@ class ArchiveStreamingServiceTest {
         }
 
         @Test
-        fun `resolves split RAR entry`() {
-            // Two volumes of 10000 bytes each.
-            // Split starts at volume 0, absolute offset 500 (= local offset 500 in vol0)
-            // Second split in volume 1, absolute offset 10100 (= local offset 100 in vol1)
+        fun `resolves split RAR entry with pre-computed splits`() {
+            // Split RAR entries should pass through pre-computed splits directly,
+            // since volume overhead can vary across volumes.
             val splitParts = listOf(
                 SplitInfo(volumeIndex = 0, dataStartPosition = 500, dataSize = 9000),
                 SplitInfo(volumeIndex = 1, dataStartPosition = 10100, dataSize = 1000)
@@ -330,9 +329,9 @@ class ArchiveStreamingServiceTest {
             assertEquals("large.bin", result.path)
             assertEquals(10000, result.totalSize)
             assertEquals(0, result.startVolumeIndex)
-            assertEquals(500, result.startOffsetInVolume) // 500 - volumeOffset[0](0) = 500
-            assertEquals(100, result.continuationHeaderSize) // 10100 - volumeOffset[1](10000) = 100
-            assertEquals(500, result.endOfArchiveSize) // volumeSize[0](10000) - 500 - 9000 = 500
+            assertEquals(splitParts, result.preComputedSplits)
+            // toSplits should return the pre-computed splits unchanged
+            assertEquals(splitParts, result.toSplits(nzb))
         }
 
         @Test
@@ -361,6 +360,48 @@ class ArchiveStreamingServiceTest {
             assertEquals(2, result.size)
             assertEquals("good.bin", result[0].path)
             assertEquals("also-good.bin", result[1].path)
+        }
+    }
+
+    // ======================================================================
+    // resolveStreamableFile → toSplits round-trip
+    // ======================================================================
+
+    @Nested
+    inner class SplitRoundTrip {
+
+        @Test
+        fun `split RAR entry round-trips through resolveStreamableFile and toSplits`() {
+            // Simulates a real RAR5 multi-volume archive where the continuation header
+            // size varies between volumes (e.g., volume number vint grows as volume
+            // index increases, or end-of-archive sections differ).
+            //
+            // resolveStreamableFile derives continuationHeaderSize from vol 1 and
+            // endOfArchiveSize from vol 0, then toSplits applies them uniformly.
+            // This fails when overhead actually differs across volumes.
+            //
+            // Volume layout (3 volumes of 10000 bytes each):
+            //   vol0: header=500, data=9000, end-of-archive=500
+            //   vol1: header=100, data=9300, end-of-archive=600 (DIFFERENT end-of-archive!)
+            //   vol2: header=150, data=8850, end-of-archive=1000 (DIFFERENT header AND end!)
+            val splitParts = listOf(
+                SplitInfo(volumeIndex = 0, dataStartPosition = 500, dataSize = 9000),
+                SplitInfo(volumeIndex = 1, dataStartPosition = 10100, dataSize = 9300),
+                SplitInfo(volumeIndex = 2, dataStartPosition = 20150, dataSize = 8850)
+            )
+            val entry = rarEntry("movie.mp4", 27150, splitParts = splitParts)
+            val nzb = archiveNzb(10000, 10000, 10000)
+
+            val streamableFile = service.resolveStreamableFile(entry, nzb)!!
+            val reconstructed = streamableFile.toSplits(nzb)
+
+            assertEquals(splitParts.size, reconstructed.size, "Should have same number of splits")
+            for (i in splitParts.indices) {
+                assertEquals(
+                    splitParts[i], reconstructed[i],
+                    "Split $i mismatch: expected=${splitParts[i]}, got=${reconstructed[i]}"
+                )
+            }
         }
     }
 
