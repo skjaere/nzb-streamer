@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.8.0](https://github.com/skjaere/nzb-streamer/compare/v0.7.4...v0.8.0) (2026-04-19)
+
+
+### Features
+
+* expose per-stream bitrate gauge
+
+
+### Bug Fixes
+
+* pass pre-computed splits through for multi-volume RARs
+
 ## [0.7.4](https://github.com/skjaere/nzb-streamer/compare/v0.7.3...v0.7.4) (2026-03-19)
 
 
