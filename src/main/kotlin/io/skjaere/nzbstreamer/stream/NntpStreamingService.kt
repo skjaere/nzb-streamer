@@ -8,6 +8,8 @@ import io.ktor.utils.io.writeFully
 import io.ktor.utils.io.writer
 import io.micrometer.core.instrument.Counter
 import io.micrometer.core.instrument.Metrics
+import io.micrometer.core.instrument.MultiGauge
+import io.micrometer.core.instrument.Tags
 import io.micrometer.core.instrument.Timer
 import io.skjaere.nntp.ArticleNotFoundException
 import io.skjaere.nntp.NntpClientPool
@@ -61,6 +63,78 @@ class NntpStreamingService(
     private val segmentsFallback = registry.counter("nzb.segments.fallback")
     private val activeStreams = AtomicLong(0).also { registry.gauge("nzb.streams.active", it) }
     private val streamCounters = ConcurrentHashMap<String, Counter>()
+
+    // Per-stream bitrate: one MultiGauge with rows backed by the state
+    // objects in streamBitrateStates. A single viewer session typically spawns
+    // many overlapping launchStreamSegments calls (one per range request from
+    // the media player), so we reference-count active users of a given name
+    // to keep the gauge row alive until the last one releases it.
+    private data class RefCountedState(val state: BitrateState, var refCount: Int)
+
+    private val streamBitrateStates = ConcurrentHashMap<String, RefCountedState>()
+    private val streamBitrateGauge = MultiGauge.builder("nzb.streams.bitrate").register(registry)
+
+    private fun refreshBitrateGauge() {
+        val names = streamBitrateStates.keys.toList()
+        streamBitrateGauge.register(
+            names.map { name ->
+                MultiGauge.Row.of(Tags.of("name", name)) {
+                    streamBitrateStates[name]?.state?.sampleBitrate() ?: 0.0
+                }
+            },
+            true,
+        )
+    }
+
+    private class BitrateState {
+        private val totalBytes = AtomicLong(0)
+        @Volatile private var lastSampleBytes = 0L
+        @Volatile private var lastSampleNanos = System.nanoTime()
+
+        fun addBytes(n: Long) {
+            totalBytes.addAndGet(n)
+        }
+
+        /** Bytes/sec averaged between the last read and now. Resets each read. */
+        fun sampleBitrate(): Double {
+            val now = System.nanoTime()
+            val bytes = totalBytes.get()
+            val deltaBytes = bytes - lastSampleBytes
+            val deltaNanos = now - lastSampleNanos
+            lastSampleBytes = bytes
+            lastSampleNanos = now
+            return if (deltaNanos <= 0) 0.0 else deltaBytes * 1_000_000_000.0 / deltaNanos
+        }
+    }
+
+    private fun acquireBitrateState(name: String): BitrateState {
+        var newlyCreated = false
+        val entry = streamBitrateStates.compute(name) { _, existing ->
+            if (existing == null) {
+                newlyCreated = true
+                RefCountedState(BitrateState(), 1)
+            } else {
+                existing.copy(refCount = existing.refCount + 1)
+            }
+        }!!
+        if (newlyCreated) refreshBitrateGauge()
+        return entry.state
+    }
+
+    private fun releaseBitrateState(name: String) {
+        var removed = false
+        streamBitrateStates.compute(name) { _, existing ->
+            when {
+                existing == null -> null
+                existing.refCount <= 1 -> {
+                    removed = true
+                    null
+                }
+                else -> existing.copy(refCount = existing.refCount - 1)
+            }
+        }
+        if (removed) refreshBitrateGauge()
+    }
 
     suspend fun connect() {
         selectorManager = SelectorManager(Dispatchers.IO)
@@ -183,10 +257,11 @@ class NntpStreamingService(
         val counter = streamCounters.computeIfAbsent(name) {
             registry.counter("nzb.streams.bytes", "name", name)
         }
+        val bitrate = acquireBitrateState(name)
         activeStreams.incrementAndGet()
         try {
             coroutineScope {
-                val writerJob = launchStreamSegments(queue, concurrency, readAheadSegments, counter)
+                val writerJob = launchStreamSegments(queue, concurrency, readAheadSegments, counter, bitrate)
                 try {
                     consume(writerJob.channel)
                 } finally {
@@ -195,6 +270,7 @@ class NntpStreamingService(
             }
         } finally {
             activeStreams.decrementAndGet()
+            releaseBitrateState(name)
         }
     }
 
@@ -211,14 +287,18 @@ class NntpStreamingService(
         val counter = streamCounters.computeIfAbsent(name) {
             registry.counter("nzb.streams.bytes", "name", name)
         }
-        return launchStreamSegments(queue, concurrency, readAheadSegments, counter)
+        val bitrate = acquireBitrateState(name)
+        val writerJob = launchStreamSegments(queue, concurrency, readAheadSegments, counter, bitrate)
+        writerJob.job.invokeOnCompletion { releaseBitrateState(name) }
+        return writerJob
     }
 
     private suspend fun launchStreamSegments(
         queue: Flow<SegmentQueueItem>,
         concurrency: Int,
         readAheadSegments: Int,
-        counter: Counter
+        counter: Counter,
+        bitrate: BitrateState
     ): WriterJob {
         val callerScope = CoroutineScope(currentCoroutineContext())
         return callerScope.writer(autoFlush = false) {
@@ -246,8 +326,10 @@ class NntpStreamingService(
                 val start = minOf(item.readStart.toInt(), data.size)
                 val end = minOf(item.readEnd.toInt(), data.size)
                 if (end > start) {
+                    val written = (end - start).toLong()
                     channel.writeFully(data, start, end)
-                    counter.increment((end - start).toDouble())
+                    counter.increment(written.toDouble())
+                    bitrate.addBytes(written)
                 }
             }
         }
@@ -297,4 +379,5 @@ class NntpStreamingService(
         }
         scope.cancel()
     }
+
 }
