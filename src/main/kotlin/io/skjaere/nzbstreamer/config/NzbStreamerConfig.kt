@@ -16,10 +16,6 @@ data class StreamingConfig(
     val readAheadSegments: Int = concurrency * 3
 )
 
-data class SeekConfig(
-    val forwardThresholdBytes: Long
-)
-
 data class PrepareConfig(
     val verifySegments: Boolean = false
 )
