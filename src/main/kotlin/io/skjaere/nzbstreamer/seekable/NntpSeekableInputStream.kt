@@ -19,12 +19,14 @@ import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.io.EOFException
 import org.slf4j.LoggerFactory
 
+private const val FORWARD_THRESHOLD_BYTES = 102400L
+
 class NntpSeekableInputStream(
     private val nzb: NzbDocument,
-    private val streamingService: NntpStreamingService,
-    private val forwardThresholdBytes: Long = 102400L
+    private val streamingService: NntpStreamingService
 ) : SeekableInputStream {
     private val logger = LoggerFactory.getLogger(NntpSeekableInputStream::class.java)
+    private val forwardThresholdBytes: Long = FORWARD_THRESHOLD_BYTES
     private val totalSize: Long = SegmentQueueService.getTotalDecodedSize(nzb)
     private var currentPosition: Long = 0
     private var currentJob: Job? = null

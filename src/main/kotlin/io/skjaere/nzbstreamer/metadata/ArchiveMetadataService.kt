@@ -19,7 +19,6 @@ import org.slf4j.LoggerFactory
 
 class ArchiveMetadataService(
     private val streamingService: NntpStreamingService,
-    private val forwardThresholdBytes: Long,
     private val prepareConfig: PrepareConfig = PrepareConfig(),
     concurrency: Int = 1
 ) {
@@ -28,7 +27,7 @@ class ArchiveMetadataService(
     private val prepareTimer = registry.timer("nzb.prepare.duration")
     private val enrichmentService = NzbEnrichmentService(streamingService)
     private val verificationService = VerificationService(streamingService, concurrency)
-    private val nestedArchiveService = NestedArchiveMetadataService(streamingService, forwardThresholdBytes)
+    private val nestedArchiveService = NestedArchiveMetadataService(streamingService)
 
     suspend fun enrich(nzb: NzbDocument): EnrichmentResult {
         val result = enrichmentService.enrich(nzb)
@@ -139,7 +138,7 @@ class ArchiveMetadataService(
 
     private suspend fun listArchiveEntries(resolved: ResolvedVolumes): List<ArchiveFileEntry>? {
         val seekableStream = NntpSeekableInputStream(
-            resolved.orderedArchiveNzb, streamingService, forwardThresholdBytes
+            resolved.orderedArchiveNzb, streamingService
         )
         val listFilesResult = seekableStream.use { stream ->
             ArchiveService.listFiles(stream, resolved.orderedVolumes, resolved.par2Data)

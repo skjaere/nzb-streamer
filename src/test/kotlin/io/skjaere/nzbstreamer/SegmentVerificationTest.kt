@@ -162,7 +162,6 @@ class SegmentVerificationTest {
         streamingService.use {
             val metadataService = ArchiveMetadataService(
                 streamingService,
-                forwardThresholdBytes = 102400L,
                 prepareConfig = PrepareConfig(verifySegments = false),
                 concurrency = 1
             )
@@ -186,7 +185,6 @@ class SegmentVerificationTest {
         streamingService.use {
             val metadataService = ArchiveMetadataService(
                 streamingService,
-                forwardThresholdBytes = 102400L,
                 prepareConfig = PrepareConfig(verifySegments = true),
                 concurrency = 1
             )

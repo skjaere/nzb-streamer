@@ -5,7 +5,6 @@ import io.skjaere.compressionutils.Par2Parser
 import io.skjaere.compressionutils.SplitInfo
 import io.skjaere.nzbstreamer.config.NntpConfig
 import io.skjaere.nzbstreamer.config.PrepareConfig
-import io.skjaere.nzbstreamer.config.SeekConfig
 import io.skjaere.nzbstreamer.config.StreamingConfig
 import io.skjaere.nzbstreamer.enrichment.EnrichmentResult
 import io.skjaere.nzbstreamer.enrichment.VerificationResult
@@ -206,17 +205,12 @@ class NzbStreamer private constructor(
         )
     }
 
-    class SeekBuilder {
-        var forwardThresholdBytes: Long = 102400L
-    }
-
     class PrepareBuilder {
         var verifySegments: Boolean = false
     }
 
     class Builder {
         private val poolBuilders = mutableListOf<NntpBuilder>()
-        private var seekBuilder: SeekBuilder = SeekBuilder()
         private var prepareBuilder: PrepareBuilder = PrepareBuilder()
         var concurrency: Int = 4
         var verificationConcurrency: Int? = null
@@ -225,10 +219,6 @@ class NzbStreamer private constructor(
         /** Add an NNTP pool. First pool added is the primary; subsequent pools are fill/fallback. */
         fun nntp(block: NntpBuilder.() -> Unit) {
             poolBuilders.add(NntpBuilder().apply(block))
-        }
-
-        fun seek(block: SeekBuilder.() -> Unit) {
-            seekBuilder = SeekBuilder().apply(block)
         }
 
         fun prepare(block: PrepareBuilder.() -> Unit) {
@@ -242,13 +232,12 @@ class NzbStreamer private constructor(
                 verificationConcurrency = verificationConcurrency ?: concurrency,
                 readAheadSegments = readAheadSegments ?: (concurrency * 3)
             )
-            val seekConfig = SeekConfig(forwardThresholdBytes = seekBuilder.forwardThresholdBytes)
             val prepareConfig = PrepareConfig(verifySegments = prepareBuilder.verifySegments)
             val streamingService = NntpStreamingService(configs, streamingConfig)
             runBlocking { streamingService.connect() }
 
             val metadataService = ArchiveMetadataService(
-                streamingService, seekConfig.forwardThresholdBytes, prepareConfig, streamingConfig.concurrency
+                streamingService, prepareConfig, streamingConfig.concurrency
             )
             val verificationService = VerificationService(streamingService, streamingConfig.verificationConcurrency)
             val archiveStreamingService = ArchiveStreamingService(streamingService)
@@ -265,7 +254,6 @@ class NzbStreamer private constructor(
         fun fromConfig(
             nntpConfigs: List<NntpConfig>,
             streamingConfig: StreamingConfig = StreamingConfig(),
-            seekConfig: SeekConfig,
             prepareConfig: PrepareConfig = PrepareConfig()
         ): NzbStreamer {
             return invoke {
@@ -282,7 +270,6 @@ class NzbStreamer private constructor(
                         maxConnections = config.maxConnections
                     }
                 }
-                seek { forwardThresholdBytes = seekConfig.forwardThresholdBytes }
                 prepare { verifySegments = prepareConfig.verifySegments }
             }
         }
@@ -291,8 +278,7 @@ class NzbStreamer private constructor(
         fun fromConfig(
             nntpConfig: NntpConfig,
             streamingConfig: StreamingConfig = StreamingConfig(),
-            seekConfig: SeekConfig,
             prepareConfig: PrepareConfig = PrepareConfig()
-        ): NzbStreamer = fromConfig(listOf(nntpConfig), streamingConfig, seekConfig, prepareConfig)
+        ): NzbStreamer = fromConfig(listOf(nntpConfig), streamingConfig, prepareConfig)
     }
 }

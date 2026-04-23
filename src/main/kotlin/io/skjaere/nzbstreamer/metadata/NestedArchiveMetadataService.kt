@@ -16,8 +16,7 @@ import io.skjaere.nzbstreamer.stream.NntpStreamingService
 import org.slf4j.LoggerFactory
 
 class NestedArchiveMetadataService(
-    private val streamingService: NntpStreamingService,
-    private val forwardThresholdBytes: Long
+    private val streamingService: NntpStreamingService
 ) {
     private val logger = LoggerFactory.getLogger(NestedArchiveMetadataService::class.java)
 
@@ -102,7 +101,7 @@ class NestedArchiveMetadataService(
         orderedArchiveNzb: NzbDocument
     ): List<ArchiveFileEntry>? {
         val volumesWithHeaders = NntpSeekableInputStream(
-            orderedArchiveNzb, streamingService, forwardThresholdBytes
+            orderedArchiveNzb, streamingService
         ).use { stream ->
             resolvedInnerVolumes.zip(outerChunks).map { (vol, chunks) ->
                 val first16kb = ByteArray(minOf(16384, vol.size).toInt())
@@ -118,7 +117,7 @@ class NestedArchiveMetadataService(
         }
 
         val innerListResult = NestedSeekableInputStream(
-            outerStream = NntpSeekableInputStream(orderedArchiveNzb, streamingService, forwardThresholdBytes),
+            outerStream = NntpSeekableInputStream(orderedArchiveNzb, streamingService),
             innerVolumeSizes = innerVolumeSizes,
             outerChunks = outerChunks
         ).use { stream ->

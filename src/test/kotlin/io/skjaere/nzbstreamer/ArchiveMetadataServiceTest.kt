@@ -98,7 +98,7 @@ class ArchiveMetadataServiceTest {
         server.use {
             val streamingService = createStreamingService(server.localPort)
             streamingService.use {
-                val metadataService = ArchiveMetadataService(streamingService, 102400L)
+                val metadataService = ArchiveMetadataService(streamingService)
                 val nzb = createNzb("article1@test")
 
                 val result = metadataService.prepare(nzb)
