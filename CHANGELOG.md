@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.9.0](https://github.com/skjaere/nzb-streamer/compare/v0.8.0...v0.9.0) (2026-04-23)
+
+
+### ⚠ BREAKING CHANGES
+
+* SeekConfig and the seekConfig parameter on NzbStreamer.fromConfig are removed.
+
+### Code Refactoring
+
+* hard-code forward-threshold-bytes, drop SeekConfig ([1d6ccc1](https://github.com/skjaere/nzb-streamer/commit/1d6ccc117dcc02c4d9079f6e67089ae489b72570))
+
 ## [0.8.0](https://github.com/skjaere/nzb-streamer/compare/v0.7.4...v0.8.0) (2026-04-19)
 
 
