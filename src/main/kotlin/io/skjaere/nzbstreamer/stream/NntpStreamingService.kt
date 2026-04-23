@@ -6,7 +6,6 @@ import io.ktor.utils.io.WriterJob
 import io.ktor.utils.io.toByteArray
 import io.ktor.utils.io.writeFully
 import io.ktor.utils.io.writer
-import io.micrometer.core.instrument.Counter
 import io.micrometer.core.instrument.Metrics
 import io.micrometer.core.instrument.MultiGauge
 import io.micrometer.core.instrument.Tags
@@ -62,7 +61,6 @@ class NntpStreamingService(
     private val segmentsFailed = registry.counter("nzb.segments.failed")
     private val segmentsFallback = registry.counter("nzb.segments.fallback")
     private val activeStreams = AtomicLong(0).also { registry.gauge("nzb.streams.active", it) }
-    private val streamCounters = ConcurrentHashMap<String, Counter>()
 
     // Per-stream bitrate: one MultiGauge with rows backed by the state
     // objects in streamBitrateStates. A single viewer session typically spawns
@@ -254,14 +252,11 @@ class NntpStreamingService(
         name: String = "unknown",
         consume: suspend (ByteReadChannel) -> Unit
     ) {
-        val counter = streamCounters.computeIfAbsent(name) {
-            registry.counter("nzb.streams.bytes", "name", name)
-        }
         val bitrate = acquireBitrateState(name)
         activeStreams.incrementAndGet()
         try {
             coroutineScope {
-                val writerJob = launchStreamSegments(queue, concurrency, readAheadSegments, counter, bitrate)
+                val writerJob = launchStreamSegments(queue, concurrency, readAheadSegments, bitrate)
                 try {
                     consume(writerJob.channel)
                 } finally {
@@ -284,11 +279,8 @@ class NntpStreamingService(
         readAheadSegments: Int = streamingConfig.readAheadSegments,
         name: String = "unknown"
     ): WriterJob {
-        val counter = streamCounters.computeIfAbsent(name) {
-            registry.counter("nzb.streams.bytes", "name", name)
-        }
         val bitrate = acquireBitrateState(name)
-        val writerJob = launchStreamSegments(queue, concurrency, readAheadSegments, counter, bitrate)
+        val writerJob = launchStreamSegments(queue, concurrency, readAheadSegments, bitrate)
         writerJob.job.invokeOnCompletion { releaseBitrateState(name) }
         return writerJob
     }
@@ -297,7 +289,6 @@ class NntpStreamingService(
         queue: Flow<SegmentQueueItem>,
         concurrency: Int,
         readAheadSegments: Int,
-        counter: Counter,
         bitrate: BitrateState
     ): WriterJob {
         val callerScope = CoroutineScope(currentCoroutineContext())
@@ -328,7 +319,6 @@ class NntpStreamingService(
                 if (end > start) {
                     val written = (end - start).toLong()
                     channel.writeFully(data, start, end)
-                    counter.increment(written.toDouble())
                     bitrate.addBytes(written)
                 }
             }
