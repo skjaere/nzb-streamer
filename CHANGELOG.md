@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.9.1](https://github.com/skjaere/nzb-streamer/compare/v0.9.0...v0.9.1) (2026-04-25)
+
+
+### Bug Fixes
+
+* **deps:** bump ktor-nntp-client to v0.5.1 ([ece302e](https://github.com/skjaere/nzb-streamer/commit/ece302e61bbe7ba5ccd7ad2cda2d908e0db5a2c3))
+
 ## [0.9.0](https://github.com/skjaere/nzb-streamer/compare/v0.8.0...v0.9.0) (2026-04-23)
 
 
