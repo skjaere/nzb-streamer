@@ -19,6 +19,7 @@ import io.skjaere.nzbstreamer.stream.ArchiveStreamingService
 import io.skjaere.nzbstreamer.stream.FileResolveResult
 import io.skjaere.nzbstreamer.stream.NamedSplits
 import io.skjaere.nzbstreamer.stream.NntpStreamingService
+import io.skjaere.nzbstreamer.stream.SegmentCache
 import io.skjaere.nzbstreamer.stream.StreamableFile
 import kotlinx.coroutines.runBlocking
 import java.io.Closeable
@@ -215,6 +216,7 @@ class NzbStreamer private constructor(
         var concurrency: Int = 4
         var verificationConcurrency: Int? = null
         var readAheadSegments: Int? = null
+        var segmentCache: SegmentCache? = null
 
         /** Add an NNTP pool. First pool added is the primary; subsequent pools are fill/fallback. */
         fun nntp(block: NntpBuilder.() -> Unit) {
@@ -233,7 +235,7 @@ class NzbStreamer private constructor(
                 readAheadSegments = readAheadSegments ?: (concurrency * 3)
             )
             val prepareConfig = PrepareConfig(verifySegments = prepareBuilder.verifySegments)
-            val streamingService = NntpStreamingService(configs, streamingConfig)
+            val streamingService = NntpStreamingService(configs, streamingConfig, segmentCache)
             runBlocking { streamingService.connect() }
 
             val metadataService = ArchiveMetadataService(
@@ -254,12 +256,14 @@ class NzbStreamer private constructor(
         fun fromConfig(
             nntpConfigs: List<NntpConfig>,
             streamingConfig: StreamingConfig = StreamingConfig(),
-            prepareConfig: PrepareConfig = PrepareConfig()
+            prepareConfig: PrepareConfig = PrepareConfig(),
+            segmentCache: SegmentCache? = null,
         ): NzbStreamer {
             return invoke {
                 concurrency = streamingConfig.concurrency
                 verificationConcurrency = streamingConfig.verificationConcurrency
                 readAheadSegments = streamingConfig.readAheadSegments
+                this.segmentCache = segmentCache
                 nntpConfigs.forEach { config ->
                     nntp {
                         host = config.host
@@ -278,7 +282,8 @@ class NzbStreamer private constructor(
         fun fromConfig(
             nntpConfig: NntpConfig,
             streamingConfig: StreamingConfig = StreamingConfig(),
-            prepareConfig: PrepareConfig = PrepareConfig()
-        ): NzbStreamer = fromConfig(listOf(nntpConfig), streamingConfig, prepareConfig)
+            prepareConfig: PrepareConfig = PrepareConfig(),
+            segmentCache: SegmentCache? = null,
+        ): NzbStreamer = fromConfig(listOf(nntpConfig), streamingConfig, prepareConfig, segmentCache)
     }
 }

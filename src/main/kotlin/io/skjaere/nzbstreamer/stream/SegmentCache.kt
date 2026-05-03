@@ -1,5 +1,6 @@
 package io.skjaere.nzbstreamer.stream
 
+import io.micrometer.core.instrument.Metrics
 import io.skjaere.nzbstreamer.config.SegmentCacheConfig
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
@@ -56,6 +57,13 @@ class SegmentCache(private val config: SegmentCacheConfig) : AutoCloseable {
         require(config.maxBytes > 0) { "maxBytes must be > 0" }
         config.cacheDir.createDirectories()
         loadIndex()
+
+        // Gauges read state on every scrape; AtomicLong satisfies Number, and the
+        // index gauge reads .size unsynchronized — fine for a metric.
+        val registry = Metrics.globalRegistry
+        registry.gauge("nzb.segments.cache.bytes", totalBytes)
+        registry.gauge("nzb.segments.cache.max.bytes", AtomicLong(config.maxBytes))
+        registry.gauge("nzb.segments.cache.entries", index) { it.size.toDouble() }
     }
 
     private fun loadIndex() {

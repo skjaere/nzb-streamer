@@ -27,9 +27,12 @@ import kotlinx.coroutines.channels.consumeEach
 import kotlinx.coroutines.channels.produce
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.toList
 import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.withTimeout
+import kotlin.time.Duration.Companion.milliseconds
 import org.slf4j.LoggerFactory
 import java.io.Closeable
 import java.util.concurrent.ConcurrentHashMap
@@ -40,7 +43,8 @@ import kotlin.concurrent.write
 
 class NntpStreamingService(
     initialConfigs: List<NntpConfig>,
-    private val streamingConfig: StreamingConfig = StreamingConfig()
+    private val streamingConfig: StreamingConfig = StreamingConfig(),
+    private val segmentCache: SegmentCache? = null
 ) : Closeable {
     constructor(config: NntpConfig) : this(listOf(config))
 
@@ -60,6 +64,8 @@ class NntpStreamingService(
     private val segmentDownloadTimer = registry.timer("nzb.segments.download.duration")
     private val segmentsFailed = registry.counter("nzb.segments.failed")
     private val segmentsFallback = registry.counter("nzb.segments.fallback")
+    private val segmentCacheHits = registry.counter("nzb.segments.cache.hits")
+    private val segmentCacheMisses = registry.counter("nzb.segments.cache.misses")
     private val activeStreams = AtomicLong(0).also { registry.gauge("nzb.streams.active", it) }
 
     // Per-stream bitrate: one MultiGauge with rows backed by the state
@@ -326,14 +332,29 @@ class NntpStreamingService(
     }
 
     private suspend fun downloadSegment(articleId: String): ByteArray {
+        if (segmentCache != null) {
+            segmentCache.get(articleId)?.let {
+                segmentCacheHits.increment()
+                return it
+            }
+            segmentCacheMisses.increment()
+            // Singleflight in SegmentCache dedupes concurrent fetches for the same article.
+            return segmentCache.getOrFetch(articleId) { fetchSegmentFromNntp(articleId) }
+        }
+        return fetchSegmentFromNntp(articleId)
+    }
+
+    private suspend fun fetchSegmentFromNntp(articleId: String): ByteArray {
         val sample = Timer.start(registry)
         val snapshot = poolLock.read { pools.toList() }
         val data = snapshot.withIndex().firstNotNullOfOrNull { (index, entry) ->
             try {
                 var result: ByteArray? = null
-                entry.pool.bodyYenc("<$articleId>", NntpPriority.STREAMING.value).collect { event ->
-                    if (event is YencEvent.Body) {
-                        result = event.data.toByteArray()
+                withTimeout(streamingConfig.segmentFetchTimeoutMs.milliseconds) {
+                    entry.pool.bodyYenc("<$articleId>", NntpPriority.STREAMING.value).collect { event ->
+                        if (event is YencEvent.Body) {
+                            result = event.data.toByteArray()
+                        }
                     }
                 }
                 result?.also {
@@ -348,6 +369,21 @@ class NntpStreamingService(
                         articleId, index, entry.config.host, entry.config.port, index + 1
                     )
                     segmentsFallback.increment()
+                }
+                null
+            } catch (e: TimeoutCancellationException) {
+                if (index < snapshot.size - 1) {
+                    logger.warn(
+                        "Segment <{}> timed out after {}ms on pool[{}] ({}:{}), trying pool[{}]",
+                        articleId, streamingConfig.segmentFetchTimeoutMs,
+                        index, entry.config.host, entry.config.port, index + 1
+                    )
+                    segmentsFallback.increment()
+                } else {
+                    logger.warn(
+                        "Segment <{}> timed out after {}ms on all {} pool(s)",
+                        articleId, streamingConfig.segmentFetchTimeoutMs, snapshot.size
+                    )
                 }
                 null
             }
@@ -366,6 +402,13 @@ class NntpStreamingService(
     override fun close() {
         poolLock.read {
             pools.forEach { it.pool.close() }
+        }
+        segmentCache?.close()
+        // Close the ktor SelectorManager that all pool sockets share. Must happen after the
+        // pools have torn their sockets down so we don't yank the selector out from under
+        // an in-flight QUIT round-trip.
+        if (::selectorManager.isInitialized) {
+            runCatching { selectorManager.close() }
         }
         scope.cancel()
     }
