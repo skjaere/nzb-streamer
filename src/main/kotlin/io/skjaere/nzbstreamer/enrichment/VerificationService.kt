@@ -26,8 +26,22 @@ class VerificationService(
 
     suspend fun verifySegments(nzb: NzbDocument): VerificationResult {
         val sample = Timer.start(registry)
+        // Carry the per-segment position within its file (and the file's name/size)
+        // alongside each unit of work, so when a segment is missing we can log WHERE
+        // in the file it sits — useful for distinguishing "this NZB is mostly broken"
+        // from "just one segment lost at position N/M".
+        data class SegmentToCheck(
+            val segment: io.skjaere.nzbstreamer.nzb.NzbSegment,
+            val fileName: String,
+            val positionInFile: Int,  // 1-based
+            val totalSegmentsInFile: Int
+        )
         val segmentsToVerify = nzb.files.flatMap { file ->
-            file.segments
+            val name = file.yencHeaders?.name ?: file.subject
+            val total = file.segments.size
+            file.segments.mapIndexed { idx, segment ->
+                SegmentToCheck(segment, name, idx + 1, total)
+            }
         }
 
         if (segmentsToVerify.isEmpty()) {
@@ -38,20 +52,20 @@ class VerificationService(
 
         logger.debug("Verifying {} additional segments", segmentsToVerify.size)
 
-        val firstMissing = AtomicReference<String>(null)
+        val firstMissing = AtomicReference<SegmentToCheck>(null)
         var checkedCount = 0
         try {
             coroutineScope {
                 val semaphore = Semaphore(concurrency)
-                segmentsToVerify.map { segment ->
+                segmentsToVerify.map { unit ->
                     async {
                         if (firstMissing.get() != null) return@async
                         semaphore.acquire()
                         try {
                             if (firstMissing.get() != null) return@async
-                            val result = streamingService.statAcrossPools("<${segment.articleId}>")
+                            val result = streamingService.statAcrossPools("<${unit.segment.articleId}>")
                             if (result is StatResult.NotFound) {
-                                firstMissing.compareAndSet(null, segment.articleId)
+                                firstMissing.compareAndSet(null, unit)
                             }
                         } finally {
                             semaphore.release()
@@ -71,14 +85,23 @@ class VerificationService(
         sample.stop(verificationTimer)
         verificationSegments.increment(checkedCount.toDouble())
 
-        val missingArticleId = firstMissing.get()
-        if (missingArticleId != null) {
+        val missing = firstMissing.get()
+        if (missing != null) {
             verificationMissing.increment(1.0)
-            val message = "Missing article: $missingArticleId"
+            // Include position/total/filename so we can see WHERE in the file the
+            // first missing segment sits — telling us whether the NZB is broken at
+            // the head, the middle, or the tail (which often correlates with the
+            // root cause: head=indexer indexing miss, tail=expired retention).
+            // segment.number is the NZB-declared segment number (sometimes differs
+            // from list position when the NZB enumerates out of order).
+            val message = "Missing article ${missing.segment.articleId} at " +
+                "position ${missing.positionInFile}/${missing.totalSegmentsInFile} " +
+                "(segment.number=${missing.segment.number}) " +
+                "of file '${missing.fileName}'"
             logger.warn(message)
             return VerificationResult.MissingArticles(
                 message,
-                ArticleNotFoundException("Missing article: $missingArticleId")
+                ArticleNotFoundException(message)
             )
         }
 
