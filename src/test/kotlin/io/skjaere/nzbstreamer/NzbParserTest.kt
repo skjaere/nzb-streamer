@@ -3,8 +3,47 @@ package io.skjaere.nzbstreamer
 import io.skjaere.nzbstreamer.nzb.NzbParser
 import org.junit.jupiter.api.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertNull
 
 class NzbParserTest {
+
+    @Test
+    fun `parse NZB with head meta password sets NzbDocument password`() {
+        val xml = """
+            <?xml version="1.0" encoding="UTF-8"?>
+            <nzb xmlns="http://www.newzbin.com/DTD/2003/nzb">
+                <head>
+                    <meta type="title">Some.Release.Name</meta>
+                    <meta type="password">hunter2</meta>
+                </head>
+                <file poster="x" date="1" subject="s">
+                    <groups><group>g</group></groups>
+                    <segments><segment bytes="1" number="1">a@b</segment></segments>
+                </file>
+            </nzb>
+        """.trimIndent()
+
+        val nzb = NzbParser.parse(xml.toByteArray())
+
+        assertEquals("hunter2", nzb.password)
+    }
+
+    @Test
+    fun `parse NZB without head meta password leaves password null`() {
+        val xml = """
+            <?xml version="1.0" encoding="UTF-8"?>
+            <nzb xmlns="http://www.newzbin.com/DTD/2003/nzb">
+                <file poster="x" date="1" subject="s">
+                    <groups><group>g</group></groups>
+                    <segments><segment bytes="1" number="1">a@b</segment></segments>
+                </file>
+            </nzb>
+        """.trimIndent()
+
+        val nzb = NzbParser.parse(xml.toByteArray())
+
+        assertNull(nzb.password)
+    }
 
     @Test
     fun `parse single file NZB`() {

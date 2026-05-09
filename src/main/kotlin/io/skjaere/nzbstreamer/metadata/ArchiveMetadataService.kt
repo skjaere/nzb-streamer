@@ -33,7 +33,10 @@ class ArchiveMetadataService(
         val result = enrichmentService.enrich(nzb)
         if (result is EnrichmentResult.Success) {
             return EnrichmentResult.Success(
-                NzbDocument(result.enrichedNzb.files.filter { it.yencHeaders != null })
+                NzbDocument(
+                    files = result.enrichedNzb.files.filter { it.yencHeaders != null },
+                    password = result.enrichedNzb.password,
+                )
             )
         }
         return result
@@ -71,7 +74,14 @@ class ArchiveMetadataService(
                             )
                         )
                     } else {
-                        PrepareResult.Success(extractMetadata(enrichedNzb))
+                        when (val mr = extractMetadata(enrichedNzb)) {
+                            is MetadataResult.Success -> PrepareResult.Success(mr.metadata)
+                            is MetadataResult.Encrypted -> PrepareResult.Encrypted(
+                                message = "Archive '${mr.info.archiveName ?: "<unknown>"}' is " +
+                                        "password-protected (RAR5 HEAD_CRYPT)",
+                                info = mr.info,
+                            )
+                        }
                     }
                 }
 
@@ -86,21 +96,33 @@ class ArchiveMetadataService(
         }
     }
 
-    suspend fun extractMetadata(nzb: NzbDocument): ExtractedMetadata {
+    suspend fun extractMetadata(nzb: NzbDocument): MetadataResult {
         val resolved = resolveVolumes(nzb)
         val (orderedArchiveNzb, orderedVolumes, obfuscated) = resolved
 
-        val rawEntries = listArchiveEntries(resolved)
-            ?: return ExtractedMetadata.Raw(
-                response = NzbMetadataResponse(
-                    volumes = orderedVolumes.map { it.filename },
-                    obfuscated = obfuscated,
-                    entries = emptyList()
-                ),
-                orderedArchiveNzb = orderedArchiveNzb
+        return when (val r = listArchiveEntries(resolved)) {
+            is ListArchiveEntriesResult.Encrypted -> MetadataResult.Encrypted(r.info)
+            is ListArchiveEntriesResult.Unsupported -> MetadataResult.Success(
+                ExtractedMetadata.Raw(
+                    response = NzbMetadataResponse(
+                        volumes = orderedVolumes.map { it.filename },
+                        obfuscated = obfuscated,
+                        entries = emptyList()
+                    ),
+                    orderedArchiveNzb = orderedArchiveNzb
+                )
             )
 
-        return buildMetadata(rawEntries, orderedArchiveNzb, orderedVolumes, obfuscated)
+            is ListArchiveEntriesResult.Entries -> MetadataResult.Success(
+                buildMetadata(r.entries, orderedArchiveNzb, orderedVolumes, obfuscated)
+            )
+        }
+    }
+
+    private sealed interface ListArchiveEntriesResult {
+        data class Entries(val entries: List<ArchiveFileEntry>) : ListArchiveEntriesResult
+        data object Unsupported : ListArchiveEntriesResult
+        data class Encrypted(val info: io.skjaere.compressionutils.EncryptionInfo) : ListArchiveEntriesResult
     }
 
     private fun resolveVolumes(nzb: NzbDocument): ResolvedVolumes {
@@ -129,26 +151,33 @@ class ArchiveMetadataService(
         logger.debug("Extracting metadata from {} volumes (obfuscated={})", orderedVolumes.size, obfuscated)
 
         return ResolvedVolumes(
-            orderedArchiveNzb = NzbDocument(orderedArchiveFiles),
+            orderedArchiveNzb = NzbDocument(files = orderedArchiveFiles, password = nzb.password),
             orderedVolumes = orderedVolumes,
             obfuscated = obfuscated,
             par2Data = par2Data
         )
     }
 
-    private suspend fun listArchiveEntries(resolved: ResolvedVolumes): List<ArchiveFileEntry>? {
+    private suspend fun listArchiveEntries(resolved: ResolvedVolumes): ListArchiveEntriesResult {
         val seekableStream = NntpSeekableInputStream(
             resolved.orderedArchiveNzb, streamingService
         )
         val listFilesResult = seekableStream.use { stream ->
-            ArchiveService.listFiles(stream, resolved.orderedVolumes, resolved.par2Data)
+            ArchiveService.listFiles(
+                stream = stream,
+                volumes = resolved.orderedVolumes,
+                par2Data = resolved.par2Data,
+                password = resolved.orderedArchiveNzb.password,
+            )
         }
         return when (listFilesResult) {
-            is ListFilesResult.Success -> listFilesResult.entries
+            is ListFilesResult.Success -> ListArchiveEntriesResult.Entries(listFilesResult.entries)
             is ListFilesResult.UnsupportedFormat -> {
                 logger.debug("No supported archive format detected; returning volumes without archive entries")
-                null
+                ListArchiveEntriesResult.Unsupported
             }
+
+            is ListFilesResult.Encrypted -> ListArchiveEntriesResult.Encrypted(listFilesResult.info)
         }
     }
 
