@@ -180,6 +180,66 @@ class ArchiveStreamingServiceTest {
             val splits = listOf(SplitInfo(0, 0, 100))
             assertEquals(emptyList(), adjustSplitsForRange(splits, 200, 100))
         }
+
+        // Encrypted-split trims must NOT shift dataStartPosition (it's the on-disk IV
+        // position — moving it would yank the AES block index math). Instead trim should
+        // shift dataAreaPlaintextOffset on the encryption metadata.
+
+        private val testEnc = io.skjaere.compressionutils.SplitEncryptionInfo(
+            plaintextHeaderSize = 184,
+            salt = ByteArray(16) { (it * 3).toByte() },
+            kdfIterationsLog2 = 15,
+            dataAreaPlaintextOffset = 0,
+        )
+
+        @Test
+        fun `encrypted split keeps dataStartPosition pinned at IV when trimmed mid-range`() {
+            val splits = listOf(SplitInfo(0, 94, 1000, encryption = testEnc))
+            val result = adjustSplitsForRange(splits, 200, 500)
+            assertEquals(1, result.size)
+            // dataStartPosition stays at the IV (94), NOT shifted to 94+200
+            assertEquals(94, result[0].dataStartPosition)
+            // dataSize is the trimmed plaintext length
+            assertEquals(500, result[0].dataSize)
+            // Trim is encoded into the plaintext-offset field
+            assertEquals(200, result[0].encryption!!.dataAreaPlaintextOffset)
+            // Other crypto params are preserved
+            assertEquals(testEnc.plaintextHeaderSize, result[0].encryption!!.plaintextHeaderSize)
+            assertEquals(testEnc.kdfIterationsLog2, result[0].encryption!!.kdfIterationsLog2)
+        }
+
+        @Test
+        fun `encrypted split with a non-zero starting plaintext offset accumulates trims`() {
+            // Simulating a secondary range request on an already-trimmed split (e.g. from a
+            // resolve path that pre-trimmed). The new plaintext offset = old offset + trim.
+            val preTrimmed = testEnc.copy(dataAreaPlaintextOffset = 100)
+            val splits = listOf(SplitInfo(0, 94, 1000, encryption = preTrimmed))
+            val result = adjustSplitsForRange(splits, 50, 200)
+            assertEquals(94, result[0].dataStartPosition)
+            assertEquals(200, result[0].dataSize)
+            assertEquals(150, result[0].encryption!!.dataAreaPlaintextOffset)  // 100 + 50
+        }
+
+        @Test
+        fun `encrypted multi-volume splits trim each independently`() {
+            // Two encrypted blocks, one per volume — typical for a split file in a
+            // multi-volume RAR. Trimming a range that crosses both must produce two
+            // splits, each with its own IV pinned and its own plaintext offset.
+            val splits = listOf(
+                SplitInfo(0, 94, 1000, encryption = testEnc),
+                SplitInfo(1, 50, 1000, encryption = testEnc),
+            )
+            val result = adjustSplitsForRange(splits, 800, 400)
+            assertEquals(2, result.size)
+            // First split: 200 bytes from offset 800 in this split's plaintext data area
+            assertEquals(94, result[0].dataStartPosition)
+            assertEquals(200, result[0].dataSize)
+            assertEquals(800, result[0].encryption!!.dataAreaPlaintextOffset)
+            // Second split: 200 bytes from offset 0 (range start landed mid-first-split)
+            assertEquals(50, result[1].dataStartPosition)
+            assertEquals(200, result[1].dataSize)
+            assertEquals(0, result[1].encryption!!.dataAreaPlaintextOffset)
+        }
     }
 
     // ======================================================================

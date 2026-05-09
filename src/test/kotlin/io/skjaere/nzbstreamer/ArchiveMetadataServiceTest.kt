@@ -81,6 +81,44 @@ class ArchiveMetadataServiceTest {
         return service
     }
 
+    /**
+     * Regression guard. Production incident: 21 NZBs landed in debridav with
+     * usenet_download.status=COMPLETED but zero files behind them, because
+     * `prepare()` returned `Success(Raw(emptyList()))` on the empty-files path
+     * (ArchiveMetadataService.kt — the `if (enrichedNzb.files.isEmpty())` branch
+     * inside the EnrichmentResult.Success arm) instead of surfacing the missing
+     * articles. Default `verifySegments=false` is the prod config, so the only
+     * line of defence here is enrichment correctly bubbling 430 → MissingArticles.
+     *
+     * Pin the wire-level contract: when the NNTP server returns "430 No Such
+     * Article Found" for every BODY, prepare() MUST end up at MissingArticles —
+     * never at Success, regardless of how many files are in the underlying NZB.
+     */
+    @Test
+    fun `prepare returns MissingArticles when server responds 430 to all BODY requests`() = runBlocking {
+        val server = startServer { reader, out ->
+            while (true) {
+                val line = reader.readLine() ?: break
+                if (line.startsWith("BODY")) {
+                    out.write("430 No Such Article Found\r\n".toByteArray())
+                    out.flush()
+                }
+            }
+        }
+
+        server.use {
+            val streamingService = createStreamingService(server.localPort)
+            streamingService.use {
+                val metadataService = ArchiveMetadataService(streamingService)
+                val nzb = createNzb("missing@test")
+
+                val result = metadataService.prepare(nzb)
+
+                assertIs<PrepareResult.MissingArticles>(result)
+            }
+        }
+    }
+
     @Test
     fun `prepare returns success with empty entries when archive type cannot be detected`() = runBlocking {
         // Garbage data that does not match any archive signature

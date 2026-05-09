@@ -127,6 +127,16 @@ class NestedArchiveMetadataService(
         return when (innerListResult) {
             is ListFilesResult.Success -> innerListResult.entries
             is ListFilesResult.UnsupportedFormat -> null
+            // Encrypted nested archive: treated as "no inner entries" for now —
+            // the outer caller surfaces this state via the outer parse, and
+            // inner-archive password support isn't part of Phase 1.
+            is ListFilesResult.Encrypted -> {
+                logger.info(
+                    "Inner nested archive '{}' is encrypted (RAR5 HEAD_CRYPT); skipping inner entry listing",
+                    innerListResult.info.archiveName,
+                )
+                null
+            }
         }
     }
 
