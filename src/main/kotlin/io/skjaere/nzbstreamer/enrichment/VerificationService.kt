@@ -16,13 +16,27 @@ import java.util.concurrent.atomic.AtomicReference
 
 class VerificationService(
     private val streamingService: NntpStreamingService,
-    private val concurrency: Int = 1
+    concurrency: Int = 1
 ) {
     private val logger = LoggerFactory.getLogger(VerificationService::class.java)
     private val registry = Metrics.globalRegistry
     private val verificationTimer = registry.timer("nzb.verification.duration")
     private val verificationSegments = registry.counter("nzb.verification.segments")
     private val verificationMissing = registry.counter("nzb.verification.missing")
+
+    // Mutable so the live override path in debridav can bump it without restarting.
+    // Read fresh into the per-call Semaphore below; in-flight verifications keep their
+    // existing semaphore. Volatile is sufficient — single-int write, no compound
+    // check-then-act on the field itself.
+    @Volatile
+    private var currentConcurrency: Int = concurrency
+
+    fun setConcurrency(value: Int) {
+        require(value > 0) { "concurrency must be > 0, got $value" }
+        currentConcurrency = value
+    }
+
+    fun getConcurrency(): Int = currentConcurrency
 
     suspend fun verifySegments(nzb: NzbDocument): VerificationResult {
         val sample = Timer.start(registry)
@@ -56,7 +70,7 @@ class VerificationService(
         var checkedCount = 0
         try {
             coroutineScope {
-                val semaphore = Semaphore(concurrency)
+                val semaphore = Semaphore(currentConcurrency)
                 segmentsToVerify.map { unit ->
                     async {
                         if (firstMissing.get() != null) return@async
