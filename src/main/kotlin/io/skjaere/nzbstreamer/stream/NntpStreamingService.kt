@@ -18,7 +18,6 @@ import io.skjaere.nzbstreamer.config.NntpConfig
 import io.skjaere.nzbstreamer.config.StreamingConfig
 import io.skjaere.nzbstreamer.queue.SegmentQueueItem
 import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
@@ -33,6 +32,7 @@ import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.flow.toList
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.withTimeout
+import kotlin.coroutines.EmptyCoroutineContext
 import kotlin.time.Duration.Companion.milliseconds
 import org.slf4j.LoggerFactory
 import java.io.Closeable
@@ -51,7 +51,7 @@ class NntpStreamingService(
 
     private data class PoolEntry(val config: NntpConfig, val pool: NntpClientPool)
 
-    private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    private val scope = CoroutineScope(SupervisorJob())
     private val logger = LoggerFactory.getLogger(NntpStreamingService::class.java)
     private val pools = mutableListOf<PoolEntry>()
     private lateinit var selectorManager: SelectorManager
@@ -162,7 +162,7 @@ class NntpStreamingService(
     }
 
     suspend fun connect() {
-        selectorManager = SelectorManager(Dispatchers.IO)
+        selectorManager = SelectorManager(EmptyCoroutineContext)
         initialConfigs.forEachIndexed { index, config ->
             pools.add(PoolEntry(config, createPool(config)))
             logger.info(
