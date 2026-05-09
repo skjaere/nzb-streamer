@@ -29,6 +29,7 @@ import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.flow.toList
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.withTimeout
@@ -58,6 +59,17 @@ class NntpStreamingService(
 
     private val initialConfigs = initialConfigs.toList()
 
+    // Mutable streaming knobs. Read fresh on each new streamSegments call (via the
+    // default-arg pattern below), so live updates apply to the next stream that opens
+    // without disturbing in-flight ones — those keep the Semaphore/produce capacity
+    // they were launched with. Volatile is enough: the field is read once into a
+    // local at call entry, no compound check-then-act.
+    @Volatile
+    private var currentConcurrency: Int = streamingConfig.concurrency
+
+    @Volatile
+    private var currentReadAheadSegments: Int = streamingConfig.readAheadSegments
+
     private val registry = Metrics.globalRegistry
     private val segmentsDownloaded = registry.counter("nzb.segments.downloaded")
     private val segmentsBytes = registry.counter("nzb.segments.bytes")
@@ -66,6 +78,15 @@ class NntpStreamingService(
     private val segmentsFallback = registry.counter("nzb.segments.fallback")
     private val segmentCacheHits = registry.counter("nzb.segments.cache.hits")
     private val segmentCacheMisses = registry.counter("nzb.segments.cache.misses")
+
+    // Time from launchStreamSegments entry to the first SegmentQueueItem being
+    // emitted from the queue Flow. For RAW streams this is near-instant (just
+    // walking NzbFile.segments). For archive streams it captures the cost of
+    // walking RAR/7z metadata to locate the first relevant article.
+    private val firstArticleResolvedTimer = Timer.builder("nzb.stream.first_article_resolved.duration")
+        .description("Time from stream-segments launch to first article ID emitted from the queue")
+        .publishPercentileHistogram()
+        .register(registry)
     private val activeStreams = AtomicLong(0).also { registry.gauge("nzb.streams.active", it) }
 
     // Per-stream bitrate: one MultiGauge with rows backed by the state
@@ -194,6 +215,20 @@ class NntpStreamingService(
         return poolLock.read { pools.map { it.config } }
     }
 
+    fun setStreamingConcurrency(value: Int) {
+        require(value > 0) { "concurrency must be > 0, got $value" }
+        currentConcurrency = value
+    }
+
+    fun setReadAheadSegments(value: Int) {
+        require(value > 0) { "readAheadSegments must be > 0, got $value" }
+        currentReadAheadSegments = value
+    }
+
+    fun getStreamingConcurrency(): Int = currentConcurrency
+
+    fun getReadAheadSegments(): Int = currentReadAheadSegments
+
     /**
      * Tries [block] on each pool in order. On [ArticleNotFoundException], falls back to the next pool.
      * Throws the last exception if all pools fail.
@@ -253,8 +288,8 @@ class NntpStreamingService(
      */
     suspend fun streamSegments(
         queue: Flow<SegmentQueueItem>,
-        concurrency: Int = streamingConfig.concurrency,
-        readAheadSegments: Int = streamingConfig.readAheadSegments,
+        concurrency: Int = currentConcurrency,
+        readAheadSegments: Int = currentReadAheadSegments,
         name: String = "unknown",
         consume: suspend (ByteReadChannel) -> Unit
     ) {
@@ -281,8 +316,8 @@ class NntpStreamingService(
      */
     suspend fun launchStreamSegments(
         queue: Flow<SegmentQueueItem>,
-        concurrency: Int = streamingConfig.concurrency,
-        readAheadSegments: Int = streamingConfig.readAheadSegments,
+        concurrency: Int = currentConcurrency,
+        readAheadSegments: Int = currentReadAheadSegments,
         name: String = "unknown"
     ): WriterJob {
         val bitrate = acquireBitrateState(name)
@@ -299,7 +334,14 @@ class NntpStreamingService(
     ): WriterJob {
         val callerScope = CoroutineScope(currentCoroutineContext())
         return callerScope.writer(autoFlush = false) {
-            val items = queue.toList()
+            val resolveSample = Timer.start(registry)
+            var firstResolved = false
+            val items = queue.onEach {
+                if (!firstResolved) {
+                    resolveSample.stop(firstArticleResolvedTimer)
+                    firstResolved = true
+                }
+            }.toList()
             if (items.isEmpty()) return@writer
 
             val downloadSemaphore = Semaphore(concurrency)
@@ -347,6 +389,14 @@ class NntpStreamingService(
     private suspend fun fetchSegmentFromNntp(articleId: String): ByteArray {
         val sample = Timer.start(registry)
         val snapshot = poolLock.read { pools.toList() }
+        // Track timeout failures across pools. ArticleNotFoundException means the server
+        // gave a definitive 430; a timeout means we don't actually know whether the
+        // article is missing or just slow. If ANY pool timed out, surface as a
+        // TimeoutCancellationException rather than ArticleNotFoundException — otherwise
+        // a transient slow-NNTP incident gets misclassified as "article permanently
+        // missing", which downstream (NzbImportService, NzbFileResource) treats as
+        // DMCA/retention drop and blocklists the NZB or skips it silently.
+        var firstTimeout: TimeoutCancellationException? = null
         val data = snapshot.withIndex().firstNotNullOfOrNull { (index, entry) ->
             try {
                 var result: ByteArray? = null
@@ -372,6 +422,7 @@ class NntpStreamingService(
                 }
                 null
             } catch (e: TimeoutCancellationException) {
+                if (firstTimeout == null) firstTimeout = e
                 if (index < snapshot.size - 1) {
                     logger.warn(
                         "Segment <{}> timed out after {}ms on pool[{}] ({}:{}), trying pool[{}]",
@@ -396,6 +447,7 @@ class NntpStreamingService(
             return data
         }
         segmentsFailed.increment()
+        firstTimeout?.let { throw it }
         throw ArticleNotFoundException("Article <$articleId> not found on any pool")
     }
 
