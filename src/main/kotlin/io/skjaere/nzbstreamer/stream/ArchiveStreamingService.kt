@@ -2,14 +2,21 @@ package io.skjaere.nzbstreamer.stream
 
 import io.ktor.utils.io.*
 import io.skjaere.compressionutils.ArchiveFileEntry
+import io.skjaere.compressionutils.Rar5Crypto
+import io.skjaere.compressionutils.Rar5DataAreaDecryptor
 import io.skjaere.compressionutils.RarFileEntry
 import io.skjaere.compressionutils.SevenZipFileEntry
 import io.skjaere.compressionutils.SplitInfo
 import io.skjaere.compressionutils.TranslatedFileEntry
 import io.skjaere.nzbstreamer.nzb.NzbDocument
 import io.skjaere.nzbstreamer.queue.SegmentQueueService
+import io.skjaere.nzbstreamer.seekable.NntpSeekableInputStream
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.flow.flow
 import org.slf4j.LoggerFactory
+import java.util.concurrent.ConcurrentHashMap
 
 sealed interface FileResolveResult {
     data class Streamable(val namedSplits: NamedSplits) : FileResolveResult {
@@ -25,6 +32,20 @@ class ArchiveStreamingService(
     private val streamingService: NntpStreamingService
 ) {
     private val logger = LoggerFactory.getLogger(ArchiveStreamingService::class.java)
+
+    // Cache of derived AES keys. PBKDF2 at 2^15 iterations is meaningfully slow
+    // (~50–200ms), and the same archive is typically streamed many times across
+    // a media session — derive once per (password, salt, iters) tuple.
+    private val keyCache = ConcurrentHashMap<KeyCacheKey, ByteArray>()
+
+    private data class KeyCacheKey(val password: String, val saltHex: String, val iters: Int)
+
+    private fun deriveKeyCached(password: String, salt: ByteArray, kdfIterationsLog2: Int): ByteArray {
+        val saltHex = salt.joinToString("") { "%02x".format(it) }
+        return keyCache.computeIfAbsent(KeyCacheKey(password, saltHex, kdfIterationsLog2)) {
+            Rar5Crypto.deriveKey(password, salt, kdfIterationsLog2)
+        }
+    }
 
     fun resolveFile(
         entries: List<ArchiveFileEntry>,
@@ -90,10 +111,15 @@ class ArchiveStreamingService(
         }
 
         logger.debug(
-            "Streaming {} splits (range={})",
+            "Streaming {} splits (range={}, encrypted={})",
             effectiveSplits.size,
-            range?.let { "${it.first}-${it.last}" } ?: "full"
+            range?.let { "${it.first}-${it.last}" } ?: "full",
+            effectiveSplits.any { it.encryption != null },
         )
+
+        if (effectiveSplits.any { it.encryption != null }) {
+            return streamEncrypted(archiveNzb, effectiveSplits, namedSplits.name, consume)
+        }
 
         val combinedQueue = flow {
             for (split in effectiveSplits) {
@@ -116,6 +142,10 @@ class ArchiveStreamingService(
             namedSplits.splits
         }
 
+        if (effectiveSplits.any { it.encryption != null }) {
+            return launchEncryptedFileWriter(archiveNzb, effectiveSplits, namedSplits.name)
+        }
+
         val combinedQueue = flow {
             for (split in effectiveSplits) {
                 SegmentQueueService.createRangeQueue(
@@ -124,6 +154,64 @@ class ArchiveStreamingService(
             }
         }
         return streamingService.launchStreamSegments(combinedQueue, name = namedSplits.name)
+    }
+
+    /**
+     * Streams an encrypted RAR5 file by AES-CBC decrypting on the fly.
+     *
+     * Each [SplitInfo] points at the IV of an encrypted block (one per volume for a split file);
+     * `Rar5DataAreaDecryptor` reads ciphertext from `NntpSeekableInputStream` in 64 KiB chunks,
+     * decrypts, and writes plaintext to the output channel. Memory bound is the chunk size,
+     * not the requested range — important for video seeking where Plex issues multi-MB ranges.
+     */
+    private suspend fun streamEncrypted(
+        archiveNzb: NzbDocument,
+        splits: List<SplitInfo>,
+        name: String,
+        consume: suspend (ByteReadChannel) -> Unit,
+    ) {
+        coroutineScope {
+            val writerJob = launchEncryptedFileWriter(archiveNzb, splits, name)
+            try {
+                consume(writerJob.channel)
+            } finally {
+                writerJob.cancel()
+            }
+        }
+    }
+
+    private suspend fun launchEncryptedFileWriter(
+        archiveNzb: NzbDocument,
+        splits: List<SplitInfo>,
+        name: String,
+    ): WriterJob {
+        val password = archiveNzb.password
+            ?: error("Encrypted RAR5 archive but NzbDocument has no password metadata (file=$name)")
+        val callerScope = CoroutineScope(currentCoroutineContext())
+        return callerScope.writer(autoFlush = false) {
+            val seekableStream = NntpSeekableInputStream(archiveNzb, streamingService)
+            try {
+                for (split in splits) {
+                    val enc = checkNotNull(split.encryption) {
+                        "encrypted-streaming path got an unencrypted split (file=$name, split=$split)"
+                    }
+                    val key = deriveKeyCached(password, enc.salt, enc.kdfIterationsLog2)
+                    Rar5DataAreaDecryptor(key).streamDataAreaPlaintext(
+                        sourceStream = seekableStream,
+                        blockIvPosition = split.dataStartPosition,
+                        plaintextHeaderSize = enc.plaintextHeaderSize,
+                        dataAreaPlaintextOffset = enc.dataAreaPlaintextOffset,
+                        length = split.dataSize,
+                        dataAreaIv = enc.dataAreaIv,
+                    ) { buf, off, len ->
+                        // ktor's writeFully takes (startIndex, endIndex), not (offset, length).
+                        channel.writeFully(buf, off, off + len)
+                    }
+                }
+            } finally {
+                seekableStream.close()
+            }
+        }
     }
 
     companion object {
@@ -147,11 +235,27 @@ class ArchiveStreamingService(
                 .map { (fileOffset, split) ->
                     val trimStart = maxOf(0L, rangeStart - fileOffset)
                     val trimEnd = minOf(split.dataSize, rangeEnd - fileOffset)
-                    SplitInfo(
-                        volumeIndex = split.volumeIndex,
-                        dataStartPosition = split.dataStartPosition + trimStart,
-                        dataSize = trimEnd - trimStart
-                    )
+                    val enc = split.encryption
+                    if (enc != null) {
+                        // Encrypted splits: dataStartPosition must keep pointing at the IV on disk —
+                        // moving it forward would break the AES block index math. Encode the trim into
+                        // the plaintext-offset field on the encryption metadata; the decryptor consumes
+                        // it as `dataAreaPlaintextOffset`.
+                        SplitInfo(
+                            volumeIndex = split.volumeIndex,
+                            dataStartPosition = split.dataStartPosition,
+                            dataSize = trimEnd - trimStart,
+                            encryption = enc.copy(
+                                dataAreaPlaintextOffset = enc.dataAreaPlaintextOffset + trimStart,
+                            ),
+                        )
+                    } else {
+                        SplitInfo(
+                            volumeIndex = split.volumeIndex,
+                            dataStartPosition = split.dataStartPosition + trimStart,
+                            dataSize = trimEnd - trimStart
+                        )
+                    }
                 }
         }
 
