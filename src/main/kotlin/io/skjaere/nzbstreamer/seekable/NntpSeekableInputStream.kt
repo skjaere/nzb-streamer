@@ -4,6 +4,7 @@ import io.ktor.utils.io.ByteReadChannel
 import io.ktor.utils.io.discard
 import io.ktor.utils.io.readAvailable
 import io.ktor.utils.io.readByte
+import io.micrometer.core.instrument.Metrics
 import io.skjaere.compressionutils.SeekableInputStream
 import io.skjaere.nzbstreamer.nzb.NzbDocument
 import io.skjaere.nzbstreamer.queue.SegmentQueueService
@@ -31,6 +32,8 @@ class NntpSeekableInputStream(
     private var currentPosition: Long = 0
     private var currentJob: Job? = null
     private var currentChannel: ByteReadChannel? = null
+
+    private val skippedBytes = Metrics.globalRegistry.counter("nzb.stream.skipped_bytes")
 
     override suspend fun read(buffer: ByteArray, offset: Int, length: Int): Int {
         if (currentPosition >= totalSize) return -1
@@ -63,6 +66,7 @@ class NntpSeekableInputStream(
         if (forward in 1..forwardThresholdBytes && currentChannel != null) {
             logger.debug("Forward skip {} bytes from {} to {}", forward, currentPosition, position)
             currentChannel!!.discard(forward)
+            skippedBytes.increment(forward.toDouble())
             currentPosition = position
         } else {
             logger.debug("Seek from {} to {} (reopening stream)", currentPosition, position)
