@@ -24,7 +24,29 @@ object NzbParser {
             parseFile(fileElements.item(i) as Element)
         }
 
-        return NzbDocument(files)
+        return NzbDocument(files = files, password = parsePassword(document.documentElement))
+    }
+
+    /**
+     * Extracts the archive password from `<head><meta type="password">…</meta></head>`.
+     * The NZB v1.1 spec defines `meta` elements under `head` carrying typed key/value
+     * pairs — `type="password"` is the de-facto standard for encrypted releases.
+     * Returns null if no head/meta/password element is present.
+     */
+    private fun parsePassword(root: Element): String? {
+        val heads = root.getElementsByTagNameNS(NZB_NAMESPACE, "head")
+        for (i in 0 until heads.length) {
+            val head = heads.item(i) as Element
+            val metas = head.getElementsByTagNameNS(NZB_NAMESPACE, "meta")
+            for (j in 0 until metas.length) {
+                val meta = metas.item(j) as Element
+                if (meta.getAttribute("type") == "password") {
+                    val value = meta.textContent.trim()
+                    if (value.isNotEmpty()) return value
+                }
+            }
+        }
+        return null
     }
 
     private fun parseFile(element: Element): NzbFile {

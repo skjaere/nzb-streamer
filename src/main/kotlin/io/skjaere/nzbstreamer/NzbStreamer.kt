@@ -40,8 +40,14 @@ class NzbStreamer private constructor(
         return metadataService.enrich(nzb)
     }
 
-    suspend fun prepare(nzbBytes: ByteArray): PrepareResult {
-        val nzb = NzbParser.parse(nzbBytes)
+    /**
+     * @param passwordOverride if non-null, supersedes any `<head><meta type="password">` in the
+     *   NZB XML. Useful for CLI invocations and integration tests against releases that ship
+     *   the password out-of-band rather than in the NZB metadata.
+     */
+    suspend fun prepare(nzbBytes: ByteArray, passwordOverride: String? = null): PrepareResult {
+        val parsed = NzbParser.parse(nzbBytes)
+        val nzb = if (passwordOverride != null) parsed.copy(password = passwordOverride) else parsed
         return metadataService.prepare(nzb)
     }
 
@@ -179,6 +185,29 @@ class NzbStreamer private constructor(
     fun getPoolConfigs(): List<NntpConfig> {
         return streamingService.getPoolConfigs()
     }
+
+    fun setStreamingConcurrency(value: Int) {
+        streamingService.setStreamingConcurrency(value)
+    }
+
+    fun setReadAheadSegments(value: Int) {
+        streamingService.setReadAheadSegments(value)
+    }
+
+    // NOTE: only mutates the top-level VerificationService used by [verifySegments].
+    // ArchiveMetadataService holds its own internal VerificationService for
+    // prepare-time enrichment (sized from streamingConfig.concurrency at build time)
+    // and is not affected — that path runs once per NZB import, not per stream, so
+    // it's a lower-impact restart-required knob.
+    fun setVerificationConcurrency(value: Int) {
+        verificationService.setConcurrency(value)
+    }
+
+    fun getStreamingConcurrency(): Int = streamingService.getStreamingConcurrency()
+
+    fun getReadAheadSegments(): Int = streamingService.getReadAheadSegments()
+
+    fun getVerificationConcurrency(): Int = verificationService.getConcurrency()
 
     override fun close() {
         streamingService.close()
