@@ -313,10 +313,19 @@ class NntpStreamingService(
         block: suspend (pool: NntpClientPool) -> T
     ): T {
         val snapshot = poolLock.read { pools.toList() }
-        val breakerActive = snapshot.size > 1
+        if (snapshot.isEmpty()) {
+            error("$logPrefix: no NNTP pools configured")
+        }
+        // Breakers protect *some* healthy pool from being starved by a sick one. When
+        // every pool's breaker is open simultaneously (e.g. a brief outage that tripped
+        // both), denying every call just amplifies the failure — falling through with
+        // breakers disabled for this attempt at least surfaces the real upstream error
+        // (timeout, IO failure) instead of an opaque "no permits anywhere" miss.
+        val effectiveBreakerActive = snapshot.size > 1 &&
+            !snapshot.all { circuitBreakerFor(it).state == CircuitBreaker.State.OPEN }
         var lastException: Throwable? = null
         return snapshot.withIndex().firstNotNullOfOrNull { (index, entry) ->
-            val breaker = if (breakerActive) circuitBreakerFor(entry) else null
+            val breaker = if (effectiveBreakerActive) circuitBreakerFor(entry) else null
             if (breaker != null && !breaker.tryAcquirePermission()) {
                 logger.debug(
                     "{} skipping pool[{}] ({}:{}) — circuit breaker is {}",
@@ -387,7 +396,11 @@ class NntpStreamingService(
                 }
                 null
             }
-        } ?: throw (lastException ?: error("withFallback called with empty pool list"))
+        } ?: throw (lastException ?: error(
+            "$logPrefix: every pool refused the call but none threw — this branch is " +
+                "only reachable if all circuit breakers transitioned to OPEN between the " +
+                "preflight check and the per-pool tryAcquirePermission. Retry."
+        ))
     }
 
     suspend fun <T> withClient(
@@ -551,8 +564,12 @@ class NntpStreamingService(
         // to. With a single pool, opening it would just convert every request into
         // a CallNotPermittedException — worse than the timeout/error we'd otherwise
         // surface. With multiple pools, an open breaker lets us skip a sick upstream
-        // for `circuitBreakerCooldownMs` without trying it at all.
-        val breakerActive = snapshot.size > 1
+        // for `circuitBreakerCooldownMs` without trying it at all — *unless* every
+        // pool's breaker is OPEN at once (transient outage tripping all of them).
+        // In that case the breaker has nothing healthy to protect, so disable gating
+        // for this call and let the real upstream error surface.
+        val breakerActive = snapshot.size > 1 &&
+            !snapshot.all { circuitBreakerFor(it).state == CircuitBreaker.State.OPEN }
         // Track timeout failures across pools. ArticleNotFoundException means the server
         // gave a definitive 430; a timeout means we don't actually know whether the
         // article is missing or just slow. If ANY pool timed out, surface as a
