@@ -168,7 +168,7 @@ class MultiPoolFallbackTest {
     }
 
     @Test
-    fun `statAcrossPools finds article on fill when primary returns NotFound`() = runBlocking {
+    fun `statAcrossPools finds article on fill when primary returns NotFound`(): Unit = runBlocking {
         val articleId = "<test-article@mock>"
 
         primaryContainer.client.addStatExpectation(articleId, false)
@@ -182,7 +182,7 @@ class MultiPoolFallbackTest {
     }
 
     @Test
-    fun `statAcrossPools returns NotFound when missing on all pools`() = runBlocking {
+    fun `statAcrossPools returns NotFound when missing on all pools`(): Unit = runBlocking {
         val articleId = "<missing-everywhere@mock>"
 
         primaryContainer.client.addStatExpectation(articleId, false)
@@ -216,7 +216,7 @@ class MultiPoolFallbackTest {
     }
 
     @Test
-    fun `verifySegments succeeds when article found on fill pool`() = runBlocking {
+    fun `verifySegments succeeds when article found on fill pool`(): Unit = runBlocking {
         val articleOnPrimary = "<seg1@primary>"
         val articleOnFill = "<seg2@fill>"
 
