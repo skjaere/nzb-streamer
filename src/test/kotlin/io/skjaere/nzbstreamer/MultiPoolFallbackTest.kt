@@ -196,10 +196,14 @@ class MultiPoolFallbackTest {
     }
 
     @Test
-    fun `statAcrossPools returns Found immediately when primary has article`() = runBlocking {
-        val articleId = "<on-primary@mock>"
+    fun `statAcrossPools early-exits on the first Found`() = runBlocking {
+        val articleId = "<on-both@mock>"
 
+        // Article exists on both pools. statAcrossPools picks its starting pool by
+        // weighted random (proportional to maxConnections — used to spread STAT load),
+        // so we can't assert which pool got the request — only that exactly one did.
         primaryContainer.client.addStatExpectation(articleId, true)
+        fillContainer.client.addStatExpectation(articleId, true)
 
         primaryContainer.client.clearStats()
         fillContainer.client.clearStats()
@@ -210,9 +214,9 @@ class MultiPoolFallbackTest {
             assertIs<StatResult.Found>(result)
         }
 
-        // Fill server should not have been called for STAT
-        val fillStats = fillContainer.client.getStats()
-        assertEquals(0, fillStats.getOrDefault("STAT", 0), "Fill server should not have received STAT requests")
+        val totalStats = primaryContainer.client.getStats().getOrDefault("STAT", 0) +
+            fillContainer.client.getStats().getOrDefault("STAT", 0)
+        assertEquals(1, totalStats, "Expected exactly one pool to receive the STAT; got $totalStats")
     }
 
     @Test
@@ -220,8 +224,12 @@ class MultiPoolFallbackTest {
         val articleOnPrimary = "<seg1@primary>"
         val articleOnFill = "<seg2@fill>"
 
+        // Set expectations on BOTH pools for BOTH articles — statAcrossPools picks its
+        // starting pool by weighted random, so a missing expectation on whichever pool
+        // happens to be tried first would throw and fail verification.
         primaryContainer.client.addStatExpectation(articleOnPrimary, true)
         primaryContainer.client.addStatExpectation(articleOnFill, false)
+        fillContainer.client.addStatExpectation(articleOnPrimary, false)
         fillContainer.client.addStatExpectation(articleOnFill, true)
 
         val nzb = NzbDocument(
