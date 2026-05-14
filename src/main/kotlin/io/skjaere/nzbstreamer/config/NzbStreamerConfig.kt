@@ -24,7 +24,22 @@ data class StreamingConfig(
      * during which the in-flight streamSegments coroutineScope cannot unwind and its
      * activeStreams counter stays stuck.
      */
-    val segmentFetchTimeoutMs: Long = 20_000L
+    val segmentFetchTimeoutMs: Long = 5_000L,
+    /**
+     * Per-pool circuit breaker: number of *consecutive* failures (timeouts, IO errors,
+     * protocol/connection NntpExceptions — anything that wasn't a clean server 430)
+     * before the circuit opens and that pool is skipped for [circuitBreakerCooldownMs].
+     * A single success resets the counter. The breaker is inert when only one pool is
+     * configured — there'd be nowhere to fall back to and skipping it would just turn
+     * every request into a hard failure.
+     */
+    val circuitBreakerFailureThreshold: Int = 5,
+    /**
+     * How long to skip a pool after its circuit opens. After this window elapses the
+     * circuit resets to closed and the next request tries the pool again; if it fails
+     * the threshold count starts over and the breaker can re-open.
+     */
+    val circuitBreakerCooldownMs: Long = 60_000L,
 )
 
 data class PrepareConfig(

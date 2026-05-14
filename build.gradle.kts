@@ -26,6 +26,11 @@ dependencies {
     implementation(libs.kotlinx.coroutines.core)
     implementation(libs.kotlinx.serialization.json)
     implementation(libs.slf4j.api)
+    // Per-pool circuit breaker for the multi-upstream fallback path. Each pool gets
+    // its own named CircuitBreaker in a shared registry, keyed by host:port.
+    implementation(libs.resilience4j.circuitbreaker)
+    implementation(libs.resilience4j.kotlin)
+    implementation(libs.resilience4j.micrometer)
 
     testImplementation(libs.kotlin.test)
     testImplementation(libs.junit.jupiter)
