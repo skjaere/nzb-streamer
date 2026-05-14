@@ -1,5 +1,9 @@
 package io.skjaere.nzbstreamer.stream
 
+import io.github.resilience4j.circuitbreaker.CircuitBreaker
+import io.github.resilience4j.circuitbreaker.CircuitBreakerConfig
+import io.github.resilience4j.circuitbreaker.CircuitBreakerRegistry
+import io.github.resilience4j.micrometer.tagged.TaggedCircuitBreakerMetrics
 import io.ktor.network.selector.SelectorManager
 import io.ktor.utils.io.ByteReadChannel
 import io.ktor.utils.io.WriterJob
@@ -12,11 +16,14 @@ import io.micrometer.core.instrument.Tags
 import io.micrometer.core.instrument.Timer
 import io.skjaere.nntp.ArticleNotFoundException
 import io.skjaere.nntp.NntpClientPool
+import io.skjaere.nntp.NntpException
 import io.skjaere.nntp.StatResult
 import io.skjaere.nntp.YencEvent
 import io.skjaere.nzbstreamer.config.NntpConfig
 import io.skjaere.nzbstreamer.config.StreamingConfig
 import io.skjaere.nzbstreamer.queue.SegmentQueueItem
+import java.io.IOException
+import java.time.Duration
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.SupervisorJob
@@ -57,6 +64,54 @@ class NntpStreamingService(
     private lateinit var selectorManager: SelectorManager
     private val poolLock = ReentrantReadWriteLock()
 
+    /**
+     * Per-pool circuit breaker. Each pool gets a CircuitBreaker named `host:port`,
+     * sharing the same config (count-based sliding window, threshold + cooldown
+     * from [StreamingConfig]). Failures that count: timeouts, IOExceptions, and
+     * NntpException family — anything we can't blame on a clean server 430.
+     * ArticleNotFoundException is *ignored* (server cleanly said the article
+     * doesn't exist — that's not the pool's fault). The breaker is inert when
+     * only one pool is configured, see [executeWithCircuitBreaker].
+     */
+    private val circuitBreakerConfig: CircuitBreakerConfig = CircuitBreakerConfig.custom()
+        .slidingWindowType(CircuitBreakerConfig.SlidingWindowType.COUNT_BASED)
+        .slidingWindowSize(streamingConfig.circuitBreakerFailureThreshold * 2)
+        .minimumNumberOfCalls(streamingConfig.circuitBreakerFailureThreshold)
+        .failureRateThreshold(50f)
+        .waitDurationInOpenState(Duration.ofMillis(streamingConfig.circuitBreakerCooldownMs))
+        .permittedNumberOfCallsInHalfOpenState(1)
+        .automaticTransitionFromOpenToHalfOpenEnabled(true)
+        .recordExceptions(
+            NntpException::class.java,
+            IOException::class.java,
+            TimeoutCancellationException::class.java,
+        )
+        .ignoreExceptions(ArticleNotFoundException::class.java)
+        .build()
+
+    private val circuitBreakerRegistry: CircuitBreakerRegistry =
+        CircuitBreakerRegistry.of(circuitBreakerConfig).also { reg ->
+            // Surface state changes (closed → open, open → half-open, etc.) in logs.
+            reg.eventPublisher.onEntryAdded { event ->
+                event.addedEntry.eventPublisher.onStateTransition { transition ->
+                    logger.warn(
+                        "Circuit breaker {} → {} for pool {}",
+                        transition.stateTransition.fromState,
+                        transition.stateTransition.toState,
+                        transition.circuitBreakerName,
+                    )
+                }
+            }
+            // Wire breaker state/calls into micrometer so they appear in Grafana
+            // alongside the existing pool gauges. We reference the global registry
+            // directly here because the `registry` field is declared further down
+            // in the class and isn't initialized yet at this point in construction.
+            TaggedCircuitBreakerMetrics.ofCircuitBreakerRegistry(reg).bindTo(Metrics.globalRegistry)
+        }
+
+    private fun circuitBreakerFor(entry: PoolEntry): CircuitBreaker =
+        circuitBreakerRegistry.circuitBreaker("${entry.config.host}:${entry.config.port}")
+
     private val initialConfigs = initialConfigs.toList()
 
     // Mutable streaming knobs. Read fresh on each new streamSegments call (via the
@@ -73,7 +128,10 @@ class NntpStreamingService(
     private val registry = Metrics.globalRegistry
     private val segmentsDownloaded = registry.counter("nzb.segments.downloaded")
     private val segmentsBytes = registry.counter("nzb.segments.bytes")
-    private val segmentDownloadTimer = registry.timer("nzb.segments.download.duration")
+    private val segmentDownloadTimer = Timer.builder("nzb.segments.download.duration")
+        .description("End-to-end time per segment fetch: status line + yenc body transfer + any multi-pool fallback retries")
+        .publishPercentileHistogram()
+        .register(registry)
     private val segmentsFailed = registry.counter("nzb.segments.failed")
     private val segmentsFallback = registry.counter("nzb.segments.fallback")
     private val segmentCacheHits = registry.counter("nzb.segments.cache.hits")
@@ -230,30 +288,106 @@ class NntpStreamingService(
     fun getReadAheadSegments(): Int = currentReadAheadSegments
 
     /**
-     * Tries [block] on each pool in order. On [ArticleNotFoundException], falls back to the next pool.
-     * Throws the last exception if all pools fail.
+     * Tries [block] on each pool in order. Falls back to the next pool on conditions
+     * that are recoverable by re-issuing against a different upstream:
+     *
+     *  - [ArticleNotFoundException] (server said 430 — try another provider)
+     *  - [NntpProtocolException] (wire-state corruption on the pool's connection,
+     *    e.g. yenc body bytes leaking into a status line; the pool's catch-all has
+     *    already marked that connection dead, but the request itself is fine and
+     *    should be retried elsewhere)
+     *  - [NntpConnectionException] / [IOException] (transient network failure to
+     *    this pool — exhausted by the inner pool's `.retry()` budget already)
+     *
+     * Not caught (propagated directly):
+     *  - [NntpAuthenticationException] — credentials problem, every pool would
+     *    likely fail the same way; fail loudly so the operator notices.
+     *  - [kotlinx.coroutines.CancellationException] — structured-concurrency
+     *    cancellation, not our exception to swallow.
+     *
+     * Throws the last fallback-triggering exception if every pool fails.
      */
+    @Suppress("TooGenericExceptionCaught")
     private suspend fun <T> withFallback(
         logPrefix: String,
         block: suspend (pool: NntpClientPool) -> T
     ): T {
         val snapshot = poolLock.read { pools.toList() }
-        var lastException: ArticleNotFoundException? = null
+        val breakerActive = snapshot.size > 1
+        var lastException: Throwable? = null
         return snapshot.withIndex().firstNotNullOfOrNull { (index, entry) ->
+            val breaker = if (breakerActive) circuitBreakerFor(entry) else null
+            if (breaker != null && !breaker.tryAcquirePermission()) {
+                logger.debug(
+                    "{} skipping pool[{}] ({}:{}) — circuit breaker is {}",
+                    logPrefix, index, entry.config.host, entry.config.port, breaker.state
+                )
+                segmentsFallback.increment()
+                return@firstNotNullOfOrNull null
+            }
+            val callStart = System.nanoTime()
             try {
-                block(entry.pool)
+                val result = block(entry.pool)
+                // Pass Unit rather than `result`: T is unbounded (could be nullable),
+                // and resilience4j only inspects the result when a recordResultPredicate
+                // is configured (we don't). Avoids the Java Object/T platform-type warning.
+                breaker?.onResult(
+                    System.nanoTime() - callStart,
+                    java.util.concurrent.TimeUnit.NANOSECONDS,
+                    Unit,
+                )
+                result
+            } catch (e: io.skjaere.nntp.NntpAuthenticationException) {
+                // Credentials issue — every pool would fail the same way. Release
+                // the permit without recording, then rethrow so the operator sees it.
+                breaker?.releasePermission()
+                throw e
             } catch (e: ArticleNotFoundException) {
+                // Clean 430 — the pool is healthy, the article just isn't there.
+                breaker?.releasePermission()
                 lastException = e
                 if (index < snapshot.size - 1) {
                     logger.debug(
-                        "{} not found on pool[{}] ({}:{}), trying pool[{}]",
-                        logPrefix, index, entry.config.host, entry.config.port, index + 1
+                        "{} not found on pool[{}] ({}:{}) — falling back to pool[{}]",
+                        logPrefix, index, entry.config.host, entry.config.port, index + 1,
+                    )
+                    segmentsFallback.increment()
+                }
+                null
+            } catch (e: io.skjaere.nntp.NntpException) {
+                breaker?.onError(
+                    System.nanoTime() - callStart,
+                    java.util.concurrent.TimeUnit.NANOSECONDS,
+                    e,
+                )
+                lastException = e
+                if (index < snapshot.size - 1) {
+                    logger.debug(
+                        "{} failed on pool[{}] ({}:{}) with {} — falling back to pool[{}]: {}",
+                        logPrefix, index, entry.config.host, entry.config.port,
+                        e::class.simpleName, index + 1, e.message,
+                    )
+                    segmentsFallback.increment()
+                }
+                null
+            } catch (e: java.io.IOException) {
+                breaker?.onError(
+                    System.nanoTime() - callStart,
+                    java.util.concurrent.TimeUnit.NANOSECONDS,
+                    e,
+                )
+                lastException = e
+                if (index < snapshot.size - 1) {
+                    logger.debug(
+                        "{} I/O failure on pool[{}] ({}:{}) — falling back to pool[{}]: {}",
+                        logPrefix, index, entry.config.host, entry.config.port,
+                        index + 1, e.message,
                     )
                     segmentsFallback.increment()
                 }
                 null
             }
-        } ?: throw lastException!!
+        } ?: throw (lastException ?: error("withFallback called with empty pool list"))
     }
 
     suspend fun <T> withClient(
@@ -389,6 +523,12 @@ class NntpStreamingService(
     private suspend fun fetchSegmentFromNntp(articleId: String): ByteArray {
         val sample = Timer.start(registry)
         val snapshot = poolLock.read { pools.toList() }
+        // The circuit breaker is only meaningful when there's somewhere to fall back
+        // to. With a single pool, opening it would just convert every request into
+        // a CallNotPermittedException — worse than the timeout/error we'd otherwise
+        // surface. With multiple pools, an open breaker lets us skip a sick upstream
+        // for `circuitBreakerCooldownMs` without trying it at all.
+        val breakerActive = snapshot.size > 1
         // Track timeout failures across pools. ArticleNotFoundException means the server
         // gave a definitive 430; a timeout means we don't actually know whether the
         // article is missing or just slow. If ANY pool timed out, surface as a
@@ -398,6 +538,16 @@ class NntpStreamingService(
         // DMCA/retention drop and blocklists the NZB or skips it silently.
         var firstTimeout: TimeoutCancellationException? = null
         val data = snapshot.withIndex().firstNotNullOfOrNull { (index, entry) ->
+            val breaker = if (breakerActive) circuitBreakerFor(entry) else null
+            if (breaker != null && !breaker.tryAcquirePermission()) {
+                logger.debug(
+                    "Segment <{}> skipping pool[{}] ({}:{}) — circuit breaker is {}",
+                    articleId, index, entry.config.host, entry.config.port, breaker.state
+                )
+                segmentsFallback.increment()
+                return@firstNotNullOfOrNull null
+            }
+            val callStart = System.nanoTime()
             try {
                 var result: ByteArray? = null
                 withTimeout(streamingConfig.segmentFetchTimeoutMs.milliseconds) {
@@ -407,12 +557,22 @@ class NntpStreamingService(
                         }
                     }
                 }
-                result?.also {
+                val payload = result
+                if (payload != null) {
+                    breaker?.onResult(
+                        System.nanoTime() - callStart,
+                        java.util.concurrent.TimeUnit.NANOSECONDS,
+                        payload,
+                    )
                     if (index > 0) {
                         logger.debug("Segment <{}> served by fallback pool[{}]", articleId, index)
                     }
                 }
+                payload
             } catch (e: ArticleNotFoundException) {
+                // Clean 430 — server told us the article is gone. That's not a pool
+                // health signal, so release the permit without recording it.
+                breaker?.releasePermission()
                 if (index < snapshot.size - 1) {
                     logger.debug(
                         "Segment <{}> not found on pool[{}] ({}:{}), trying pool[{}]",
@@ -422,7 +582,21 @@ class NntpStreamingService(
                 }
                 null
             } catch (e: TimeoutCancellationException) {
+                breaker?.onError(
+                    System.nanoTime() - callStart,
+                    java.util.concurrent.TimeUnit.NANOSECONDS,
+                    e,
+                )
                 if (firstTimeout == null) firstTimeout = e
+                // Count every per-pool timeout, regardless of whether a later pool
+                // succeeded. The TTFB / body-duration histograms drop timed-out
+                // commands entirely (the timer is never stopped on cancellation),
+                // so without this counter slow upstreams that hit the segment
+                // timeout are invisible in latency percentiles.
+                registry.counter(
+                    "nzb.segments.body_timeouts",
+                    "pool.name", "${entry.config.host}:${entry.config.port}"
+                ).increment()
                 if (index < snapshot.size - 1) {
                     logger.warn(
                         "Segment <{}> timed out after {}ms on pool[{}] ({}:{}), trying pool[{}]",
@@ -435,6 +609,36 @@ class NntpStreamingService(
                         "Segment <{}> timed out after {}ms on all {} pool(s)",
                         articleId, streamingConfig.segmentFetchTimeoutMs, snapshot.size
                     )
+                }
+                null
+            } catch (e: NntpException) {
+                breaker?.onError(
+                    System.nanoTime() - callStart,
+                    java.util.concurrent.TimeUnit.NANOSECONDS,
+                    e,
+                )
+                if (index < snapshot.size - 1) {
+                    logger.warn(
+                        "Segment <{}> NNTP error on pool[{}] ({}:{}) — {}: {}",
+                        articleId, index, entry.config.host, entry.config.port,
+                        e::class.simpleName, e.message
+                    )
+                    segmentsFallback.increment()
+                }
+                null
+            } catch (e: IOException) {
+                breaker?.onError(
+                    System.nanoTime() - callStart,
+                    java.util.concurrent.TimeUnit.NANOSECONDS,
+                    e,
+                )
+                if (index < snapshot.size - 1) {
+                    logger.warn(
+                        "Segment <{}> I/O error on pool[{}] ({}:{}) — {}: {}",
+                        articleId, index, entry.config.host, entry.config.port,
+                        e::class.simpleName, e.message
+                    )
+                    segmentsFallback.increment()
                 }
                 null
             }
