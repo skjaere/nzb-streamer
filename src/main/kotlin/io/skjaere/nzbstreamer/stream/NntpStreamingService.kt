@@ -397,21 +397,45 @@ class NntpStreamingService(
 
     suspend fun statAcrossPools(articleId: String): StatResult {
         val snapshot = poolLock.read { pools.toList() }
-        return snapshot.withIndex().firstNotNullOfOrNull { (index, entry) ->
+        // Weight the starting-pool pick by maxConnections so verification load spreads
+        // proportionally to per-pool capacity. The default linear iteration always sends
+        // STATs to pool[0] first; with a 100-conn primary + 50-conn fill, that caps health
+        // checks at 100 in-flight (pool[1] only gets traffic when pool[0] returns 430).
+        // Weighted-random pick distributes the first try ~67/33, so both pools saturate.
+        // Body streaming via fetchSegmentFromNntp is unaffected — it still prefers pool[0].
+        val ordered = orderForStat(snapshot)
+        return ordered.withIndex().firstNotNullOfOrNull { (index, entry) ->
             val result = entry.pool.withClient(NntpPriority.HEALTH_CHECK.value) { it.stat(articleId) }
             when (result) {
                 is StatResult.Found -> result
                 is StatResult.NotFound -> {
-                    if (index < snapshot.size - 1) {
+                    if (index < ordered.size - 1) {
                         logger.debug(
-                            "STAT {} not found on pool[{}] ({}:{}), trying pool[{}]",
-                            articleId, index, entry.config.host, entry.config.port, index + 1
+                            "STAT {} not found on pool[{}] ({}:{}), trying next pool",
+                            articleId, index, entry.config.host, entry.config.port,
                         )
                     }
                     null
                 }
             }
         } ?: StatResult.NotFound(430, "Not found on any pool")
+    }
+
+    private fun orderForStat(snapshot: List<PoolEntry>): List<PoolEntry> {
+        if (snapshot.size <= 1) return snapshot
+        val totalWeight = snapshot.sumOf { it.config.maxConnections }
+        if (totalWeight <= 0) return snapshot
+        var roll = java.util.concurrent.ThreadLocalRandom.current().nextInt(totalWeight)
+        var firstIndex = snapshot.lastIndex
+        for ((i, entry) in snapshot.withIndex()) {
+            roll -= entry.config.maxConnections
+            if (roll < 0) {
+                firstIndex = i
+                break
+            }
+        }
+        if (firstIndex == 0) return snapshot
+        return listOf(snapshot[firstIndex]) + snapshot.filterIndexed { i, _ -> i != firstIndex }
     }
 
     /**
