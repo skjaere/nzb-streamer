@@ -217,6 +217,12 @@ class NzbStreamer private constructor(
 
     fun getCircuitBreakerCooldownMs(): Long = streamingService.getCircuitBreakerCooldownMs()
 
+    fun setSegmentFetchTimeoutMs(value: Long) {
+        streamingService.setSegmentFetchTimeoutMs(value)
+    }
+
+    fun getSegmentFetchTimeoutMs(): Long = streamingService.getSegmentFetchTimeoutMs()
+
     override fun close() {
         streamingService.close()
     }
