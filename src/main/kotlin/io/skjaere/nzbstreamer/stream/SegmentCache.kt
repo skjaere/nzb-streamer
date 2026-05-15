@@ -44,9 +44,14 @@ class SegmentCache(private val config: SegmentCacheConfig) : AutoCloseable {
 
     private val json = Json { ignoreUnknownKeys = true }
     private val indexLock = Mutex()
-    private val singleflightLock = Mutex()
     private val index = mutableMapOf<String, Entry>()
-    private val inFlight = mutableMapOf<String, CompletableDeferred<ByteArray>>()
+    // ConcurrentHashMap.putIfAbsent gives us atomic single-flight registration without
+    // a coarse-grained mutex around the entire claim flow. Prior implementation used a
+    // global `singleflightLock` mutex whose critical section included a disk-I/O recheck
+    // (get → readEntry → withContext(Dispatchers.IO) { path.readBytes() }) — that
+    // serialized every concurrent fetch across the cache, observed in prod as 51-199s
+    // stream-startup stalls when Plex fired its parallel range probes.
+    private val inFlight = java.util.concurrent.ConcurrentHashMap<String, CompletableDeferred<ByteArray>>()
     private val totalBytes = AtomicLong(0)
     private val pendingWrites = AtomicLong(0)
 
@@ -143,34 +148,40 @@ class SegmentCache(private val config: SegmentCacheConfig) : AutoCloseable {
     /**
      * Returns cached bytes for [articleId], invoking [fetch] on miss and caching the result.
      * Concurrent calls for the same article-id share a single fetch.
+     *
+     * Single-flight is implemented via `ConcurrentHashMap.putIfAbsent` on [inFlight],
+     * so concurrent calls for *different* article-ids never block each other. The
+     * leader-side TOCTOU recheck (a concurrent fetch may have completed and removed
+     * its own inflight entry between our `get` fast-path and our `putIfAbsent`) runs
+     * outside any lock — the worst that happens is one redundant disk read or, very
+     * rarely, one redundant NNTP fetch, both correctness-preserving.
      */
     suspend fun getOrFetch(articleId: String, fetch: suspend () -> ByteArray): ByteArray {
         get(articleId)?.let { return it }
 
-        val (deferred, isLeader) = singleflightLock.withLock {
-            inFlight[articleId]?.let { return@withLock it to false }
-            // Re-check disk under the singleflight lock — a concurrent leader may have
-            // just finished and removed itself from inFlight before we arrived.
-            get(articleId)?.let { return it }
-            val d = CompletableDeferred<ByteArray>()
-            inFlight[articleId] = d
-            d to true
-        }
-
-        if (!isLeader) return deferred.await()
+        val ourDeferred = CompletableDeferred<ByteArray>()
+        val existing = inFlight.putIfAbsent(articleId, ourDeferred)
+        if (existing != null) return existing.await()
 
         return try {
-            val bytes = fetch()
-            store(articleId, bytes)
-            deferred.complete(bytes)
+            // Leader-side recheck: a previous leader may have finished and removed
+            // itself between our fast-path `get` and our `putIfAbsent`. Outside any
+            // lock — other articles' fetches are unaffected by this disk read.
+            val fromDisk = get(articleId)
+            val bytes = if (fromDisk != null) {
+                fromDisk
+            } else {
+                val fetched = fetch()
+                store(articleId, fetched)
+                fetched
+            }
+            ourDeferred.complete(bytes)
             bytes
         } catch (t: Throwable) {
-            deferred.completeExceptionally(t)
+            ourDeferred.completeExceptionally(t)
             throw t
         } finally {
-            singleflightLock.withLock {
-                if (inFlight[articleId] === deferred) inFlight.remove(articleId)
-            }
+            inFlight.remove(articleId, ourDeferred)
         }
     }
 
