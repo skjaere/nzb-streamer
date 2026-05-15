@@ -209,6 +209,14 @@ class NzbStreamer private constructor(
 
     fun getVerificationConcurrency(): Int = verificationService.getConcurrency()
 
+    fun setCircuitBreakerConfig(failureThreshold: Int, cooldownMs: Long) {
+        streamingService.setCircuitBreakerConfig(failureThreshold, cooldownMs)
+    }
+
+    fun getCircuitBreakerFailureThreshold(): Int = streamingService.getCircuitBreakerFailureThreshold()
+
+    fun getCircuitBreakerCooldownMs(): Long = streamingService.getCircuitBreakerCooldownMs()
+
     override fun close() {
         streamingService.close()
     }

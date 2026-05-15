@@ -72,25 +72,44 @@ class NntpStreamingService(
      * ArticleNotFoundException is *ignored* (server cleanly said the article
      * doesn't exist — that's not the pool's fault). The breaker is inert when
      * only one pool is configured, see [executeWithCircuitBreaker].
+     *
+     * [currentCircuitBreakerConfig] is mutable so the live override path in
+     * debridav can re-tune thresholds without a restart. Each [circuitBreakerFor]
+     * call hands out the breaker for that pool using whatever config the registry
+     * currently holds for that name; [setCircuitBreakerConfig] swaps the config
+     * and removes existing breakers so the next acquisition re-creates them with
+     * the new thresholds.
      */
-    private val circuitBreakerConfig: CircuitBreakerConfig = CircuitBreakerConfig.custom()
-        .slidingWindowType(CircuitBreakerConfig.SlidingWindowType.COUNT_BASED)
-        .slidingWindowSize(streamingConfig.circuitBreakerFailureThreshold * 2)
-        .minimumNumberOfCalls(streamingConfig.circuitBreakerFailureThreshold)
-        .failureRateThreshold(50f)
-        .waitDurationInOpenState(Duration.ofMillis(streamingConfig.circuitBreakerCooldownMs))
-        .permittedNumberOfCallsInHalfOpenState(1)
-        .automaticTransitionFromOpenToHalfOpenEnabled(true)
-        .recordExceptions(
-            NntpException::class.java,
-            IOException::class.java,
-            TimeoutCancellationException::class.java,
-        )
-        .ignoreExceptions(ArticleNotFoundException::class.java)
-        .build()
+    @Volatile
+    private var currentCircuitBreakerFailureThreshold: Int = streamingConfig.circuitBreakerFailureThreshold
+
+    @Volatile
+    private var currentCircuitBreakerCooldownMs: Long = streamingConfig.circuitBreakerCooldownMs
+
+    private fun buildCircuitBreakerConfig(failureThreshold: Int, cooldownMs: Long): CircuitBreakerConfig =
+        CircuitBreakerConfig.custom()
+            .slidingWindowType(CircuitBreakerConfig.SlidingWindowType.COUNT_BASED)
+            .slidingWindowSize(failureThreshold * 2)
+            .minimumNumberOfCalls(failureThreshold)
+            .failureRateThreshold(50f)
+            .waitDurationInOpenState(Duration.ofMillis(cooldownMs))
+            .permittedNumberOfCallsInHalfOpenState(1)
+            .automaticTransitionFromOpenToHalfOpenEnabled(true)
+            .recordExceptions(
+                NntpException::class.java,
+                IOException::class.java,
+                TimeoutCancellationException::class.java,
+            )
+            .ignoreExceptions(ArticleNotFoundException::class.java)
+            .build()
 
     private val circuitBreakerRegistry: CircuitBreakerRegistry =
-        CircuitBreakerRegistry.of(circuitBreakerConfig).also { reg ->
+        CircuitBreakerRegistry.of(
+            buildCircuitBreakerConfig(
+                streamingConfig.circuitBreakerFailureThreshold,
+                streamingConfig.circuitBreakerCooldownMs,
+            )
+        ).also { reg ->
             // Surface state changes (closed → open, open → half-open, etc.) in logs.
             reg.eventPublisher.onEntryAdded { event ->
                 event.addedEntry.eventPublisher.onStateTransition { transition ->
@@ -110,7 +129,36 @@ class NntpStreamingService(
         }
 
     private fun circuitBreakerFor(entry: PoolEntry): CircuitBreaker =
-        circuitBreakerRegistry.circuitBreaker("${entry.config.host}:${entry.config.port}")
+        circuitBreakerRegistry.circuitBreaker(
+            "${entry.config.host}:${entry.config.port}",
+            buildCircuitBreakerConfig(currentCircuitBreakerFailureThreshold, currentCircuitBreakerCooldownMs),
+        )
+
+    /**
+     * Replace the breaker thresholds at runtime. Each existing per-pool breaker is
+     * removed from the registry; the next [circuitBreakerFor] call recreates it with
+     * the new config. Drops the per-breaker rolling window state — acceptable for a
+     * tuning knob since the new window fills within a handful of subsequent calls.
+     * In-flight calls already past the permission-acquisition point keep their old
+     * config for the rest of their flight.
+     */
+    fun setCircuitBreakerConfig(failureThreshold: Int, cooldownMs: Long) {
+        require(failureThreshold > 0) { "failureThreshold must be > 0, got $failureThreshold" }
+        require(cooldownMs > 0) { "cooldownMs must be > 0, got $cooldownMs" }
+        currentCircuitBreakerFailureThreshold = failureThreshold
+        currentCircuitBreakerCooldownMs = cooldownMs
+        circuitBreakerRegistry.allCircuitBreakers.forEach { breaker ->
+            circuitBreakerRegistry.remove(breaker.name)
+        }
+        logger.info(
+            "Updated circuit breaker config: failureThreshold={}, cooldownMs={}",
+            failureThreshold, cooldownMs,
+        )
+    }
+
+    fun getCircuitBreakerFailureThreshold(): Int = currentCircuitBreakerFailureThreshold
+
+    fun getCircuitBreakerCooldownMs(): Long = currentCircuitBreakerCooldownMs
 
     private val initialConfigs = initialConfigs.toList()
 
