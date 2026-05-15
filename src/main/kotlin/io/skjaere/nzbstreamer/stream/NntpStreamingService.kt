@@ -160,6 +160,20 @@ class NntpStreamingService(
 
     fun getCircuitBreakerCooldownMs(): Long = currentCircuitBreakerCooldownMs
 
+    // Per-segment body fetch deadline. Read fresh from this volatile on each
+    // withTimeout wrap so live overrides apply to the next fetch without
+    // disturbing already-in-flight ones (those keep their original deadline).
+    @Volatile
+    private var currentSegmentFetchTimeoutMs: Long = streamingConfig.segmentFetchTimeoutMs
+
+    fun setSegmentFetchTimeoutMs(value: Long) {
+        require(value > 0) { "segmentFetchTimeoutMs must be > 0, got $value" }
+        currentSegmentFetchTimeoutMs = value
+        logger.info("Updated segment fetch timeout: {}ms", value)
+    }
+
+    fun getSegmentFetchTimeoutMs(): Long = currentSegmentFetchTimeoutMs
+
     private val initialConfigs = initialConfigs.toList()
 
     // Mutable streaming knobs. Read fresh on each new streamSegments call (via the
@@ -607,6 +621,10 @@ class NntpStreamingService(
 
     private suspend fun fetchSegmentFromNntp(articleId: String): ByteArray {
         val sample = Timer.start(registry)
+        // Snapshot the timeout once so the warning log's "timed out after Nms" matches
+        // the actual deadline used by withTimeout — a runtime override mid-fetch
+        // shouldn't desync the log from the cancellation event.
+        val timeoutMs = currentSegmentFetchTimeoutMs
         val snapshot = poolLock.read { pools.toList() }
         // The circuit breaker is only meaningful when there's somewhere to fall back
         // to. With a single pool, opening it would just convert every request into
@@ -639,7 +657,7 @@ class NntpStreamingService(
             val callStart = System.nanoTime()
             try {
                 var result: ByteArray? = null
-                withTimeout(streamingConfig.segmentFetchTimeoutMs.milliseconds) {
+                withTimeout(timeoutMs.milliseconds) {
                     entry.pool.bodyYenc("<$articleId>", NntpPriority.STREAMING.value).collect { event ->
                         if (event is YencEvent.Body) {
                             result = event.data.toByteArray()
@@ -689,14 +707,14 @@ class NntpStreamingService(
                 if (index < snapshot.size - 1) {
                     logger.warn(
                         "Segment <{}> timed out after {}ms on pool[{}] ({}:{}), trying pool[{}]",
-                        articleId, streamingConfig.segmentFetchTimeoutMs,
+                        articleId, timeoutMs,
                         index, entry.config.host, entry.config.port, index + 1
                     )
                     segmentsFallback.increment()
                 } else {
                     logger.warn(
                         "Segment <{}> timed out after {}ms on all {} pool(s)",
-                        articleId, streamingConfig.segmentFetchTimeoutMs, snapshot.size
+                        articleId, timeoutMs, snapshot.size
                     )
                 }
                 null
