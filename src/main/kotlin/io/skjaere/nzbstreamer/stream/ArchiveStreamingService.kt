@@ -361,18 +361,20 @@ class ArchiveStreamingService(
         archiveNzb: NzbDocument,
         file: StreamableFile,
         range: LongRange? = null,
+        streamName: String? = null,
         consume: suspend (ByteReadChannel) -> Unit
     ) {
-        val namedSplits = NamedSplits(file.toSplits(archiveNzb), file.totalSize, file.path)
+        val namedSplits = NamedSplits(file.toSplits(archiveNzb), file.totalSize, streamName ?: file.path)
         streamFile(archiveNzb, namedSplits, range, consume = consume)
     }
 
     suspend fun launchStreamFile(
         archiveNzb: NzbDocument,
         file: StreamableFile,
-        range: LongRange? = null
+        range: LongRange? = null,
+        streamName: String? = null,
     ): WriterJob {
-        val namedSplits = NamedSplits(file.toSplits(archiveNzb), file.totalSize, file.path)
+        val namedSplits = NamedSplits(file.toSplits(archiveNzb), file.totalSize, streamName ?: file.path)
         return launchStreamFile(archiveNzb, namedSplits, range)
     }
 }

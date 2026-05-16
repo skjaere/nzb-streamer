@@ -128,32 +128,35 @@ class NzbStreamer private constructor(
         range: LongRange? = null,
         consume: suspend (ByteReadChannel) -> Unit
     ) {
-        archiveStreamingService.streamFile(metadata.orderedArchiveNzb, file, range, consume)
+        archiveStreamingService.streamFile(metadata.orderedArchiveNzb, file, range, consume = consume)
     }
 
     suspend fun streamFile(
         nzbDocument: NzbDocument,
         file: StreamableFile,
         range: LongRange? = null,
+        streamName: String? = null,
         consume: suspend (ByteReadChannel) -> Unit
     ) {
-        archiveStreamingService.streamFile(nzbDocument, file, range, consume)
+        archiveStreamingService.streamFile(nzbDocument, file, range, streamName, consume)
     }
 
     suspend fun launchStreamFile(
         metadata: ExtractedMetadata,
         file: StreamableFile,
-        range: LongRange? = null
+        range: LongRange? = null,
+        streamName: String? = null,
     ): WriterJob {
-        return archiveStreamingService.launchStreamFile(metadata.orderedArchiveNzb, file, range)
+        return archiveStreamingService.launchStreamFile(metadata.orderedArchiveNzb, file, range, streamName)
     }
 
     suspend fun launchStreamFile(
         nzbDocument: NzbDocument,
         file: StreamableFile,
-        range: LongRange? = null
+        range: LongRange? = null,
+        streamName: String? = null,
     ): WriterJob {
-        return archiveStreamingService.launchStreamFile(nzbDocument, file, range)
+        return archiveStreamingService.launchStreamFile(nzbDocument, file, range, streamName)
     }
 
     suspend fun streamVolume(
