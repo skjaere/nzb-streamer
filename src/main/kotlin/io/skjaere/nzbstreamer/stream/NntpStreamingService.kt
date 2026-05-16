@@ -214,6 +214,26 @@ class NntpStreamingService(
         .publishPercentileHistogram()
         .register(registry)
 
+    // Lookup-by-pool of the same Timer that NntpConnection uses internally for its
+    // body-duration recordings. Same name + same `pool.name` tag → Micrometer reuses
+    // the underlying meter, so timeouts we record here appear in the existing
+    // "BODY transfer duration by pool" panel without any dashboard changes.
+    //
+    // The connection-side timer only stops on markBodyConsumed, which never fires
+    // when our withTimeout cancels the bodyYenc Flow mid-stream — those attempts
+    // disappear from the latency percentiles entirely. Recording the configured
+    // timeout value here closes that gap: p99 of `nntp_body_duration_seconds`
+    // will reflect the slow tail that the connection-side timer ignores.
+    private val bodyDurationByPool = ConcurrentHashMap<String, Timer>()
+    private fun bodyDurationTimerFor(poolName: String): Timer =
+        bodyDurationByPool.computeIfAbsent(poolName) {
+            Timer.builder("nntp.body.duration")
+                .description("Full BODY round-trip: command write to article terminator consumed off the wire")
+                .publishPercentileHistogram()
+                .tag("pool.name", it)
+                .register(registry)
+        }
+
     // Time from launchStreamSegments entry to the first SegmentQueueItem being
     // emitted from the queue Flow. For RAW streams this is near-instant (just
     // walking NzbFile.segments). For archive streams it captures the cost of
@@ -761,6 +781,7 @@ class NntpStreamingService(
                 }
                 null
             } catch (e: TimeoutCancellationException) {
+                val poolName = "${entry.config.host}:${entry.config.port}"
                 breaker?.onError(
                     System.nanoTime() - callStart,
                     java.util.concurrent.TimeUnit.NANOSECONDS,
@@ -768,14 +789,18 @@ class NntpStreamingService(
                 )
                 if (firstTimeout == null) firstTimeout = e
                 // Count every per-pool timeout, regardless of whether a later pool
-                // succeeded. The TTFB / body-duration histograms drop timed-out
-                // commands entirely (the timer is never stopped on cancellation),
-                // so without this counter slow upstreams that hit the segment
-                // timeout are invisible in latency percentiles.
-                registry.counter(
-                    "nzb.segments.body_timeouts",
-                    "pool.name", "${entry.config.host}:${entry.config.port}"
-                ).increment()
+                // succeeded. Useful as its own rate panel even with the body-duration
+                // fix below — easier to alert on "rate(timeouts) > N/min" than on a
+                // percentile drift.
+                registry.counter("nzb.segments.body_timeouts", "pool.name", poolName).increment()
+                // Also record the *timeout duration* into the same nntp.body.duration
+                // histogram NntpConnection writes successes to. The connection-side
+                // timer is never stopped on cancellation, so the upper tail of slow
+                // upstreams used to be invisible in percentile dashboards. Now a 9s
+                // timeout shows up at 9s in the histogram — the BODY transfer duration
+                // panel's p99 finally reflects the actual user-facing tail.
+                bodyDurationTimerFor(poolName)
+                    .record(timeoutMs, java.util.concurrent.TimeUnit.MILLISECONDS)
                 if (index < snapshot.size - 1) {
                     logger.warn(
                         "Segment <{}> timed out after {}ms on pool[{}] ({}:{}), trying pool[{}]",
