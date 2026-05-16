@@ -199,6 +199,21 @@ class NntpStreamingService(
     private val segmentCacheHits = registry.counter("nzb.segments.cache.hits")
     private val segmentCacheMisses = registry.counter("nzb.segments.cache.misses")
 
+    // Cache lookup time on the hot path (one row per call regardless of hit/miss).
+    // Distinguishes "cache.get is slow due to disk contention" from "miss → NNTP
+    // is slow" — both look the same in the existing segmentDownloadTimer otherwise.
+    private val segmentCacheGetTimer = Timer.builder("nzb.segments.cache.get.duration")
+        .description("Per-call cache.get() time (returns null on miss). Disk-bound when the index has the entry.")
+        .publishPercentileHistogram()
+        .register(registry)
+    // Time for the full miss-path: singleflight wait + NNTP fetch + disk store.
+    // Sustained gap between this and nntp.body.duration p99 implies time burned
+    // in singleflight contention or disk-write rather than wire transfer.
+    private val segmentCacheGetOrFetchTimer = Timer.builder("nzb.segments.cache.getorfetch.duration")
+        .description("getOrFetch() wall time on cache miss: singleflight wait + fetch lambda + store.")
+        .publishPercentileHistogram()
+        .register(registry)
+
     // Time from launchStreamSegments entry to the first SegmentQueueItem being
     // emitted from the queue Flow. For RAW streams this is near-instant (just
     // walking NzbFile.segments). For archive streams it captures the cost of
@@ -530,7 +545,7 @@ class NntpStreamingService(
         activeStreams.incrementAndGet()
         try {
             coroutineScope {
-                val writerJob = launchStreamSegments(queue, concurrency, readAheadSegments, bitrate)
+                val writerJob = launchStreamSegments(queue, concurrency, readAheadSegments, bitrate, name)
                 try {
                     consume(writerJob.channel)
                 } finally {
@@ -554,7 +569,7 @@ class NntpStreamingService(
         name: String = "unknown"
     ): WriterJob {
         val bitrate = acquireBitrateState(name)
-        val writerJob = launchStreamSegments(queue, concurrency, readAheadSegments, bitrate)
+        val writerJob = launchStreamSegments(queue, concurrency, readAheadSegments, bitrate, name)
         writerJob.job.invokeOnCompletion { releaseBitrateState(name) }
         return writerJob
     }
@@ -563,26 +578,54 @@ class NntpStreamingService(
         queue: Flow<SegmentQueueItem>,
         concurrency: Int,
         readAheadSegments: Int,
-        bitrate: BitrateState
+        bitrate: BitrateState,
+        name: String,
     ): WriterJob {
         val callerScope = CoroutineScope(currentCoroutineContext())
         return callerScope.writer(autoFlush = false) {
+            // Phase timestamps for the FIRST item only. Logged at INFO when the first
+            // byte hits the output channel, so each stream startup leaves exactly one
+            // structured trace line. Lets us localize stall causes without a thread dump:
+            //   t0           = writer entry
+            //   tResolved    = first item emitted by the queue Flow
+            //   tToList      = queue.toList() finished (entire item list realized)
+            //   tFirstAcq    = first downloadSemaphore.acquire() returned
+            //   tFirstAsync  = first async{} launched
+            //   tFirstSend   = first send(item to deferred) returned
+            //   tFirstRecv   = first consumeEach iteration received its pair
+            //   tFirstAwait  = first deferred.await() returned (download complete)
+            //   tFirstWrite  = first channel.writeFully() returned
+            val t0 = System.nanoTime()
+            var tResolved = 0L
+            var tFirstAcq = 0L
+            var tFirstAsync = 0L
+            var tFirstSend = 0L
+            var tFirstRecv = 0L
+            var tFirstAwait = 0L
+            var firstArticleId: String? = null
+
             val resolveSample = Timer.start(registry)
             var firstResolved = false
             val items = queue.onEach {
                 if (!firstResolved) {
                     resolveSample.stop(firstArticleResolvedTimer)
+                    tResolved = System.nanoTime()
                     firstResolved = true
                 }
             }.toList()
+            val tToList = System.nanoTime()
             if (items.isEmpty()) return@writer
 
             val downloadSemaphore = Semaphore(concurrency)
 
             @OptIn(ExperimentalCoroutinesApi::class)
             produce(capacity = readAheadSegments) {
-                items.forEach { item ->
+                items.forEachIndexed { index, item ->
                     downloadSemaphore.acquire()
+                    if (index == 0) {
+                        tFirstAcq = System.nanoTime()
+                        firstArticleId = item.segment.articleId
+                    }
                     val deferred = async {
                         try {
                             downloadSegment(item.segment.articleId)
@@ -590,10 +633,14 @@ class NntpStreamingService(
                             downloadSemaphore.release()
                         }
                     }
+                    if (index == 0) tFirstAsync = System.nanoTime()
                     send(item to deferred)
+                    if (index == 0) tFirstSend = System.nanoTime()
                 }
             }.consumeEach { (item, deferred) ->
+                if (tFirstRecv == 0L) tFirstRecv = System.nanoTime()
                 val data = deferred.await()
+                if (tFirstAwait == 0L) tFirstAwait = System.nanoTime()
 
                 val start = minOf(item.readStart.toInt(), data.size)
                 val end = minOf(item.readEnd.toInt(), data.size)
@@ -601,6 +648,23 @@ class NntpStreamingService(
                     val written = (end - start).toLong()
                     channel.writeFully(data, start, end)
                     bitrate.addBytes(written)
+                    // One-shot startup trace on first successful write. Subsequent writes
+                    // are sustained-throughput and the bitrate gauge already covers them.
+                    if (tFirstAwait != 0L && firstArticleId != null) {
+                        val tFirstWrite = System.nanoTime()
+                        val ms = { ns: Long -> if (ns == 0L) -1L else (ns - t0) / 1_000_000 }
+                        logger.info(
+                            "Stream startup trace [{}] articleId={}: " +
+                                "resolved={}ms toList={}ms acquire={}ms async={}ms " +
+                                "send={}ms recv={}ms await={}ms write={}ms " +
+                                "(items={}, concurrency={}, readAhead={})",
+                            name, firstArticleId,
+                            ms(tResolved), ms(tToList), ms(tFirstAcq), ms(tFirstAsync),
+                            ms(tFirstSend), ms(tFirstRecv), ms(tFirstAwait), ms(tFirstWrite),
+                            items.size, concurrency, readAheadSegments,
+                        )
+                        firstArticleId = null
+                    }
                 }
             }
         }
@@ -608,13 +672,21 @@ class NntpStreamingService(
 
     private suspend fun downloadSegment(articleId: String): ByteArray {
         if (segmentCache != null) {
-            segmentCache.get(articleId)?.let {
+            val getSample = Timer.start(registry)
+            val cached = segmentCache.get(articleId)
+            getSample.stop(segmentCacheGetTimer)
+            if (cached != null) {
                 segmentCacheHits.increment()
-                return it
+                return cached
             }
             segmentCacheMisses.increment()
             // Singleflight in SegmentCache dedupes concurrent fetches for the same article.
-            return segmentCache.getOrFetch(articleId) { fetchSegmentFromNntp(articleId) }
+            val getOrFetchSample = Timer.start(registry)
+            try {
+                return segmentCache.getOrFetch(articleId) { fetchSegmentFromNntp(articleId) }
+            } finally {
+                getOrFetchSample.stop(segmentCacheGetOrFetchTimer)
+            }
         }
         return fetchSegmentFromNntp(articleId)
     }
