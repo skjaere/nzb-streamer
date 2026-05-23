@@ -421,7 +421,8 @@ class NntpStreamingService(
         val effectiveBreakerActive = snapshot.size > 1 &&
             !snapshot.all { circuitBreakerFor(it).state == CircuitBreaker.State.OPEN }
         var lastException: Throwable? = null
-        return snapshot.withIndex().firstNotNullOfOrNull { (index, entry) ->
+        var anyAttempted = false
+        val result = snapshot.withIndex().firstNotNullOfOrNull { (index, entry) ->
             val breaker = if (effectiveBreakerActive) circuitBreakerFor(entry) else null
             if (breaker != null && !breaker.tryAcquirePermission()) {
                 logger.debug(
@@ -431,73 +432,134 @@ class NntpStreamingService(
                 segmentsFallback.increment()
                 return@firstNotNullOfOrNull null
             }
-            val callStart = System.nanoTime()
-            try {
-                val result = block(entry.pool)
-                // Pass Unit rather than `result`: T is unbounded (could be nullable),
-                // and resilience4j only inspects the result when a recordResultPredicate
-                // is configured (we don't). Avoids the Java Object/T platform-type warning.
-                breaker?.onResult(
-                    System.nanoTime() - callStart,
-                    java.util.concurrent.TimeUnit.NANOSECONDS,
-                    Unit,
-                )
-                result
-            } catch (e: io.skjaere.nntp.NntpAuthenticationException) {
-                // Credentials issue — every pool would fail the same way. Release
-                // the permit without recording, then rethrow so the operator sees it.
-                breaker?.releasePermission()
-                throw e
-            } catch (e: ArticleNotFoundException) {
-                // Clean 430 — the pool is healthy, the article just isn't there.
-                breaker?.releasePermission()
-                lastException = e
-                if (index < snapshot.size - 1) {
-                    logger.debug(
-                        "{} not found on pool[{}] ({}:{}) — falling back to pool[{}]",
-                        logPrefix, index, entry.config.host, entry.config.port, index + 1,
-                    )
-                    segmentsFallback.increment()
-                }
-                null
-            } catch (e: io.skjaere.nntp.NntpException) {
-                breaker?.onError(
-                    System.nanoTime() - callStart,
-                    java.util.concurrent.TimeUnit.NANOSECONDS,
-                    e,
-                )
-                lastException = e
-                if (index < snapshot.size - 1) {
-                    logger.debug(
-                        "{} failed on pool[{}] ({}:{}) with {} — falling back to pool[{}]: {}",
-                        logPrefix, index, entry.config.host, entry.config.port,
-                        e::class.simpleName, index + 1, e.message,
-                    )
-                    segmentsFallback.increment()
-                }
-                null
-            } catch (e: java.io.IOException) {
-                breaker?.onError(
-                    System.nanoTime() - callStart,
-                    java.util.concurrent.TimeUnit.NANOSECONDS,
-                    e,
-                )
-                lastException = e
-                if (index < snapshot.size - 1) {
-                    logger.debug(
-                        "{} I/O failure on pool[{}] ({}:{}) — falling back to pool[{}]: {}",
-                        logPrefix, index, entry.config.host, entry.config.port,
-                        index + 1, e.message,
-                    )
-                    segmentsFallback.increment()
-                }
-                null
-            }
-        } ?: throw (lastException ?: error(
-            "$logPrefix: every pool refused the call but none threw — this branch is " +
-                "only reachable if all circuit breakers transitioned to OPEN between the " +
-                "preflight check and the per-pool tryAcquirePermission. Retry."
+            anyAttempted = true
+            tryOnePool(entry, breaker, index, snapshot.size, logPrefix, block) { lastException = it }
+        }
+        if (result != null) return result
+        if (lastException != null) throw lastException!!
+        // We get here when `effectiveBreakerActive` was true at preflight (so the breakers
+        // gated permission acquisition) but every pool refused at iteration time. Two ways
+        // that happens:
+        //   1. Race: a breaker we observed as not-OPEN transitioned to OPEN between the
+        //      preflight check and our tryAcquirePermission call. Possible whenever
+        //      concurrent traffic is driving probe transitions.
+        //   2. HALF_OPEN permit exhaustion: with permittedNumberOfCallsInHalfOpenState(1),
+        //      a single concurrent caller holds the lone probe permit on each breaker, and
+        //      every other call refuses. Compounded by any path that leaks a permit (e.g.
+        //      the CancellationException catch added below for TimeoutCancellationException),
+        //      because the stuck permit never frees and the breaker becomes permanently
+        //      unable to admit any caller while still reporting HALF_OPEN to the preflight
+        //      check.
+        //
+        // Either way, throwing IllegalStateException isn't useful — fail the same way we'd
+        // fail when every pool is OPEN at preflight: drop the breaker gate and try the call
+        // anyway. If the upstream is actually healthy, we get our result; if not, we
+        // surface the real error from `block`.
+        logger.warn(
+            "{} every pool refused the breaker permit (likely HALF_OPEN with permit taken) — " +
+                "retrying with breakers disabled to avoid stalling on a probe race",
+            logPrefix
+        )
+        return snapshot.withIndex().firstNotNullOfOrNull { (index, entry) ->
+            tryOnePool(entry, breaker = null, index, snapshot.size, logPrefix, block) { lastException = it }
+        } ?: throw (lastException ?: IllegalStateException(
+            "$logPrefix: retry-with-breakers-disabled also produced no result — anyAttempted=$anyAttempted"
         ))
+    }
+
+    @Suppress("TooGenericExceptionCaught", "LongParameterList")
+    private suspend fun <T> tryOnePool(
+        entry: PoolEntry,
+        breaker: CircuitBreaker?,
+        index: Int,
+        totalPools: Int,
+        logPrefix: String,
+        block: suspend (pool: NntpClientPool) -> T,
+        recordException: (Throwable) -> Unit,
+    ): T? {
+        val callStart = System.nanoTime()
+        return try {
+            val result = block(entry.pool)
+            // Pass Unit rather than `result`: T is unbounded (could be nullable),
+            // and resilience4j only inspects the result when a recordResultPredicate
+            // is configured (we don't). Avoids the Java Object/T platform-type warning.
+            breaker?.onResult(
+                System.nanoTime() - callStart,
+                java.util.concurrent.TimeUnit.NANOSECONDS,
+                Unit,
+            )
+            result
+        } catch (e: io.skjaere.nntp.NntpAuthenticationException) {
+            // Credentials issue — every pool would fail the same way. Release
+            // the permit without recording, then rethrow so the operator sees it.
+            breaker?.releasePermission()
+            throw e
+        } catch (e: ArticleNotFoundException) {
+            // Clean 430 — the pool is healthy, the article just isn't there.
+            breaker?.releasePermission()
+            recordException(e)
+            if (index < totalPools - 1) {
+                logger.debug(
+                    "{} not found on pool[{}] ({}:{}) — falling back to pool[{}]",
+                    logPrefix, index, entry.config.host, entry.config.port, index + 1,
+                )
+                segmentsFallback.increment()
+            }
+            null
+        } catch (e: io.skjaere.nntp.NntpException) {
+            breaker?.onError(
+                System.nanoTime() - callStart,
+                java.util.concurrent.TimeUnit.NANOSECONDS,
+                e,
+            )
+            recordException(e)
+            if (index < totalPools - 1) {
+                logger.debug(
+                    "{} failed on pool[{}] ({}:{}) with {} — falling back to pool[{}]: {}",
+                    logPrefix, index, entry.config.host, entry.config.port,
+                    e::class.simpleName, index + 1, e.message,
+                )
+                segmentsFallback.increment()
+            }
+            null
+        } catch (e: java.io.IOException) {
+            breaker?.onError(
+                System.nanoTime() - callStart,
+                java.util.concurrent.TimeUnit.NANOSECONDS,
+                e,
+            )
+            recordException(e)
+            if (index < totalPools - 1) {
+                logger.debug(
+                    "{} I/O failure on pool[{}] ({}:{}) — falling back to pool[{}]: {}",
+                    logPrefix, index, entry.config.host, entry.config.port,
+                    index + 1, e.message,
+                )
+                segmentsFallback.increment()
+            }
+            null
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            // Coroutine cancellation must rethrow to preserve structured concurrency.
+            // But the breaker permit must be released first — otherwise a HALF_OPEN
+            // probe that gets cancelled (e.g. by withTimeout firing) leaks its
+            // single permit and the breaker becomes permanently unable to admit any
+            // probe, manifesting as the "every pool refused" failure above.
+            //
+            // For TimeoutCancellationException specifically, count it as a failure
+            // (it's in `recordExceptions` for the breaker config). Other cancellations
+            // (parent scope cancel, structured-concurrency tear-down) just release
+            // the permit without staining the failure-rate metric.
+            if (e is kotlinx.coroutines.TimeoutCancellationException) {
+                breaker?.onError(
+                    System.nanoTime() - callStart,
+                    java.util.concurrent.TimeUnit.NANOSECONDS,
+                    e,
+                )
+            } else {
+                breaker?.releasePermission()
+            }
+            throw e
+        }
     }
 
     suspend fun <T> withClient(

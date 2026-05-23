@@ -255,6 +255,111 @@ class MultiPoolFallbackTest {
         }
     }
 
+    /**
+     * Reproduces the prod failure mode where every NZB import threw
+     * `IllegalStateException: every pool refused the call but none threw …`.
+     *
+     * The circuit-breaker config uses `permittedNumberOfCallsInHalfOpenState(1)`
+     * — only one probe call per breaker is allowed while HALF_OPEN. The preflight
+     * check inside `withFallback` only looks for `state == OPEN`, so HALF_OPEN
+     * breakers count as "active" and the per-pool `tryAcquirePermission` call is
+     * required. With both pools HALF_OPEN and their single permits already taken,
+     * every `tryAcquirePermission` returns false, the iteration produces no result,
+     * and the code throws.
+     *
+     * The fix: when every pool refuses permission at iteration time, fall through
+     * with breakers disabled (the same path already used when every pool is OPEN at
+     * preflight). The call goes through against whatever's actually live.
+     */
+    @Test
+    fun `withFallback falls through when every pool refuses HALF_OPEN permit`(): Unit = runBlocking {
+        val configs = createConfigs()
+        val service = createStreamingService(configs)
+
+        // Drive both breakers into HALF_OPEN and consume their lone permits via
+        // reflection so the test doesn't have to wait the 60s default cooldown
+        // for an organic transition.
+        val registryField = NntpStreamingService::class.java.getDeclaredField("circuitBreakerRegistry")
+        registryField.isAccessible = true
+        val registry = registryField.get(service)
+            as io.github.resilience4j.circuitbreaker.CircuitBreakerRegistry
+
+        val breakers = configs.map { registry.circuitBreaker("${it.host}:${it.port}") }
+        breakers.forEach { breaker ->
+            breaker.transitionToOpenState()
+            breaker.transitionToHalfOpenState()
+            check(breaker.tryAcquirePermission()) {
+                "test setup: expected to acquire the single HALF_OPEN permit"
+            }
+            // Next tryAcquirePermission on this breaker now returns false — exactly
+            // the prod state.
+        }
+
+        service.use {
+            // Without the fix: throws IllegalStateException("every pool refused …").
+            // With the fix: the block runs and returns its value.
+            val result = service.withClient { _ -> "ok" }
+            assertEquals("ok", result)
+        }
+    }
+
+    /**
+     * Reproduces the upstream cause of the HALF_OPEN-stuck breakers: when `block`
+     * throws `CancellationException` (most commonly `TimeoutCancellationException`
+     * from a segment-fetch timeout), none of `withFallback`'s typed catch blocks
+     * fire, so the breaker permit is never released. Resilience4j tracks acquired
+     * permits separately from observed results — an un-released HALF_OPEN permit
+     * stays consumed even after the breaker auto-transitions back into HALF_OPEN
+     * later, so every subsequent call refuses.
+     *
+     * The fix: catch CancellationException in `withFallback`, release the permit
+     * (or record it as a failure for TimeoutCancellationException, which is in
+     * `recordExceptions`), then rethrow so structured concurrency keeps working.
+     */
+    @Test
+    fun `withFallback releases breaker permit when block throws TimeoutCancellationException`(): Unit = runBlocking {
+        val configs = createConfigs()
+        val service = createStreamingService(configs)
+
+        val registryField = NntpStreamingService::class.java.getDeclaredField("circuitBreakerRegistry")
+        registryField.isAccessible = true
+        val registry = registryField.get(service)
+            as io.github.resilience4j.circuitbreaker.CircuitBreakerRegistry
+
+        val breaker = registry.circuitBreaker("${configs[0].host}:${configs[0].port}")
+        breaker.transitionToOpenState()
+        breaker.transitionToHalfOpenState()
+
+        // Run a withClient call that gets cancelled (timeout). Without the fix,
+        // the breaker permit is leaked.
+        val ex = runCatching {
+            kotlinx.coroutines.withTimeout(50) {
+                service.withClient { _ ->
+                    kotlinx.coroutines.delay(10_000)
+                    "should never reach"
+                }
+            }
+        }.exceptionOrNull()
+        assertIs<kotlinx.coroutines.TimeoutCancellationException>(ex)
+
+        // Permit must have been released. The breaker should NOT be HALF_OPEN with
+        // its single permit consumed — that's the stuck state we're trying to
+        // avoid. Either it stayed HALF_OPEN with a permit available (release-without-
+        // record path) or transitioned to OPEN (recorded as failure). Both are fine;
+        // what we don't accept is `tryAcquirePermission()` returning false while
+        // we're nominally HALF_OPEN.
+        service.use {
+            val permitAvailable = breaker.tryAcquirePermission()
+                || breaker.state == io.github.resilience4j.circuitbreaker.CircuitBreaker.State.OPEN
+                || breaker.state == io.github.resilience4j.circuitbreaker.CircuitBreaker.State.CLOSED
+            assertTrue(
+                permitAvailable,
+                "Breaker is stuck in ${breaker.state} with no permits available — " +
+                    "leak detected from the CancellationException path."
+            )
+        }
+    }
+
     @Test
     fun `single-config constructor backward compatibility`() = runBlocking {
         val segData = ByteArray(16 * 1024) { (it % 256).toByte() }
