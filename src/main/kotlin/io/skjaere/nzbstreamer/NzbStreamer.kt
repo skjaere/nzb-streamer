@@ -12,6 +12,7 @@ import io.skjaere.nzbstreamer.enrichment.VerificationService
 import io.skjaere.nzbstreamer.metadata.ArchiveMetadataService
 import io.skjaere.nzbstreamer.metadata.ExtractedMetadata
 import io.skjaere.nzbstreamer.metadata.PrepareResult
+import io.skjaere.nzbstreamer.nzb.FilenameResolver
 import io.skjaere.nzbstreamer.nzb.NzbDocument
 import io.skjaere.nzbstreamer.nzb.NzbParser
 import io.skjaere.nzbstreamer.queue.SegmentQueueService
@@ -109,10 +110,26 @@ class NzbStreamer private constructor(
     }
 
     private fun resolveRawStreamableFiles(metadata: ExtractedMetadata.Raw): List<StreamableFile> {
+        // For RAW (non-archive) NZBs the streamable filename is what users will see on
+        // their mount, so it's worth picking the most-trustworthy source instead of the
+        // on-wire yenc header name. The par2 index is built once per NZB (par2 bytes
+        // can be on any file in the doc, normally only one slot has them).
+        val par2Index = FilenameResolver.indexPar2ByHash16k(
+            metadata.orderedArchiveNzb.files.firstOrNull { it.par2Data != null }?.par2Data
+        )
         return metadata.orderedArchiveNzb.files.mapIndexedNotNull { index, file ->
             val headers = file.yencHeaders ?: return@mapIndexedNotNull null
+            val par2Filename = par2Index[FilenameResolver.hash16kHex(file.first16kb)]
+            val best = FilenameResolver.bestFilename(
+                yencName = headers.name,
+                subject = file.subject,
+                par2Filename = par2Filename,
+            )
+            // Fall back to the previously-surfaced name only if FilenameResolver
+            // returned an empty string (every source was blank — should be impossible
+            // for a real NZB but guard against malformed inputs).
             StreamableFile(
-                path = metadata.response.volumes[index],
+                path = best.ifBlank { metadata.response.volumes[index] },
                 totalSize = headers.size,
                 startVolumeIndex = index,
                 startOffsetInVolume = 0,
