@@ -1,5 +1,31 @@
 # Changelog
 
+## [0.10.0](https://github.com/skjaere/nzb-streamer/compare/v0.9.1...v0.10.0) (2026-05-25)
+
+
+### Features
+
+* **metrics:** record body-fetch timeouts into nntp.body.duration
+* **metrics:** record skipped bytes and time-to-first-article-resolved
+* **nzb:** multi-source filename resolution + obfuscation heuristic
+* **rar5:** support encrypted (HEAD_CRYPT) RAR5 archives
+* **stat:** weight starting-pool pick by maxConnections
+* **stream:** expose circuit breaker config as runtime setters
+* **stream:** on-disk segment cache + bounded segment fetch timeout
+* **stream:** optional streamName override for streamFile callers
+* **stream:** per-pool resilience4j circuit breaker
+* **stream:** per-startup phase trace + cache get/getorfetch timers
+* **stream:** runtime-tunable segmentFetchTimeoutMs
+* **verification:** log position+filename of first missing segment
+* **verification:** make concurrency mutable for runtime override
+
+
+### Bug Fixes
+
+* **segment-cache:** lock-free singleflight via ConcurrentHashMap.putIfAbsent
+* **stream:** don't deny every call when all pool breakers are OPEN
+* **stream:** unstick HALF_OPEN circuit breakers in withFallback
+
 ## [0.9.1](https://github.com/skjaere/nzb-streamer/compare/v0.9.0...v0.9.1) (2026-04-25)
 
 
