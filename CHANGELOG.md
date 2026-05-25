@@ -1,5 +1,31 @@
 # Changelog
 
+## [0.10.0](https://github.com/skjaere/nzb-streamer/compare/v0.9.1...v0.10.0) (2026-05-25)
+
+
+### Features
+
+* **metrics:** record body-fetch timeouts into nntp.body.duration ([0510911](https://github.com/skjaere/nzb-streamer/commit/0510911ffa089a88a44df24f58322ffcdbea1c66))
+* **metrics:** record skipped bytes and time-to-first-article-resolved ([faa5dcd](https://github.com/skjaere/nzb-streamer/commit/faa5dcd35af5dc9b097437462a187ae258fa218e))
+* **nzb:** multi-source filename resolution + obfuscation heuristic ([53683bf](https://github.com/skjaere/nzb-streamer/commit/53683bf547958757823836cb7121bfa593a9f038))
+* **rar5:** support encrypted (HEAD_CRYPT) RAR5 archives ([16cc6b7](https://github.com/skjaere/nzb-streamer/commit/16cc6b71c9d73a092a13e2cef5faf69523ff9059))
+* **stat:** weight starting-pool pick by maxConnections ([a5bf97a](https://github.com/skjaere/nzb-streamer/commit/a5bf97a17935465201b35c0420da4e6a69dffd5c))
+* **stream:** expose circuit breaker config as runtime setters ([eef5deb](https://github.com/skjaere/nzb-streamer/commit/eef5deb33ee48540da5c0f26e8a95f208b725427))
+* **stream:** on-disk segment cache + bounded segment fetch timeout ([7d1faa9](https://github.com/skjaere/nzb-streamer/commit/7d1faa958a5ee5e389cede6b3c3754d0fc7e015e))
+* **stream:** optional streamName override for streamFile callers ([6e62bbe](https://github.com/skjaere/nzb-streamer/commit/6e62bbef69706952e938215987f6706c29540b6f))
+* **stream:** per-pool resilience4j circuit breaker ([94b167a](https://github.com/skjaere/nzb-streamer/commit/94b167a5038b51afdec38d9ecdb577c4b6ad39b3))
+* **stream:** per-startup phase trace + cache get/getorfetch timers ([67ade4c](https://github.com/skjaere/nzb-streamer/commit/67ade4c43103241077328576c6b9de99bb44279e))
+* **stream:** runtime-tunable segmentFetchTimeoutMs ([d8519b8](https://github.com/skjaere/nzb-streamer/commit/d8519b85fbb2eed0a6c466f7356d2cfe0b0834a8))
+* **verification:** log position+filename of first missing segment ([ea46a1f](https://github.com/skjaere/nzb-streamer/commit/ea46a1f1d2b6c7bfc60dd0a83e848bd5bf21891f))
+* **verification:** make concurrency mutable for runtime override ([a43bf61](https://github.com/skjaere/nzb-streamer/commit/a43bf61fa7f48e084a2d47d77ddd2509191892c5))
+
+
+### Bug Fixes
+
+* **segment-cache:** lock-free singleflight via ConcurrentHashMap.putIfAbsent ([0b5898d](https://github.com/skjaere/nzb-streamer/commit/0b5898dd4c56d7c497aaa0cf15d3007bd9f195ef))
+* **stream:** don't deny every call when all pool breakers are OPEN ([4f7cb31](https://github.com/skjaere/nzb-streamer/commit/4f7cb31ad0975077292b72063ecc954f13feefa8))
+* **stream:** unstick HALF_OPEN circuit breakers in withFallback ([ed58780](https://github.com/skjaere/nzb-streamer/commit/ed58780c77a0ef2787a9c16ae2c4ab563e2619ae))
+
 ## [0.9.1](https://github.com/skjaere/nzb-streamer/compare/v0.9.0...v0.9.1) (2026-04-25)
 
 
