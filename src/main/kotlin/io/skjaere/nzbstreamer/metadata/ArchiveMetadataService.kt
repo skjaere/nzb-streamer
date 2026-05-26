@@ -25,7 +25,10 @@ class ArchiveMetadataService(
     private val logger = LoggerFactory.getLogger(ArchiveMetadataService::class.java)
     private val registry = Metrics.globalRegistry
     private val prepareTimer = registry.timer("nzb.prepare.duration")
-    private val enrichmentService = NzbEnrichmentService(streamingService)
+    private val enrichmentService = NzbEnrichmentService(
+        streamingService,
+        enrichmentConcurrency = prepareConfig.enrichmentConcurrency,
+    )
     private val verificationService = VerificationService(streamingService, concurrency)
     private val nestedArchiveService = NestedArchiveMetadataService(streamingService)
 

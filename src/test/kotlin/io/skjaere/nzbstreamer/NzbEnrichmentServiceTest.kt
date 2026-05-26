@@ -16,8 +16,11 @@ import java.io.BufferedReader
 import java.io.InputStreamReader
 import java.io.OutputStream
 import java.net.ServerSocket
+import java.net.SocketException
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.util.concurrent.atomic.AtomicInteger
+import kotlin.test.assertEquals
 import kotlin.test.assertIs
 import kotlin.test.assertNotNull
 import kotlin.test.assertNull
@@ -371,5 +374,110 @@ class NzbEnrichmentServiceTest {
         buf.put(ByteArray(64))
 
         return buf.array()
+    }
+
+    /**
+     * Multi-connection NNTP server: accept loop spawns one thread per client so the pool
+     * can hold many connections in parallel. Each BODY request stalls briefly via
+     * [holdBodyMs] so concurrent activity overlaps and the peak-concurrency tracker can
+     * observe it.
+     */
+    private fun startMultiConnServer(
+        holdBodyMs: Long,
+        activeBodies: AtomicInteger,
+        peakBodies: AtomicInteger,
+        articleData: ByteArray,
+    ): ServerSocket {
+        val server = ServerSocket(0)
+        Thread {
+            while (!server.isClosed) {
+                val client = try {
+                    server.accept()
+                } catch (_: SocketException) {
+                    return@Thread
+                }
+                Thread {
+                    client.use { socket ->
+                        try {
+                            val reader = BufferedReader(InputStreamReader(socket.getInputStream()))
+                            val out = socket.getOutputStream()
+                            out.write("200 welcome\r\n".toByteArray())
+                            out.flush()
+                            while (true) {
+                                val line = reader.readLine() ?: break
+                                if (!line.startsWith("BODY")) continue
+                                val now = activeBodies.incrementAndGet()
+                                peakBodies.updateAndGet { current -> maxOf(current, now) }
+                                try {
+                                    Thread.sleep(holdBodyMs)
+                                    writeYencResponse(out, "f.rar", articleData)
+                                } finally {
+                                    activeBodies.decrementAndGet()
+                                }
+                            }
+                        } catch (_: Exception) {
+                            // client disconnected mid-test, ignore
+                        }
+                    }
+                }.start()
+            }
+        }.start()
+        return server
+    }
+
+    private fun createMultiConnStreamingService(port: Int, maxConnections: Int): NntpStreamingService {
+        val config = NntpConfig(
+            host = "localhost",
+            port = port,
+            username = "",
+            password = "",
+            useTls = false,
+            maxConnections = maxConnections,
+        )
+        val service = NntpStreamingService(config)
+        runBlocking { service.connect() }
+        return service
+    }
+
+    @Test
+    fun `enrich bounds per-file fan-out to enrichmentConcurrency`() = runBlocking {
+        val articleData = "x".repeat(64).toByteArray()
+        val active = AtomicInteger()
+        val peak = AtomicInteger()
+        val fileCount = 16
+        val enrichmentConcurrency = 4
+
+        val server = startMultiConnServer(holdBodyMs = 50, active, peak, articleData)
+
+        server.use {
+            // Pool is intentionally given more capacity than the semaphore bound — we
+            // want to prove the *semaphore* is the limiter, not the pool's maxConnections.
+            val streamingService = createMultiConnStreamingService(
+                server.localPort,
+                maxConnections = enrichmentConcurrency * 4,
+            )
+            streamingService.use {
+                val enrichmentService = NzbEnrichmentService(
+                    streamingService,
+                    enrichmentConcurrency = enrichmentConcurrency,
+                )
+                val articles = (1..fileCount).map { "art-$it@test" }.toTypedArray()
+                val nzb = createNzb(*articles)
+
+                val result = enrichmentService.enrich(nzb)
+
+                assertIs<EnrichmentResult.Success>(result)
+                assertEquals(fileCount, result.enrichedNzb.files.size)
+                assertTrue(
+                    peak.get() <= enrichmentConcurrency,
+                    "peak concurrent BODYs ${peak.get()} exceeded enrichmentConcurrency $enrichmentConcurrency",
+                )
+                // Sanity: we should have actually exercised some concurrency, not run all serially.
+                assertTrue(
+                    peak.get() > 1,
+                    "expected some concurrency, only saw peak=${peak.get()} (test infra issue?)",
+                )
+            }
+        }
     }
 }
