@@ -1,5 +1,6 @@
 package io.skjaere.nzbstreamer.config
 
+import io.skjaere.nzbstreamer.enrichment.NzbEnrichmentService
 import java.nio.file.Path
 
 data class NntpConfig(
@@ -43,7 +44,16 @@ data class StreamingConfig(
 )
 
 data class PrepareConfig(
-    val verifySegments: Boolean = false
+    val verifySegments: Boolean = false,
+    /**
+     * Max concurrent per-file operations during NZB enrichment (fetching the first
+     * segment of each file to populate yenc headers + first-16KB, plus the par2
+     * download fan-out). One large multi-volume release expands to ~100 wire-level
+     * NZB files; without this bound, a parallel awaitAll over `nzb.files` opens
+     * 100+ priority=PREPARE NNTP connections at once, exceeding any reasonable
+     * pool size and provider account session limit.
+     */
+    val enrichmentConcurrency: Int = NzbEnrichmentService.DEFAULT_ENRICHMENT_CONCURRENCY,
 )
 
 /**

@@ -1,6 +1,7 @@
 package io.skjaere.nzbstreamer.enrichment
 
 import io.ktor.utils.io.*
+import io.micrometer.core.instrument.Gauge
 import io.micrometer.core.instrument.Metrics
 import io.micrometer.core.instrument.Timer
 import io.skjaere.nntp.ArticleNotFoundException
@@ -14,17 +15,52 @@ import io.skjaere.nzbstreamer.stream.NntpStreamingService
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.sync.Semaphore
 import io.skjaere.compressionutils.Par2Parser
 import org.slf4j.LoggerFactory
 import kotlin.math.min
 
 class NzbEnrichmentService(
-    private val streamingService: NntpStreamingService
+    private val streamingService: NntpStreamingService,
+    enrichmentConcurrency: Int = DEFAULT_ENRICHMENT_CONCURRENCY,
 ) {
+    companion object {
+        const val DEFAULT_ENRICHMENT_CONCURRENCY = 8
+    }
     private val logger = LoggerFactory.getLogger(NzbEnrichmentService::class.java)
     private val registry = Metrics.globalRegistry
     private val enrichmentTimer = registry.timer("nzb.enrichment.duration")
     private val enrichmentFiles = registry.counter("nzb.enrichment.files")
+    // Bound the per-file fan-out. A multi-volume release can contain 100+ wire-level
+    // NZB files; without this gate, the inner `awaitAll` would open one priority=PREPARE
+    // NNTP connection per file simultaneously and starve every other caller (and
+    // overflow most provider account session limits).
+    private val fanOutGate = Semaphore(enrichmentConcurrency)
+    // Gauge: how many permits are still free right now. 0 = the gate is the bottleneck
+    // and raising enrichmentConcurrency would let more imports run in parallel
+    // (assuming pool capacity is also available). Pair with [permitWaitTimer] to
+    // confirm callers are actually queueing.
+    private val fanOutPermitsAvailable = Gauge.builder("nzb.enrichment.fan_out.permits.available", fanOutGate) {
+        it.availablePermits.toDouble()
+    }.register(registry)
+    // Timer: how long each enrichFile/downloadPar2 waited inside withPermit before
+    // it ran. Sustained non-zero waits mean imports are being serialized at the
+    // gate — diagnostic for "is the new bound too tight?"
+    private val permitWaitTimer = registry.timer("nzb.enrichment.fan_out.permit.wait")
+
+    // Acquires a fan-out permit, recording the wait time. Equivalent to
+    // `fanOutGate.withPermit { block() }` but isolates the "time spent queued
+    // behind the bound" so we can tell whether the bound is the bottleneck.
+    private suspend fun <T> withTimedPermit(block: suspend () -> T): T {
+        val sample = Timer.start(registry)
+        fanOutGate.acquire()
+        sample.stop(permitWaitTimer)
+        try {
+            return block()
+        } finally {
+            fanOutGate.release()
+        }
+    }
 
     suspend fun enrich(nzb: NzbDocument): EnrichmentResult {
         val sample = Timer.start(registry)
@@ -32,7 +68,7 @@ class NzbEnrichmentService(
             coroutineScope {
                 nzb.files.map { file ->
                     async {
-                        enrichFile(file)
+                        withTimedPermit { enrichFile(file) }
                     }
                 }.awaitAll()
             }
@@ -65,7 +101,7 @@ class NzbEnrichmentService(
                     }
                     .map { file ->
                         async {
-                            downloadPar2(file)
+                            withTimedPermit { downloadPar2(file) }
                         }
                     }.awaitAll()
             }
