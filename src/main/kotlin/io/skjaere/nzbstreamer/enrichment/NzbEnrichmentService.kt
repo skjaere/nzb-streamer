@@ -72,18 +72,9 @@ class NzbEnrichmentService(
                     }
                 }.awaitAll()
             }
-        } catch (e: ArticleNotFoundException) {
-            logger.warn("Article not found during enrichment: {}", e.message)
-            return EnrichmentResult.MissingArticles(
-                e.message ?: "Article not found",
-                e
-            )
-        } catch (e: NntpException) {
-            logger.error("NNTP failure during enrichment: {}", e.message, e)
-            return EnrichmentResult.Failure(
-                e.message ?: "NNTP failure",
-                e
-            )
+        } catch (@Suppress("TooGenericExceptionCaught") e: Exception) {
+            classifyEnrichmentFailure(e, phase = "enrichment")?.let { return it }
+            throw e
         }
 
         val enrichedCount = nzb.files.count { it.yencHeaders != null }
@@ -105,23 +96,56 @@ class NzbEnrichmentService(
                         }
                     }.awaitAll()
             }
-        } catch (e: ArticleNotFoundException) {
-            logger.warn("PAR2 article not found: {}", e.message)
-            return EnrichmentResult.MissingArticles(
-                e.message ?: "PAR2 article not found",
-                e
-            )
-        } catch (e: NntpException) {
-            logger.error("NNTP failure during PAR2 download: {}", e.message, e)
-            return EnrichmentResult.Failure(
-                e.message ?: "NNTP failure during PAR2 download",
-                e
-            )
+        } catch (@Suppress("TooGenericExceptionCaught") e: Exception) {
+            classifyEnrichmentFailure(e, phase = "PAR2 download")?.let { return it }
+            throw e
         }
 
         sample.stop(enrichmentTimer)
         enrichmentFiles.increment(nzb.files.size.toDouble())
         return EnrichmentResult.Success(nzb)
+    }
+
+    /**
+     * Classifies an exception thrown from a per-file fan-out as either a missing-article
+     * condition or a generic NNTP failure, returning the corresponding [EnrichmentResult].
+     *
+     * Walks the cause chain rather than relying on `e is ArticleNotFoundException` because
+     * a missing article thrown inside a Ktor writer coroutine ends up wrapped as
+     * `ClosedByteChannelException(cause = ArticleNotFoundException)` by the channel's
+     * `cancel(cause)` path — visible to consumers reading from the channel. A plain `is`
+     * check would miss the wrapper and propagate up, where it gets logged at ERROR with
+     * a stack trace and shipped to GlitchTip as if it were an application bug.
+     *
+     * Returns null for exceptions that don't carry an NntpException anywhere in the
+     * cause chain — those are genuinely unexpected and the caller propagates.
+     */
+    private fun classifyEnrichmentFailure(e: Throwable, phase: String): EnrichmentResult? {
+        e.firstCauseOfType<ArticleNotFoundException>()?.let { cause ->
+            logger.warn("Article not found during {}: {}", phase, cause.message)
+            return EnrichmentResult.MissingArticles(
+                cause.message ?: "Article not found",
+                e,
+            )
+        }
+        e.firstCauseOfType<NntpException>()?.let { cause ->
+            logger.error("NNTP failure during {}: {}", phase, cause.message, e)
+            return EnrichmentResult.Failure(
+                cause.message ?: "NNTP failure",
+                e,
+            )
+        }
+        return null
+    }
+
+    private inline fun <reified T : Throwable> Throwable.firstCauseOfType(): T? {
+        var current: Throwable? = this
+        val seen = mutableSetOf<Throwable>()
+        while (current != null && seen.add(current)) {
+            if (current is T) return current
+            current = current.cause
+        }
+        return null
     }
 
     private suspend fun enrichFile(file: NzbFile) {
