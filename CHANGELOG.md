@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.11.0](https://github.com/skjaere/nzb-streamer/compare/v0.10.0...v0.11.0) (2026-05-28)
+
+
+### Features
+
+* **enrichment:** bound per-file fan-out + expose gate metrics ([ec774c6](https://github.com/skjaere/nzb-streamer/commit/ec774c66aea2941f53d1e6dbd480cc0a2d9c55c6))
+
+
+### Bug Fixes
+
+* **enrichment:** walk cause chain when classifying NNTP failures ([95993e4](https://github.com/skjaere/nzb-streamer/commit/95993e4543932a1f8063ef0bc5bf2d0bdeb0d5a0))
+
 ## [0.10.0](https://github.com/skjaere/nzb-streamer/compare/v0.9.1...v0.10.0) (2026-05-25)
 
 
