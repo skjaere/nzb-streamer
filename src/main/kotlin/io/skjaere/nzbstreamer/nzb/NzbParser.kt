@@ -2,20 +2,37 @@ package io.skjaere.nzbstreamer.nzb
 
 import org.w3c.dom.Element
 import org.w3c.dom.NodeList
+import org.xml.sax.InputSource
 import java.io.ByteArrayInputStream
+import java.io.StringReader
 import javax.xml.parsers.DocumentBuilderFactory
+import javax.xml.parsers.ParserConfigurationException
 
 object NzbParser {
     private const val NZB_NAMESPACE = "http://www.newzbin.com/DTD/2003/nzb"
+    private val HARDENING_FEATURES = listOf(
+        "http://apache.org/xml/features/nonvalidating/load-external-dtd",
+        "http://xml.org/sax/features/external-general-entities",
+        "http://xml.org/sax/features/external-parameter-entities",
+    )
 
     fun parse(data: ByteArray): NzbDocument {
         val factory = DocumentBuilderFactory.newInstance().apply {
             isNamespaceAware = true
-            setFeature("http://apache.org/xml/features/nonvalidating/load-external-dtd", false)
-            setFeature("http://xml.org/sax/features/external-general-entities", false)
-            setFeature("http://xml.org/sax/features/external-parameter-entities", false)
+            // These feature URIs are Xerces/SAX specific. Other DOM implementations, such as
+            // Android's, throw for features they do not know, so each one is best-effort.
+            HARDENING_FEATURES.forEach { feature ->
+                try {
+                    setFeature(feature, false)
+                } catch (_: ParserConfigurationException) {
+                }
+            }
         }
-        val builder = factory.newDocumentBuilder()
+        val builder = factory.newDocumentBuilder().apply {
+            // Portable guard against fetching DTDs and external entities (XXE), whichever
+            // of the features above the platform honours.
+            setEntityResolver { _, _ -> InputSource(StringReader("")) }
+        }
         val document = builder.parse(ByteArrayInputStream(data))
         document.documentElement.normalize()
 
