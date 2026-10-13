@@ -19,6 +19,7 @@ import io.skjaere.nzbstreamer.queue.SegmentQueueService
 import io.skjaere.nzbstreamer.stream.ArchiveStreamingService
 import io.skjaere.nzbstreamer.stream.FileResolveResult
 import io.skjaere.nzbstreamer.stream.NamedSplits
+import io.skjaere.nzbstreamer.stream.NntpPriority
 import io.skjaere.nzbstreamer.stream.NntpStreamingService
 import io.skjaere.nzbstreamer.stream.SegmentCache
 import io.skjaere.nzbstreamer.stream.StreamableFile
@@ -35,6 +36,17 @@ class NzbStreamer private constructor(
     suspend fun verifySegments(nzb: NzbDocument): VerificationResult {
         return verificationService.verifySegments(nzb)
     }
+
+    /**
+     * STATs every segment of the NZB (pipelined across connections, falling back across pools),
+     * reporting (checked, total) as answers arrive. Minutes on huge releases without pipelining;
+     * seconds to tens of seconds with it.
+     */
+    suspend fun verifySegments(
+        nzbBytes: ByteArray,
+        priority: NntpPriority = NntpPriority.HEALTH_CHECK,
+        progress: ((checked: Int, total: Int) -> Unit)? = null,
+    ): VerificationResult = verificationService.verifySegments(NzbParser.parse(nzbBytes), priority, progress)
 
     /** STATs a spread sample of segments; see [VerificationService.verifySample]. */
     suspend fun verifySample(
