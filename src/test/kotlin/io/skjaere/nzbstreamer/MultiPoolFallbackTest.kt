@@ -388,4 +388,24 @@ class MultiPoolFallbackTest {
             }
         }
     }
+
+    @Test
+    fun `statManyAcrossPools pipelines, falls back per article and reports progress`(): Unit = runBlocking {
+        // 100 articles: most on the primary, some only on the fill, two on neither.
+        val ids = (0 until 100).map { "many-$it@test" }
+        val onFillOnly = setOf(3, 17, 42, 64, 81, 99)
+        val missing = setOf(50, 77)
+        ids.forEachIndexed { i, id ->
+            primaryContainer.client.addStatExpectation("<$id>", i !in onFillOnly && i !in missing)
+            fillContainer.client.addStatExpectation("<$id>", i in onFillOnly)
+        }
+        val progress = java.util.Collections.synchronizedList(mutableListOf<Pair<Int, Int>>())
+        createStreamingService(createConfigs()).use { service ->
+            val present = service.statManyAcrossPools(ids, concurrency = 4, onProgress = { done, total -> progress += done to total })
+            assertEquals(ids.indices.map { it !in missing }, present)
+        }
+        // Every first-pool answer is reported, ending at 100 of 100.
+        assertEquals(100, progress.size)
+        assertEquals(100 to 100, progress.maxBy { it.first })
+    }
 }

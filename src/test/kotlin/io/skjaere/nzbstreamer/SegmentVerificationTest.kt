@@ -331,4 +331,18 @@ class SegmentVerificationTest {
             assertTrue(result.message.contains("f2-19@test"), result.message)
         }
     }
+
+    @Test
+    fun `verifySample reports progress up to the number of sampled segments`() = runBlocking<Unit> {
+        val ids = (0 until 100).map { "p$it@test" }
+        ids.forEach { NntpMockResponses.addStatMock("<$it>", true) }
+        val progress = java.util.Collections.synchronizedList(mutableListOf<Pair<Int, Int>>())
+        createStreamingService(socket.localPort).use { streamingService ->
+            val result = VerificationService(streamingService, concurrency = 1)
+                .verifySample(createMultiSegmentNzb("file1" to ids), samples = 8, progress = { done, total -> progress += done to total })
+            assertIs<VerificationResult.Success>(result)
+        }
+        val total = expectedSample(100, samples = 8).size
+        assertEquals((1..total).map { it to total }, progress.sortedBy { it.first })
+    }
 }

@@ -10,10 +10,13 @@ import io.skjaere.compressionutils.TranslatedFileEntry
 import io.skjaere.compressionutils.VolumeMetaData
 import io.skjaere.nzbstreamer.nzb.NzbDocument
 import io.skjaere.nzbstreamer.seekable.NestedSeekableInputStream
-import io.skjaere.nzbstreamer.seekable.NntpSeekableInputStream
+import io.skjaere.nzbstreamer.seekable.SegmentRandomAccessStream
 import io.skjaere.nzbstreamer.stream.ArchiveStreamingService
 import io.skjaere.nzbstreamer.stream.NntpStreamingService
 import org.slf4j.LoggerFactory
+
+/** Inner volume starts kept in flight while reading them. */
+private const val INNER_PREFETCH = 16
 
 class NestedArchiveMetadataService(
     private val streamingService: NntpStreamingService
@@ -100,28 +103,40 @@ class NestedArchiveMetadataService(
         outerChunks: List<List<SplitInfo>>,
         orderedArchiveNzb: NzbDocument
     ): List<ArchiveFileEntry>? {
-        val volumesWithHeaders = NntpSeekableInputStream(
-            orderedArchiveNzb, streamingService
-        ).use { stream ->
-            resolvedInnerVolumes.zip(outerChunks).map { (vol, chunks) ->
+        // One stream for both passes: the listing re-reads the inner volume starts, which the
+        // first pass already fetched (and the stream retains).
+        val outerStream = SegmentRandomAccessStream(orderedArchiveNzb, streamingService)
+        val innerListResult = try {
+            // ArchiveService only looks at a volume's first 16 KB when its name doesn't say it is
+            // an archive volume (obfuscated names: signature check, PAR2 name lookup). Inner
+            // volumes almost always keep their real names (.rar/.r00/.part01.rar), so reading
+            // every start would download one article per inner volume for nothing; that was
+            // most of the time spent opening scene releases repacked inside another RAR.
+            val needsHeader = resolvedInnerVolumes.map { !ArchiveService.fileHasKnownExtension(it.filename) }
+            val starts = outerChunks.map { chunks -> chunks[0].dataStartPosition }
+            val unnamed = needsHeader.indices.filter { needsHeader[it] }
+            val volumesWithHeaders = resolvedInnerVolumes.zip(outerChunks).mapIndexed { i, (vol, chunks) ->
+                if (!needsHeader[i]) return@mapIndexed vol
+                // Keep the next few unnamed starts in flight (a sliding window, so nothing is
+                // evicted from the cache before use).
+                val ahead = unnamed.filter { it >= i }.take(INNER_PREFETCH).map { starts[it] }
+                outerStream.prefetch(ahead.flatMap { listOf(it, it + 16_383) })
                 val first16kb = ByteArray(minOf(16384, vol.size).toInt())
-                stream.seek(chunks[0].dataStartPosition)
+                outerStream.seek(chunks[0].dataStartPosition)
                 var totalRead = 0
                 while (totalRead < first16kb.size) {
-                    val n = stream.read(first16kb, totalRead, first16kb.size - totalRead)
+                    val n = outerStream.read(first16kb, totalRead, first16kb.size - totalRead)
                     if (n <= 0) break
                     totalRead += n
                 }
                 vol.copy(first16kb = if (totalRead > 0) first16kb.copyOf(totalRead) else null)
             }
-        }
-
-        val innerListResult = NestedSeekableInputStream(
-            outerStream = NntpSeekableInputStream(orderedArchiveNzb, streamingService),
-            innerVolumeSizes = innerVolumeSizes,
-            outerChunks = outerChunks
-        ).use { stream ->
-            ArchiveService.listFiles(stream, volumesWithHeaders)
+            ArchiveService.listFiles(
+                NestedSeekableInputStream(outerStream = outerStream, innerVolumeSizes = innerVolumeSizes, outerChunks = outerChunks),
+                volumesWithHeaders,
+            )
+        } finally {
+            outerStream.close()
         }
 
         return when (innerListResult) {

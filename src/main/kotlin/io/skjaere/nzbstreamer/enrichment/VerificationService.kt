@@ -4,15 +4,10 @@ import io.micrometer.core.instrument.Metrics
 import io.micrometer.core.instrument.Timer
 import io.skjaere.nntp.ArticleNotFoundException
 import io.skjaere.nntp.NntpException
-import io.skjaere.nntp.StatResult
 import io.skjaere.nzbstreamer.nzb.NzbDocument
+import io.skjaere.nzbstreamer.stream.NntpPriority
 import io.skjaere.nzbstreamer.stream.NntpStreamingService
-import kotlinx.coroutines.async
-import kotlinx.coroutines.awaitAll
-import kotlinx.coroutines.coroutineScope
-import kotlinx.coroutines.sync.Semaphore
 import org.slf4j.LoggerFactory
-import java.util.concurrent.atomic.AtomicReference
 
 class VerificationService(
     private val streamingService: NntpStreamingService,
@@ -38,7 +33,11 @@ class VerificationService(
 
     fun getConcurrency(): Int = currentConcurrency
 
-    suspend fun verifySegments(nzb: NzbDocument): VerificationResult {
+    suspend fun verifySegments(
+        nzb: NzbDocument,
+        priority: NntpPriority = NntpPriority.HEALTH_CHECK,
+        progress: ((checked: Int, total: Int) -> Unit)? = null,
+    ): VerificationResult {
         val sample = Timer.start(registry)
         val segmentsToVerify = segmentsOf(nzb)
 
@@ -49,7 +48,7 @@ class VerificationService(
         }
 
         logger.debug("Verifying {} additional segments", segmentsToVerify.size)
-        val result = check(segmentsToVerify)
+        val result = check(segmentsToVerify, priority, progress)
         sample.stop(verificationTimer)
         if (result is VerificationResult.Success) {
             logger.debug("All {} segments verified successfully", segmentsToVerify.size)
@@ -64,7 +63,12 @@ class VerificationService(
      * a sample takes about one round trip per [currentConcurrency] segments, and a release
      * with expired articles is usually missing whole stretches, which a spread sample hits.
      */
-    suspend fun verifySample(nzb: NzbDocument, samples: Int = 32): VerificationResult {
+    suspend fun verifySample(
+        nzb: NzbDocument,
+        samples: Int = 32,
+        priority: NntpPriority = NntpPriority.PREPARE,
+        progress: ((checked: Int, total: Int) -> Unit)? = null,
+    ): VerificationResult {
         require(samples > 0) { "samples must be > 0, got $samples" }
         val all = segmentsOf(nzb)
         if (all.isEmpty()) return VerificationResult.Success
@@ -72,7 +76,7 @@ class VerificationService(
         val spread = (0 until samples).map { i -> (i.toLong() * (all.size - 1) / maxOf(samples - 1, 1)).toInt() }
         val chosen = (ends + spread).distinct().sorted().map { all[it] }
         logger.debug("Verifying a sample of {} of {} segments", chosen.size, all.size)
-        return check(chosen)
+        return check(chosen, priority, progress)
     }
 
     // Carry the per-segment position within its file (and the file's name/size)
@@ -94,27 +98,16 @@ class VerificationService(
         }
     }
 
-    private suspend fun check(segmentsToVerify: List<SegmentToCheck>): VerificationResult {
-        val firstMissing = AtomicReference<SegmentToCheck>(null)
-        try {
-            coroutineScope {
-                val semaphore = Semaphore(currentConcurrency)
-                segmentsToVerify.map { unit ->
-                    async {
-                        if (firstMissing.get() != null) return@async
-                        semaphore.acquire()
-                        try {
-                            if (firstMissing.get() != null) return@async
-                            val result = streamingService.statAcrossPools("<${unit.segment.articleId}>")
-                            if (result is StatResult.NotFound) {
-                                firstMissing.compareAndSet(null, unit)
-                            }
-                        } finally {
-                            semaphore.release()
-                        }
-                    }
-                }.awaitAll()
-            }
+    private suspend fun check(
+        segmentsToVerify: List<SegmentToCheck>,
+        priority: NntpPriority,
+        progress: ((checked: Int, total: Int) -> Unit)?,
+    ): VerificationResult {
+        // Pipelined STATs across the connections (one round trip per batch, not per article).
+        val present = try {
+            streamingService.statManyAcrossPools(
+                segmentsToVerify.map { it.segment.articleId }, currentConcurrency, priority, progress,
+            )
         } catch (e: NntpException) {
             logger.error("NNTP failure during segment verification: {}", e.message, e)
             return VerificationResult.Failure(
@@ -122,10 +115,11 @@ class VerificationService(
                 e
             )
         }
+        val firstMissing = present.indexOfFirst { !it }.takeIf { it >= 0 }?.let { segmentsToVerify[it] }
 
         verificationSegments.increment(segmentsToVerify.size.toDouble())
 
-        val missing = firstMissing.get() ?: return VerificationResult.Success
+        val missing = firstMissing ?: return VerificationResult.Success
         verificationMissing.increment(1.0)
         // Include position/total/filename so we can see WHERE in the file the
         // first missing segment sits — telling us whether the NZB is broken at

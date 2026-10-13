@@ -28,6 +28,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.channels.consumeEach
 import kotlinx.coroutines.channels.produce
@@ -48,6 +49,9 @@ import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.locks.ReentrantReadWriteLock
 import kotlin.concurrent.read
 import kotlin.concurrent.write
+
+/** Smallest STAT batch worth a pipeline of its own. */
+private const val STAT_CHUNK_MIN = 32
 
 class NntpStreamingService(
     initialConfigs: List<NntpConfig>,
@@ -593,6 +597,55 @@ class NntpStreamingService(
         } ?: StatResult.NotFound(430, "Not found on any pool")
     }
 
+    /**
+     * STATs many articles with pipelining ([NntpClientPool.statPipelined]): the ids are split
+     * into chunks run on up to [concurrency] connections of the first pool at once; articles
+     * that pool lacks are asked of the next pool, and so on. Returns, per article (in order),
+     * whether any pool has it.
+     *
+     * [onProgress] gets (answered, total) as the first pool answers, so a progress bar moves
+     * steadily; re-asking other pools for the few missing ones happens after.
+     */
+    suspend fun statManyAcrossPools(
+        articleIds: List<String>,
+        concurrency: Int,
+        priority: NntpPriority = NntpPriority.HEALTH_CHECK,
+        onProgress: ((answered: Int, total: Int) -> Unit)? = null,
+    ): List<Boolean> {
+        if (articleIds.isEmpty()) return emptyList()
+        val snapshot = poolLock.read { pools.toList() }
+        val present = BooleanArray(articleIds.size)
+        var pending = articleIds.indices.toList()
+        val answered = java.util.concurrent.atomic.AtomicInteger()
+        snapshot.forEachIndexed { poolIndex, entry ->
+            if (pending.isEmpty()) return@forEachIndexed
+            val first = poolIndex == 0
+            // Enough chunks to use the connections, each big enough to keep a pipeline full.
+            val chunkSize = maxOf(STAT_CHUNK_MIN, (pending.size + concurrency - 1) / concurrency)
+            coroutineScope {
+                val semaphore = Semaphore(concurrency)
+                pending.chunked(chunkSize).map { chunk ->
+                    async {
+                        semaphore.acquire()
+                        try {
+                            val results = entry.pool.statPipelined(chunk.map { "<${articleIds[it]}>" }, priority.value) { _, _ ->
+                                if (first) onProgress?.invoke(answered.incrementAndGet(), articleIds.size)
+                            }
+                            chunk.zip(results).forEach { (index, result) -> if (result is StatResult.Found) present[index] = true }
+                        } finally {
+                            semaphore.release()
+                        }
+                    }
+                }.awaitAll()
+            }
+            pending = pending.filterNot { present[it] }
+            if (pending.isNotEmpty() && poolIndex < snapshot.size - 1) {
+                logger.debug("{} of {} articles not on pool[{}] ({}:{}), asking the next pool", pending.size, articleIds.size, poolIndex, entry.config.host, entry.config.port)
+            }
+        }
+        return present.toList()
+    }
+
     private fun orderForStat(snapshot: List<PoolEntry>): List<PoolEntry> {
         if (snapshot.size <= 1) return snapshot
         val totalWeight = snapshot.sumOf { it.config.maxConnections }
@@ -751,6 +804,12 @@ class NntpStreamingService(
             }
         }
     }
+
+    /**
+     * One decoded segment, through the segment cache and provider fallback like streaming.
+     * For random access (archive headers), where streaming's read-ahead would be wasted.
+     */
+    suspend fun fetchSegment(articleId: String): ByteArray = downloadSegment(articleId)
 
     private suspend fun downloadSegment(articleId: String): ByteArray {
         if (segmentCache != null) {

@@ -54,6 +54,14 @@ object SegmentQueueService {
         }
     }
 
+    /** Every segment of [nzb] with its decoded size and position in the concatenated files. */
+    fun segmentLayout(nzb: NzbDocument): List<SegmentQueueItem> {
+        var globalOffset = 0L
+        return nzb.files.flatMapIndexed { fileIndex, file ->
+            createFileQueueList(file, fileIndex, globalOffset).also { globalOffset += getFileDecodedSize(file) }
+        }
+    }
+
     fun getTotalDecodedSize(nzb: NzbDocument): Long {
         return nzb.files.sumOf { getFileDecodedSize(it) }
     }

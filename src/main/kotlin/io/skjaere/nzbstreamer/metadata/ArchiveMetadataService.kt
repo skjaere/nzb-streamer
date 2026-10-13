@@ -13,7 +13,7 @@ import io.skjaere.nzbstreamer.enrichment.NzbEnrichmentService
 import io.skjaere.nzbstreamer.enrichment.VerificationResult
 import io.skjaere.nzbstreamer.enrichment.VerificationService
 import io.skjaere.nzbstreamer.nzb.NzbDocument
-import io.skjaere.nzbstreamer.seekable.NntpSeekableInputStream
+import io.skjaere.nzbstreamer.seekable.SegmentRandomAccessStream
 import io.skjaere.nzbstreamer.stream.NntpStreamingService
 import org.slf4j.LoggerFactory
 
@@ -162,9 +162,8 @@ class ArchiveMetadataService(
     }
 
     private suspend fun listArchiveEntries(resolved: ResolvedVolumes): ListArchiveEntriesResult {
-        val seekableStream = NntpSeekableInputStream(
-            resolved.orderedArchiveNzb, streamingService
-        )
+        // Header walk: random access without read-ahead (see SegmentRandomAccessStream).
+        val seekableStream = SegmentRandomAccessStream(resolved.orderedArchiveNzb, streamingService)
         val listFilesResult = seekableStream.use { stream ->
             ArchiveService.listFiles(
                 stream = stream,
