@@ -40,23 +40,7 @@ class VerificationService(
 
     suspend fun verifySegments(nzb: NzbDocument): VerificationResult {
         val sample = Timer.start(registry)
-        // Carry the per-segment position within its file (and the file's name/size)
-        // alongside each unit of work, so when a segment is missing we can log WHERE
-        // in the file it sits — useful for distinguishing "this NZB is mostly broken"
-        // from "just one segment lost at position N/M".
-        data class SegmentToCheck(
-            val segment: io.skjaere.nzbstreamer.nzb.NzbSegment,
-            val fileName: String,
-            val positionInFile: Int,  // 1-based
-            val totalSegmentsInFile: Int
-        )
-        val segmentsToVerify = nzb.files.flatMap { file ->
-            val name = file.yencHeaders?.name ?: file.subject
-            val total = file.segments.size
-            file.segments.mapIndexed { idx, segment ->
-                SegmentToCheck(segment, name, idx + 1, total)
-            }
-        }
+        val segmentsToVerify = segmentsOf(nzb)
 
         if (segmentsToVerify.isEmpty()) {
             sample.stop(verificationTimer)
@@ -65,9 +49,53 @@ class VerificationService(
         }
 
         logger.debug("Verifying {} additional segments", segmentsToVerify.size)
+        val result = check(segmentsToVerify)
+        sample.stop(verificationTimer)
+        if (result is VerificationResult.Success) {
+            logger.debug("All {} segments verified successfully", segmentsToVerify.size)
+        }
+        return result
+    }
 
+    /**
+     * Checks a sample of segments instead of all of them: the first and last segment of
+     * every file plus evenly spaced segments in between, [samples] in total (more when the
+     * NZB has many files). STATing every segment of a 7 GB release takes tens of seconds;
+     * a sample takes about one round trip per [currentConcurrency] segments, and a release
+     * with expired articles is usually missing whole stretches, which a spread sample hits.
+     */
+    suspend fun verifySample(nzb: NzbDocument, samples: Int = 32): VerificationResult {
+        require(samples > 0) { "samples must be > 0, got $samples" }
+        val all = segmentsOf(nzb)
+        if (all.isEmpty()) return VerificationResult.Success
+        val ends = all.indices.filter { all[it].positionInFile == 1 || all[it].positionInFile == all[it].totalSegmentsInFile }
+        val spread = (0 until samples).map { i -> (i.toLong() * (all.size - 1) / maxOf(samples - 1, 1)).toInt() }
+        val chosen = (ends + spread).distinct().sorted().map { all[it] }
+        logger.debug("Verifying a sample of {} of {} segments", chosen.size, all.size)
+        return check(chosen)
+    }
+
+    // Carry the per-segment position within its file (and the file's name/size)
+    // alongside each unit of work, so when a segment is missing we can log WHERE
+    // in the file it sits — useful for distinguishing "this NZB is mostly broken"
+    // from "just one segment lost at position N/M".
+    private data class SegmentToCheck(
+        val segment: io.skjaere.nzbstreamer.nzb.NzbSegment,
+        val fileName: String,
+        val positionInFile: Int,  // 1-based
+        val totalSegmentsInFile: Int
+    )
+
+    private fun segmentsOf(nzb: NzbDocument): List<SegmentToCheck> = nzb.files.flatMap { file ->
+        val name = file.yencHeaders?.name ?: file.subject
+        val total = file.segments.size
+        file.segments.mapIndexed { idx, segment ->
+            SegmentToCheck(segment, name, idx + 1, total)
+        }
+    }
+
+    private suspend fun check(segmentsToVerify: List<SegmentToCheck>): VerificationResult {
         val firstMissing = AtomicReference<SegmentToCheck>(null)
-        var checkedCount = 0
         try {
             coroutineScope {
                 val semaphore = Semaphore(currentConcurrency)
@@ -87,7 +115,6 @@ class VerificationService(
                     }
                 }.awaitAll()
             }
-            checkedCount = segmentsToVerify.size
         } catch (e: NntpException) {
             logger.error("NNTP failure during segment verification: {}", e.message, e)
             return VerificationResult.Failure(
@@ -96,30 +123,24 @@ class VerificationService(
             )
         }
 
-        sample.stop(verificationTimer)
-        verificationSegments.increment(checkedCount.toDouble())
+        verificationSegments.increment(segmentsToVerify.size.toDouble())
 
-        val missing = firstMissing.get()
-        if (missing != null) {
-            verificationMissing.increment(1.0)
-            // Include position/total/filename so we can see WHERE in the file the
-            // first missing segment sits — telling us whether the NZB is broken at
-            // the head, the middle, or the tail (which often correlates with the
-            // root cause: head=indexer indexing miss, tail=expired retention).
-            // segment.number is the NZB-declared segment number (sometimes differs
-            // from list position when the NZB enumerates out of order).
-            val message = "Missing article ${missing.segment.articleId} at " +
-                "position ${missing.positionInFile}/${missing.totalSegmentsInFile} " +
-                "(segment.number=${missing.segment.number}) " +
-                "of file '${missing.fileName}'"
-            logger.warn(message)
-            return VerificationResult.MissingArticles(
-                message,
-                ArticleNotFoundException(message)
-            )
-        }
-
-        logger.debug("All {} segments verified successfully", segmentsToVerify.size)
-        return VerificationResult.Success
+        val missing = firstMissing.get() ?: return VerificationResult.Success
+        verificationMissing.increment(1.0)
+        // Include position/total/filename so we can see WHERE in the file the
+        // first missing segment sits — telling us whether the NZB is broken at
+        // the head, the middle, or the tail (which often correlates with the
+        // root cause: head=indexer indexing miss, tail=expired retention).
+        // segment.number is the NZB-declared segment number (sometimes differs
+        // from list position when the NZB enumerates out of order).
+        val message = "Missing article ${missing.segment.articleId} at " +
+            "position ${missing.positionInFile}/${missing.totalSegmentsInFile} " +
+            "(segment.number=${missing.segment.number}) " +
+            "of file '${missing.fileName}'"
+        logger.warn(message)
+        return VerificationResult.MissingArticles(
+            message,
+            ArticleNotFoundException(message)
+        )
     }
 }

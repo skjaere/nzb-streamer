@@ -36,6 +36,15 @@ class NzbStreamer private constructor(
         return verificationService.verifySegments(nzb)
     }
 
+    /** STATs a spread sample of segments; see [VerificationService.verifySample]. */
+    suspend fun verifySample(nzb: NzbDocument, samples: Int = 32): VerificationResult {
+        return verificationService.verifySample(nzb, samples)
+    }
+
+    suspend fun verifySample(nzbBytes: ByteArray, samples: Int = 32): VerificationResult {
+        return verificationService.verifySample(NzbParser.parse(nzbBytes), samples)
+    }
+
     suspend fun enrich(nzbBytes: ByteArray): EnrichmentResult {
         val nzb = NzbParser.parse(nzbBytes)
         return metadataService.enrich(nzb)
