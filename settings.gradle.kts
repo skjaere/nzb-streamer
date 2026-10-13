@@ -20,7 +20,7 @@ if (file("../kotlin-compression-utils").exists()) {
     }
 }
 
-if (file("../mock-nntp-server/mock-nntp-server").exists()) {
+if (gradle.parent == null && file("../mock-nntp-server/mock-nntp-server").exists()) {
     includeBuild("../mock-nntp-server/mock-nntp-server") {
         dependencySubstitution {
             substitute(module("io.skjaere.mocknntp:mock-nntp-server")).using(project(":"))
