@@ -28,6 +28,17 @@ class SegmentRandomAccessStreamTest {
         data.copyOfRange(i * segmentSize, (i + 1) * segmentSize)
     }, prefetchDepth = prefetchDepth)
 
+    /** Over 4 GiB of 1 MB segments following the same p mod 251 pattern, generated as each one is fetched. */
+    private fun largeStream(): SegmentRandomAccessStream {
+        val size = 1_000_000L
+        val layout = (0 until 4_500).map { i ->
+            SegmentQueueItem(NzbSegment(bytes = size, number = i + 1, articleId = "l$i"), 0, i, size, i * size, 0, size)
+        }
+        return SegmentRandomAccessStream(layout, { id -> pattern(id.removePrefix("l").toLong() * size, size.toInt()) })
+    }
+
+    private fun pattern(from: Long, n: Int) = ByteArray(n) { ((from + it) % 251).toByte() }
+
     private suspend fun SegmentRandomAccessStream.readFully(n: Int): ByteArray {
         val out = ByteArray(n)
         var got = 0
@@ -88,6 +99,40 @@ class SegmentRandomAccessStreamTest {
             s.seek(9_200); s.readFully(10)
             assertEquals(setOf("s5", "s9", "s150"), fetched.toSet())
             assertEquals(3, fetched.size)
+        }
+    }
+
+    @Test
+    fun `a forward jump of more than 2 GiB past the retained slices reads the right bytes`() = runBlocking<Unit> {
+        // Like the inferred-split RAR walk: volume 0's headers, then the end of the last volume.
+        largeStream().use { s ->
+            assertContentEquals(pattern(0, 100), s.readFully(100))
+            s.seek(2_600_000_123L)
+            assertContentEquals(pattern(2_600_000_123L, 100), s.readFully(100))
+        }
+    }
+
+    @Test
+    fun `a jump of 4 GiB and a few bytes is not served from the slice retained before it`() = runBlocking<Unit> {
+        largeStream().use { s ->
+            s.seek(5_000); s.readFully(100)
+            val target = 5_000L + (1L shl 32) + 100
+            s.seek(target)
+            assertContentEquals(pattern(target, 100), s.readFully(100))
+        }
+    }
+
+    @Test
+    fun `reading past the bytes a segment delivered ends the stream, however far in`() = runBlocking<Unit> {
+        // segmentLayout gives the last listed segment the rest of the file, so an NZB missing articles
+        // declares one huge segment whose article holds only one part.
+        val declared = 5_000_000_000L
+        val short = listOf(SegmentQueueItem(NzbSegment(bytes = 1000, number = 1, articleId = "s0"), 0, 0, declared, 0, 0, declared))
+        SegmentRandomAccessStream(short, { data.copyOf(segmentSize) }).use { s ->
+            listOf((1L shl 32) + 10, 3_000_000_000L).forEach { pos ->
+                s.seek(pos)
+                assertEquals(-1, s.read(ByteArray(10), 0, 10), "read at $pos")
+            }
         }
     }
 }

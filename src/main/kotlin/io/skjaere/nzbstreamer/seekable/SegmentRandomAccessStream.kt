@@ -70,9 +70,10 @@ class SegmentRandomAccessStream(
     override suspend fun read(buffer: ByteArray, offset: Int, length: Int): Int {
         if (length == 0) return 0
         if (position >= totalSize) return -1
+        // Distances are compared as Long: a jump past 2 GiB must not wrap into a slice or segment.
         retained.floorEntry(position)?.let { (start, slice) ->
-            val within = (position - start).toInt()
-            if (within < slice.size) {
+            if (position - start < slice.size) {
+                val within = (position - start).toInt()
                 val n = minOf(length, slice.size - within)
                 System.arraycopy(slice, within, buffer, offset, n)
                 position += n
@@ -83,9 +84,9 @@ class SegmentRandomAccessStream(
         val index = indexOf(position)
         val item = layout[index]
         val bytes = segment(index).await()
+        if (position - item.globalOffset >= bytes.size) return -1
         val within = (position - item.globalOffset).toInt()
         val n = minOf(length, bytes.size - within)
-        if (n <= 0) return -1
         retain(item.globalOffset, bytes, within)
         System.arraycopy(bytes, within, buffer, offset, n)
         position += n
