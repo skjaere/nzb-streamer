@@ -134,6 +134,34 @@ class SegmentVerificationTest {
     }
 
     @Test
+    fun `verifySegments reports a segment whose id carries CR LF as missing, not its neighbours`() = runBlocking<Unit> {
+        val data = "test file content".toByteArray()
+        registerYencBody("<seg1@test>", "testfile.rar", data)
+        NntpMockResponses.addStatMock("<seg2@test>", true)
+        NntpMockResponses.addStatMock("<gone@test>", false)
+        NntpMockResponses.addStatMock("<seg3@test>", true)
+
+        val streamingService = createStreamingService(socket.localPort)
+        streamingService.use {
+            val enrichmentService = NzbEnrichmentService(streamingService)
+            val verificationService = VerificationService(streamingService, concurrency = 1)
+            // An NZB can spell CR LF in a segment id (&#13;&#10;): written as is, it'd be a second STAT.
+            val nzb = createMultiSegmentNzb(
+                "file1" to listOf("seg1@test", "seg2@test>\r\nSTAT <gone@test", "seg3@test")
+            )
+
+            val enrichResult = enrichmentService.enrich(nzb)
+            assertIs<EnrichmentResult.Success>(enrichResult)
+
+            val verifyResult = verificationService.verifySegments(enrichResult.enrichedNzb)
+            assertIs<VerificationResult.MissingArticles>(verifyResult)
+            assertTrue(verifyResult.message.contains("position 2/3"), verifyResult.message)
+            // The connection is still in step: the next STAT gets its own answer.
+            assertIs<StatResult.NotFound>(streamingService.withClient { it.stat("<gone@test>") })
+        }
+    }
+
+    @Test
     fun `verifySegments returns Success for single-segment files`() = runBlocking<Unit> {
         val data = "test file content".toByteArray()
         registerYencBody("<seg1@test>", "testfile.rar", data)
