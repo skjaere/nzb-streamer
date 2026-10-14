@@ -33,9 +33,12 @@ class NzbStreamer private constructor(
     private val archiveStreamingService: ArchiveStreamingService
 ) : Closeable {
 
-    suspend fun verifySegments(nzb: NzbDocument): VerificationResult {
-        return verificationService.verifySegments(nzb)
-    }
+    /** Like the NZB-bytes overload, for an NZB already parsed (or a part of one, e.g. the volumes of one file). */
+    suspend fun verifySegments(
+        nzb: NzbDocument,
+        priority: NntpPriority = NntpPriority.HEALTH_CHECK,
+        progress: ((checked: Int, total: Int) -> Unit)? = null,
+    ): VerificationResult = verificationService.verifySegments(nzb, priority, progress)
 
     /**
      * STATs every segment of the NZB (pipelined across connections, falling back across pools),
