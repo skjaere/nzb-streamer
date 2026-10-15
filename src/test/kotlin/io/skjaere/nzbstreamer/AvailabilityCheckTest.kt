@@ -210,8 +210,9 @@ class AvailabilityCheckTest {
     // A provider that fails other than with a 430 (login refused, unreachable, its connection
     // dropping, an error answer, closed) passes the articles it hasn't answered on to the next
     // one at once. An article is missing only when every provider answered 430; one that no
-    // provider could answer makes the check a failure with the cause. Dead providers cost
-    // seconds at most.
+    // provider could answer makes the check a failure with the cause. A refused login or a host
+    // that doesn't resolve costs milliseconds. (A provider that refuses connections still costs
+    // the pool's acquire timeout, 30 s or more: ktor-nntp-client retries the connect.)
 
     private val deadProviderBound = 5_000L
 
@@ -334,6 +335,22 @@ class AvailabilityCheckTest {
             withContext(Dispatchers.IO) { service.removePool(configs[0]) }
             assertIs<VerificationResult.Success>(check.await())
             assertEquals(stats().toSet(), fill.statsRead.toSet())
+        }
+    }
+
+    /** The caller's own failure is the check's, not a provider's: it isn't passed on to the next one. */
+    @Test
+    fun `a progress callback that throws fails the check with its exception`() = runBlocking<Unit> {
+        val primary = server { true }
+        val fill = server { true }
+        service(primary, fill, connections = 1).use { service ->
+            val failure = runCatching {
+                withTimeout(deadProviderBound) {
+                    service.statUntilMissing(ids(10), concurrency = 1, onProgress = { _, _ -> error("progress broke") })
+                }
+            }.exceptionOrNull()
+            assertEquals("progress broke", failure?.message, "failed with: $failure")
+            assertEquals(emptyList(), fill.statsRead)
         }
     }
 

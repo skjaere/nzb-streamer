@@ -841,6 +841,9 @@ class NntpStreamingService(
         suspend fun ask(batch: List<StatAsk>) {
             // Set for each article a 223 or 430 settles; read once the batch is done.
             val settled = BooleanArray(batch.size)
+            // Set when onAnswer (the caller's progress callback) throws: the check's failure,
+            // not the pool's.
+            var answerFailed = false
             val job = launch {
                 try {
                     statBatch(entry, poolIndex, batch.map { articleIds[it.index] }, priority, timer) { i, result ->
@@ -848,12 +851,18 @@ class NntpStreamingService(
                         // batch is done.
                         if (result is StatResult.Found || (result is StatResult.NotFound && result.code == 430)) {
                             settled[i] = true
-                            onAnswer(batch[i], result)
+                            try {
+                                onAnswer(batch[i], result)
+                            } catch (e: Throwable) {
+                                answerFailed = true
+                                throw e
+                            }
                         }
                     }
                 } catch (e: CancellationException) {
                     throw e
                 } catch (@Suppress("TooGenericExceptionCaught") e: Exception) {
+                    if (answerFailed) throw e
                     failed(e)
                 }
             }
