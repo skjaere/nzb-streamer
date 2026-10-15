@@ -17,6 +17,7 @@ import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
 import org.slf4j.LoggerFactory
+import java.io.IOException
 import kotlin.math.abs
 
 /**
@@ -111,7 +112,12 @@ class SegmentRandomAccessStream(
         return if (read(one, 0, 1) == 1) one[0].toInt() and 0xFF else -1
     }
 
+    /**
+     * Moves to [position]; past the end, reads end the stream. A negative position (an archive's
+     * offset gone wrong) is refused with an [IOException], as a file refuses it, and changes nothing.
+     */
     override suspend fun seek(position: Long) {
+        if (position < 0) throw IOException("Negative seek position: $position")
         val previous = lastSeekTarget
         val stride = previous?.let { position - it }
         // Two equal forward jumps, each beyond one segment: assume the pattern continues.

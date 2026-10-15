@@ -2,12 +2,15 @@ package io.skjaere.nzbstreamer.seekable
 
 import io.skjaere.nzbstreamer.nzb.NzbSegment
 import io.skjaere.nzbstreamer.queue.SegmentQueueItem
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
 import org.junit.jupiter.api.Test
+import java.io.IOException
 import java.util.Collections
 import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
+import kotlin.test.assertIs
 import kotlin.test.assertTrue
 
 class SegmentRandomAccessStreamTest {
@@ -119,6 +122,25 @@ class SegmentRandomAccessStreamTest {
             val target = 5_000L + (1L shl 32) + 100
             s.seek(target)
             assertContentEquals(pattern(target, 100), s.readFully(100))
+        }
+    }
+
+    @Test
+    fun `a negative seek is refused, not left for a read to fail on`() = runBlocking<Unit> {
+        stream().use { s ->
+            s.seek(500)
+            val failure = try {
+                s.seek(-1)
+                s.read()
+                null
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                e
+            }
+            assertIs<IOException>(failure, "seek(-1), then read: $failure")
+            assertEquals(500, s.position(), "position after the refused seek")
+            assertEquals(data[500].toInt() and 0xFF, s.read())
         }
     }
 
