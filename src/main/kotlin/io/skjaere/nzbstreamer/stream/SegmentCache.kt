@@ -2,8 +2,12 @@ package io.skjaere.nzbstreamer.stream
 
 import io.micrometer.core.instrument.Metrics
 import io.skjaere.nzbstreamer.config.SegmentCacheConfig
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
@@ -155,13 +159,22 @@ class SegmentCache(private val config: SegmentCacheConfig) : AutoCloseable {
      * its own inflight entry between our `get` fast-path and our `putIfAbsent`) runs
      * outside any lock — the worst that happens is one redundant disk read or, very
      * rarely, one redundant NNTP fetch, both correctness-preserving.
+     *
+     * A leader's failure is its followers' too, but not its cancellation: a follower whose
+     * leader is cancelled fetches for itself (or follows the next leader).
      */
     suspend fun getOrFetch(articleId: String, fetch: suspend () -> ByteArray): ByteArray {
         get(articleId)?.let { return it }
 
         val ourDeferred = CompletableDeferred<ByteArray>()
         val existing = inFlight.putIfAbsent(articleId, ourDeferred)
-        if (existing != null) return existing.await()
+        if (existing != null) {
+            return follow(existing) ?: run {
+                // The cancelled leader may not have let go of it yet.
+                inFlight.remove(articleId, existing)
+                getOrFetch(articleId, fetch)
+            }
+        }
 
         return try {
             // Leader-side recheck: a previous leader may have finished and removed
@@ -185,25 +198,38 @@ class SegmentCache(private val config: SegmentCacheConfig) : AutoCloseable {
         }
     }
 
+    /** [leader]'s bytes, or null if it was cancelled and we weren't. */
+    private suspend fun follow(leader: CompletableDeferred<ByteArray>): ByteArray? = try {
+        leader.await()
+    } catch (_: CancellationException) {
+        // Ours goes on up; the leader's isn't ours.
+        currentCoroutineContext().ensureActive()
+        null
+    }
+
     private suspend fun store(articleId: String, bytes: ByteArray) {
         val path = filePathFor(articleId)
-        val ok = withContext(Dispatchers.IO) {
-            runCatching {
-                path.parent.createDirectories()
-                path.writeBytes(bytes)
-                true
-            }.getOrElse {
-                logger.warn("Failed to write cache file {}: {}", path, it.message)
-                false
+        // A file written is one the index must know, or it is never evicted: no cancellation
+        // between the write and the index update.
+        val newTotal = withContext(NonCancellable) {
+            val ok = withContext(Dispatchers.IO) {
+                runCatching {
+                    path.parent.createDirectories()
+                    path.writeBytes(bytes)
+                    true
+                }.getOrElse {
+                    logger.warn("Failed to write cache file {}: {}", path, it.message)
+                    false
+                }
             }
-        }
-        if (!ok) return
+            if (!ok) return@withContext null
 
-        val newTotal = indexLock.withLock {
-            index[articleId]?.let { totalBytes.addAndGet(-it.size) }
-            index[articleId] = Entry(articleId, bytes.size.toLong(), System.nanoTime())
-            totalBytes.addAndGet(bytes.size.toLong())
-        }
+            indexLock.withLock {
+                index[articleId]?.let { totalBytes.addAndGet(-it.size) }
+                index[articleId] = Entry(articleId, bytes.size.toLong(), System.nanoTime())
+                totalBytes.addAndGet(bytes.size.toLong())
+            }
+        } ?: return
         if (newTotal > evictThreshold) evict()
         if (pendingWrites.incrementAndGet() % INDEX_FLUSH_INTERVAL == 0L) saveIndex()
     }
@@ -226,7 +252,8 @@ class SegmentCache(private val config: SegmentCacheConfig) : AutoCloseable {
             targets
         }
         if (toRemove.isEmpty()) return
-        withContext(Dispatchers.IO) {
+        // Out of the index already: delete them even if cancelled, or they stay on disk for good.
+        withContext(NonCancellable + Dispatchers.IO) {
             for (cand in toRemove) {
                 runCatching { filePathFor(cand.articleId).deleteIfExists() }
             }
