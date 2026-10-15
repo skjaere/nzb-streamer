@@ -1,6 +1,7 @@
 package io.skjaere.nzbstreamer.seekable
 
 import io.ktor.utils.io.ByteReadChannel
+import io.ktor.utils.io.ClosedByteChannelException
 import io.ktor.utils.io.discard
 import io.ktor.utils.io.readAvailable
 import io.ktor.utils.io.readByte
@@ -26,8 +27,9 @@ private const val FORWARD_THRESHOLD_BYTES = 102400L
  * they're read. A read starts that download as a child of the reading coroutine: [close], or a seek
  * that reopens it, ends it, and until then the reading coroutine's job doesn't complete. [close]
  * doesn't wait for the download to stop; the reading coroutine's job completes once it has. A
- * download that fails makes [read] throw why. Downloads never go past [end] (the whole of [nzb] by
- * default): reads there end the stream.
+ * download that fails makes [read] throw why: its failure itself (an
+ * [io.skjaere.nntp.ArticleNotFoundException], say), as streaming a plain file does. Downloads never
+ * go past [end] (the whole of [nzb] by default): reads there end the stream.
  */
 class NntpSeekableInputStream @JvmOverloads constructor(
     private val nzb: NzbDocument,
@@ -48,12 +50,12 @@ class NntpSeekableInputStream @JvmOverloads constructor(
         if (currentPosition >= totalSize) return -1
         ensureChannel()
         val channel = currentChannel ?: return -1
-        val bytesRead = channel.readAvailable(buffer, offset, length)
+        val bytesRead = unwrappingFailure { channel.readAvailable(buffer, offset, length) }
         if (bytesRead > 0) {
             currentPosition += bytesRead
         } else if (bytesRead == -1) {
             // The download stopped early: say why rather than end the stream.
-            channel.closedCause?.let { throw it }
+            channel.closedCause?.let { throw it.unwrapped() }
         }
         return bytesRead
     }
@@ -63,11 +65,11 @@ class NntpSeekableInputStream @JvmOverloads constructor(
         ensureChannel()
         val channel = currentChannel ?: return -1
         return try {
-            val b = channel.readByte().toInt() and 0xFF
+            val b = unwrappingFailure { channel.readByte() }.toInt() and 0xFF
             currentPosition++
             b
         } catch (_: EOFException) {
-            channel.closedCause?.let { throw it }
+            channel.closedCause?.let { throw it.unwrapped() }
             -1
         }
     }
@@ -78,7 +80,7 @@ class NntpSeekableInputStream @JvmOverloads constructor(
         val forward = position - currentPosition
         if (forward in 1..forwardThresholdBytes && currentChannel != null) {
             logger.debug("Forward skip {} bytes from {} to {}", forward, currentPosition, position)
-            currentChannel!!.discard(forward)
+            unwrappingFailure { currentChannel!!.discard(forward) }
             skippedBytes.increment(forward.toDouble())
             currentPosition = position
         } else {
@@ -132,4 +134,18 @@ class NntpSeekableInputStream @JvmOverloads constructor(
         currentChannel = null
         job?.cancelAndJoin()
     }
+
+    // A channel the download's failure closed throws (or leaves in closedCause) Ktor's
+    // ClosedByteChannelException around it. Readers get the failure itself, as streaming a plain
+    // file throws it.
+    private inline fun <T> unwrappingFailure(read: () -> T): T = try {
+        read()
+    } catch (e: ClosedByteChannelException) {
+        throw e.unwrapped()
+    }
+
+    // Past every ClosedByteChannelException: Ktor's, and the copies coroutines' stack-trace
+    // recovery (debug mode) makes of it, each with the one it copies as its cause.
+    private fun Throwable.unwrapped(): Throwable =
+        generateSequence(this) { it.cause }.firstOrNull { it !is ClosedByteChannelException } ?: this
 }

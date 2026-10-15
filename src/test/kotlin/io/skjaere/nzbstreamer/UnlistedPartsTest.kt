@@ -122,7 +122,7 @@ class UnlistedPartsTest {
             it.connect()
             val stream = NntpSeekableInputStream(nzb, it)
             stream.seek(4L * partSize + 100)
-            // The stream throws the channel's close cause as Ktor wraps it (library issue N29).
+            // The stream throws the download's failure itself (library issue N29).
             val result = try {
                 stream.read(ByteArray(100), 0, 100)
             } catch (e: CancellationException) {
@@ -132,7 +132,7 @@ class UnlistedPartsTest {
             } finally {
                 stream.close()
             }
-            assertNotNull((result as? Throwable).missingArticle(), "read in the unlisted parts: $result")
+            assertIs<ArticleNotFoundException>(result, "read in the unlisted parts: $result")
         }
     }
 

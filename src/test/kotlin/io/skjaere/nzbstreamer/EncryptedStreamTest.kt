@@ -32,9 +32,12 @@ import kotlin.coroutines.CoroutineContext
 import kotlin.coroutines.EmptyCoroutineContext
 import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
+import kotlin.test.assertIs
 import kotlin.test.assertTrue
 import kotlin.test.fail
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
@@ -170,6 +173,15 @@ class EncryptedStreamTest {
 
     private fun Throwable?.chain() = generateSequence(this) { it.cause }.toList()
 
+    /** What [read] returned, or what it threw. */
+    private suspend fun outcomeOf(read: suspend () -> Int): Any = try {
+        read()
+    } catch (e: CancellationException) {
+        throw e
+    } catch (e: Exception) {
+        e
+    }
+
     /** A dispatcher with one thread, as Android's main thread is. A daemon: a test that hangs it can't hold up the JVM. */
     private fun singleThread() =
         Executors.newSingleThreadExecutor { Thread(it, "single").apply { isDaemon = true } }.asCoroutineDispatcher()
@@ -258,6 +270,26 @@ class EncryptedStreamTest {
     }
 
     /**
+     * As in a plain file: streamFile throws the [ArticleNotFoundException] itself, and the channel
+     * closes with it as its cause, not with Ktor's ClosedByteChannelException around it.
+     */
+    @Test
+    fun `a missing article in an encrypted file reaches callers as itself, as in a plain file`() = runBlocking<Unit> {
+        val missing = segmentOf(blockStart + 16 + blocks(headerSize.toInt()) + 20_000)
+        service(server(missing)).use { service ->
+            val streamer = ArchiveStreamingService(service)
+            val splits = NamedSplits(listOf(split), plaintext.size.toLong(), "video.mkv")
+            // Whether consume takes the early end for the end or its read throws.
+            assertFailsWith<ArticleNotFoundException> { streamer.streamFile(nzb(), splits) { it.readToEnd() } }
+            assertFailsWith<ArticleNotFoundException> { streamer.streamFile(nzb(), splits) { it.readFully(ByteArray(plaintext.size)) } }
+
+            val channel = startStream(service).channel
+            channel.readToEnd()
+            assertIs<ArticleNotFoundException>(channel.closedCause?.cause, "closed with: ${channel.closedCause.chain()}")
+        }
+    }
+
+    /**
      * A consume that has what it wants closes the channel and returns: the writer, held up in a
      * flush by the megabyte nobody reads, then finds the channel closed, which is not the stream
      * failing.
@@ -322,13 +354,13 @@ class EncryptedStreamTest {
                 } catch (_: IOException) {
                 }
 
-                val outcome = try {
-                    "returned ${stream.read(buffer, 0, buffer.size)}"
-                } catch (e: IOException) {
-                    e
-                }
-                if (outcome !is Throwable) fail("read past the missing article $outcome")
-                assertTrue(outcome.chain().any { it is ArticleNotFoundException }, "threw: ${outcome.chain()}")
+                // The download's failure itself, as streaming a plain file throws it.
+                val outcome = outcomeOf { stream.read(buffer, 0, buffer.size) }
+                if (outcome !is Throwable) fail("read past the missing article: returned $outcome")
+                assertIs<ArticleNotFoundException>(outcome, "threw: ${outcome.chain()}")
+                val byteOutcome = outcomeOf { stream.read() }
+                if (byteOutcome !is Throwable) fail("read a byte past the missing article: returned $byteOutcome")
+                assertIs<ArticleNotFoundException>(byteOutcome, "threw: ${byteOutcome.chain()}")
             } finally {
                 stream.close()
             }
