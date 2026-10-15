@@ -11,11 +11,13 @@ import io.skjaere.compressionutils.Rar5Crypto
 import io.skjaere.compressionutils.SplitEncryptionInfo
 import io.skjaere.compressionutils.SplitInfo
 import io.skjaere.nntp.ArticleNotFoundException
+import io.skjaere.nntp.NntpConnectionException
 import io.skjaere.nntp.YencHeaders
 import io.skjaere.nzbstreamer.config.NntpConfig
 import io.skjaere.nzbstreamer.nzb.NzbDocument
 import io.skjaere.nzbstreamer.nzb.NzbFile
 import io.skjaere.nzbstreamer.nzb.NzbSegment
+import io.skjaere.nzbstreamer.queue.SegmentQueueService
 import io.skjaere.nzbstreamer.seekable.NntpSeekableInputStream
 import io.skjaere.nzbstreamer.stream.ArchiveStreamingService
 import io.skjaere.nzbstreamer.stream.NamedSplits
@@ -126,17 +128,30 @@ class EncryptedStreamTest {
         password = password,
     )
 
-    /** Serves the archive's segments but [missing]; [answer] runs before each answer and may block. */
-    private fun server(missing: Int? = null, archive: ByteArray = this.archive, answer: (Int) -> Unit = {}) = FakeNntpServer(body = { id ->
-        val i = id.removePrefix("<seg").substringBefore('@').toInt()
-        answer(i)
-        if (i == missing) {
-            null
-        } else {
-            val slice = archive.copyOfRange(i * segmentSize, minOf(archive.size, (i + 1) * segmentSize))
-            YencEncoder.encodeSinglePart(slice, "release.part1.rar").data
-        }
-    }).also { servers += it }
+    /**
+     * Serves the archive's segments but [missing]; the connection drops partway through [dropped]'s
+     * body each time it is asked for. [answer] runs before each answer and may block.
+     */
+    private fun server(
+        missing: Int? = null,
+        archive: ByteArray = this.archive,
+        dropped: Int? = null,
+        answer: (Int) -> Unit = {},
+    ) = FakeNntpServer(
+        body = { id ->
+            val i = id.segment()
+            answer(i)
+            if (i == missing) {
+                null
+            } else {
+                val slice = archive.copyOfRange(i * segmentSize, minOf(archive.size, (i + 1) * segmentSize))
+                YencEncoder.encodeSinglePart(slice, "release.part1.rar").data
+            }
+        },
+        dropAfter = { id -> 2_000.takeIf { id.segment() == dropped } },
+    ).also { servers += it }
+
+    private fun String.segment() = removePrefix("<seg").substringBefore('@').toInt()
 
     private fun service(server: FakeNntpServer) = NntpStreamingService(
         NntpConfig("127.0.0.1", server.port, "", "", useTls = false, maxConnections = 4)
@@ -289,6 +304,23 @@ class EncryptedStreamTest {
             val channel = startStream(service).channel
             channel.readToEnd()
             assertIs<ArticleNotFoundException>(channel.closedCause?.cause, "closed with: ${channel.closedCause.chain()}")
+        }
+    }
+
+    /** Any failure, not only a missing article: a dropped connection reaches callers as from a plain file. */
+    @Test
+    fun `a connection that drops in an encrypted file reaches callers as in a plain file`() = runBlocking<Unit> {
+        val dropped = segmentOf(blockStart + 16 + blocks(headerSize.toInt()) + 20_000)
+        service(server(dropped = dropped)).use { service ->
+            val plain = runCatching {
+                service.streamSegments(SegmentQueueService.createFileQueue(nzb().files.single(), 0, 0L), name = "plain") { it.readToEnd() }
+            }.exceptionOrNull()
+            val encrypted = runCatching {
+                ArchiveStreamingService(service)
+                    .streamFile(nzb(), NamedSplits(listOf(split), plaintext.size.toLong(), "video.mkv")) { it.readToEnd() }
+            }.exceptionOrNull()
+            assertTrue(plain.chain().any { it is NntpConnectionException }, "plain: ${plain.chain()}")
+            assertEquals(plain?.javaClass, encrypted?.javaClass, "encrypted: ${encrypted.chain()}, plain: ${plain.chain()}")
         }
     }
 
