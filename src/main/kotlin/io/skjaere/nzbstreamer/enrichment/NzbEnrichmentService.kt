@@ -22,6 +22,7 @@ import kotlinx.coroutines.sync.Semaphore
 import io.skjaere.compressionutils.Par2Parser
 import org.slf4j.LoggerFactory
 import java.io.IOException
+import java.util.concurrent.ConcurrentHashMap
 import kotlin.math.min
 
 class NzbEnrichmentService(
@@ -66,31 +67,55 @@ class NzbEnrichmentService(
         }
     }
 
+    /**
+     * Fetches the first article of each file of [nzb] that prepare needs to open the release (see
+     * [ReleaseFiles]: its archive volumes, or its content when it has none, and the PAR2 index),
+     * then downloads the PAR2 index. The enriched NZB holds those files, but for any left out: a
+     * file the release opens without (a PAR2 file, another episode's video or archive set) that
+     * lacks its first article, which is logged. A file it needs that lacks it is MissingArticles.
+     */
     suspend fun enrich(nzb: NzbDocument): EnrichmentResult {
         val sample = Timer.start(registry)
+        val release = ReleaseFiles(nzb.files)
+        val lacking = ConcurrentHashMap<Int, ArticleNotFoundException>()
         try {
             coroutineScope {
-                nzb.files.map { file ->
+                release.toFetch.map { i ->
                     async {
-                        withTimedPermit { enrichFile(file) }
+                        withTimedPermit {
+                            try {
+                                enrichFile(nzb.files[i])
+                            } catch (e: ArticleNotFoundException) {
+                                if (!release.mayLack(i)) throw e
+                                lacking[i] = e
+                            }
+                        }
                     }
                 }.awaitAll()
             }
+            release.needed(lacking.keys)?.let { throw lacking.getValue(it) }
         } catch (@Suppress("TooGenericExceptionCaught") e: Exception) {
             rethrowCancellation(e)
             classifyEnrichmentFailure(e, phase = "enrichment")?.let { return it }
             throw e
         }
 
-        val enrichedCount = nzb.files.count { it.yencHeaders != null }
-        logger.debug("Enriched {} of {} files", enrichedCount, nzb.files.size)
+        val leftOut = release.leftOut(lacking.keys)
+        if (leftOut.isNotEmpty()) {
+            logger.warn(
+                "Leaving out {} file(s) the release opens without, as they or their archive set lack a first article: {}",
+                leftOut.size, leftOut.sorted().joinToString { release.nameOf(it) },
+            )
+        }
+        val files = release.toFetch.filterNot { it in leftOut }.map { nzb.files[it] }
+        logger.debug("Enriched {} of {} files", files.size, nzb.files.size)
 
         // After enrichment, download the base PAR2 file (contains recovery set metadata).
         // Skip .volXXX+YYY.par2 recovery volume files — they contain recovery blocks
         // and can be very large (tens of MB each), causing OOM if loaded into memory.
         try {
             coroutineScope {
-                nzb.files
+                files
                     .filter { file ->
                         val first16kb = file.first16kb ?: return@filter false
                         Par2Parser.isPar2(first16kb) && Par2Parser.hasFileDescriptions(first16kb)
@@ -108,8 +133,8 @@ class NzbEnrichmentService(
         }
 
         sample.stop(enrichmentTimer)
-        enrichmentFiles.increment(nzb.files.size.toDouble())
-        return EnrichmentResult.Success(nzb)
+        enrichmentFiles.increment(release.toFetch.size.toDouble())
+        return EnrichmentResult.Success(NzbDocument(files, nzb.password))
     }
 
     /**
@@ -170,11 +195,23 @@ class NzbEnrichmentService(
         logger.debug("Enriched file: {}", file.yencHeaders?.name)
     }
 
+    /**
+     * Downloads the PAR2 index [file] into its par2Data. One that lacks an article is left without:
+     * it only names obfuscated volumes, and the release opens without it.
+     */
     private suspend fun downloadPar2(file: NzbFile) {
         logger.debug("Downloading PAR2 file: {}", file.yencHeaders?.name)
         val queue = SegmentQueueService.createFileQueue(file, 0, 0L)
-        streamingService.streamSegments(queue, name = "par2:${file.yencHeaders?.name}") { channel ->
-            file.par2Data = channel.toByteArray()
+        try {
+            streamingService.streamSegments(queue, name = "par2:${file.yencHeaders?.name}") { channel ->
+                file.par2Data = channel.toByteArray()
+            }
+        } catch (@Suppress("TooGenericExceptionCaught") e: Exception) {
+            rethrowCancellation(e)
+            val missing = e.firstCauseOfType<ArticleNotFoundException>() ?: throw e
+            file.par2Data = null
+            logger.warn("Going on without PAR2 file {}, which lacks an article: {}", file.yencHeaders?.name, missing.message)
+            return
         }
         logger.debug("Downloaded PAR2 file: {} ({} bytes)", file.yencHeaders?.name, file.par2Data?.size)
     }
