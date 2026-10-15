@@ -568,6 +568,11 @@ class NntpStreamingService(
                 breaker?.releasePermission()
             }
             throw e
+        } catch (e: Throwable) {
+            // Anything else (the pool closed under us, an error from the caller's block) says
+            // nothing the breaker records, but the permit must go back all the same.
+            breaker?.releasePermission()
+            throw e
         }
     }
 
@@ -1022,8 +1027,9 @@ class NntpStreamingService(
         // missing", which downstream (NzbImportService, NzbFileResource) treats as
         // DMCA/retention drop and blocklists the NZB or skips it silently.
         var firstTimeout: TimeoutCancellationException? = null
-        val data = snapshot.withIndex().firstNotNullOfOrNull { (index, entry) ->
-            val breaker = if (breakerActive) circuitBreakerFor(entry) else null
+        var anyAttempted = false
+        suspend fun fetchFromPools(useBreakers: Boolean): ByteArray? = snapshot.withIndex().firstNotNullOfOrNull { (index, entry) ->
+            val breaker = if (useBreakers) circuitBreakerFor(entry) else null
             if (breaker != null && !breaker.tryAcquirePermission()) {
                 logger.debug(
                     "Segment <{}> skipping pool[{}] ({}:{}) — circuit breaker is {}",
@@ -1032,106 +1038,22 @@ class NntpStreamingService(
                 segmentsFallback.increment()
                 return@firstNotNullOfOrNull null
             }
-            val callStart = System.nanoTime()
-            try {
-                var result: ByteArray? = null
-                withTimeout(timeoutMs.milliseconds) {
-                    entry.pool.bodyYenc("<$articleId>", NntpPriority.STREAMING.value).collect { event ->
-                        if (event is YencEvent.Body) {
-                            result = event.data.toByteArray()
-                        }
-                    }
-                }
-                val payload = result
-                if (payload != null) {
-                    breaker?.onResult(
-                        System.nanoTime() - callStart,
-                        java.util.concurrent.TimeUnit.NANOSECONDS,
-                        payload,
-                    )
-                    if (index > 0) {
-                        logger.debug("Segment <{}> served by fallback pool[{}]", articleId, index)
-                    }
-                }
-                payload
-            } catch (e: ArticleNotFoundException) {
-                // Clean 430 — server told us the article is gone. That's not a pool
-                // health signal, so release the permit without recording it.
-                breaker?.releasePermission()
-                if (index < snapshot.size - 1) {
-                    logger.debug(
-                        "Segment <{}> not found on pool[{}] ({}:{}), trying pool[{}]",
-                        articleId, index, entry.config.host, entry.config.port, index + 1
-                    )
-                    segmentsFallback.increment()
-                }
-                null
-            } catch (e: TimeoutCancellationException) {
-                val poolName = "${entry.config.host}:${entry.config.port}"
-                breaker?.onError(
-                    System.nanoTime() - callStart,
-                    java.util.concurrent.TimeUnit.NANOSECONDS,
-                    e,
-                )
+            anyAttempted = true
+            fetchFromPool(articleId, entry, index, snapshot.size, breaker, timeoutMs) { e ->
                 if (firstTimeout == null) firstTimeout = e
-                // Count every per-pool timeout, regardless of whether a later pool
-                // succeeded. Useful as its own rate panel even with the body-duration
-                // fix below — easier to alert on "rate(timeouts) > N/min" than on a
-                // percentile drift.
-                registry.counter("nzb.segments.body_timeouts", "pool.name", poolName).increment()
-                // Also record the *timeout duration* into the same nntp.body.duration
-                // histogram NntpConnection writes successes to. The connection-side
-                // timer is never stopped on cancellation, so the upper tail of slow
-                // upstreams used to be invisible in percentile dashboards. Now a 9s
-                // timeout shows up at 9s in the histogram — the BODY transfer duration
-                // panel's p99 finally reflects the actual user-facing tail.
-                bodyDurationTimerFor(poolName)
-                    .record(timeoutMs, java.util.concurrent.TimeUnit.MILLISECONDS)
-                if (index < snapshot.size - 1) {
-                    logger.warn(
-                        "Segment <{}> timed out after {}ms on pool[{}] ({}:{}), trying pool[{}]",
-                        articleId, timeoutMs,
-                        index, entry.config.host, entry.config.port, index + 1
-                    )
-                    segmentsFallback.increment()
-                } else {
-                    logger.warn(
-                        "Segment <{}> timed out after {}ms on all {} pool(s)",
-                        articleId, timeoutMs, snapshot.size
-                    )
-                }
-                null
-            } catch (e: NntpException) {
-                breaker?.onError(
-                    System.nanoTime() - callStart,
-                    java.util.concurrent.TimeUnit.NANOSECONDS,
-                    e,
-                )
-                if (index < snapshot.size - 1) {
-                    logger.warn(
-                        "Segment <{}> NNTP error on pool[{}] ({}:{}) — {}: {}",
-                        articleId, index, entry.config.host, entry.config.port,
-                        e::class.simpleName, e.message
-                    )
-                    segmentsFallback.increment()
-                }
-                null
-            } catch (e: IOException) {
-                breaker?.onError(
-                    System.nanoTime() - callStart,
-                    java.util.concurrent.TimeUnit.NANOSECONDS,
-                    e,
-                )
-                if (index < snapshot.size - 1) {
-                    logger.warn(
-                        "Segment <{}> I/O error on pool[{}] ({}:{}) — {}: {}",
-                        articleId, index, entry.config.host, entry.config.port,
-                        e::class.simpleName, e.message
-                    )
-                    segmentsFallback.increment()
-                }
-                null
             }
+        }
+        // Every pool refused a permit (a probe race, or each HALF_OPEN breaker's one permit
+        // taken): as in withFallback, try anyway rather than call the article missing.
+        val data = fetchFromPools(breakerActive) ?: if (breakerActive && !anyAttempted) {
+            logger.warn(
+                "Segment <{}>: every pool refused the breaker permit (likely HALF_OPEN with permit taken) — " +
+                    "retrying with breakers disabled",
+                articleId,
+            )
+            fetchFromPools(useBreakers = false)
+        } else {
+            null
         }
 
         sample.stop(segmentDownloadTimer)
@@ -1143,6 +1065,132 @@ class NntpStreamingService(
         segmentsFailed.increment()
         firstTimeout?.let { throw it }
         throw ArticleNotFoundException("Article <$articleId> not found on any pool")
+    }
+
+    /**
+     * One attempt at [articleId] on [entry]'s pool, reporting to [breaker] (if any) how it went.
+     * Returns null to move on to the next pool; a timeout also goes to [onTimeout].
+     */
+    @Suppress("LongParameterList", "LongMethod")
+    private suspend fun fetchFromPool(
+        articleId: String,
+        entry: PoolEntry,
+        index: Int,
+        poolCount: Int,
+        breaker: CircuitBreaker?,
+        timeoutMs: Long,
+        onTimeout: (TimeoutCancellationException) -> Unit,
+    ): ByteArray? {
+        val callStart = System.nanoTime()
+        // Set once the breaker has heard how the call went. Any other way out (cancelled as the
+        // reader seeks or stops, the pool closed, an error no arm below expects) hands the permit
+        // back in the finally: a HALF_OPEN breaker has one, and if it's kept, the breaker stays
+        // half-open with none and this pool is skipped until the process restarts.
+        var settled = false
+        return try {
+            var result: ByteArray? = null
+            withTimeout(timeoutMs.milliseconds) {
+                entry.pool.bodyYenc("<$articleId>", NntpPriority.STREAMING.value).collect { event ->
+                    if (event is YencEvent.Body) {
+                        result = event.data.toByteArray()
+                    }
+                }
+            }
+            val payload = result
+            if (payload != null) {
+                breaker?.onResult(
+                    System.nanoTime() - callStart,
+                    java.util.concurrent.TimeUnit.NANOSECONDS,
+                    payload,
+                )
+                settled = true
+                if (index > 0) {
+                    logger.debug("Segment <{}> served by fallback pool[{}]", articleId, index)
+                }
+            }
+            payload
+        } catch (e: ArticleNotFoundException) {
+            // Clean 430 — server told us the article is gone. That's not a pool
+            // health signal, so the finally releases the permit without recording it.
+            if (index < poolCount - 1) {
+                logger.debug(
+                    "Segment <{}> not found on pool[{}] ({}:{}), trying pool[{}]",
+                    articleId, index, entry.config.host, entry.config.port, index + 1
+                )
+                segmentsFallback.increment()
+            }
+            null
+        } catch (e: TimeoutCancellationException) {
+            val poolName = "${entry.config.host}:${entry.config.port}"
+            breaker?.onError(
+                System.nanoTime() - callStart,
+                java.util.concurrent.TimeUnit.NANOSECONDS,
+                e,
+            )
+            settled = true
+            onTimeout(e)
+            // Count every per-pool timeout, regardless of whether a later pool
+            // succeeded. Useful as its own rate panel even with the body-duration
+            // fix below — easier to alert on "rate(timeouts) > N/min" than on a
+            // percentile drift.
+            registry.counter("nzb.segments.body_timeouts", "pool.name", poolName).increment()
+            // Also record the *timeout duration* into the same nntp.body.duration
+            // histogram NntpConnection writes successes to. The connection-side
+            // timer is never stopped on cancellation, so the upper tail of slow
+            // upstreams used to be invisible in percentile dashboards. Now a 9s
+            // timeout shows up at 9s in the histogram — the BODY transfer duration
+            // panel's p99 finally reflects the actual user-facing tail.
+            bodyDurationTimerFor(poolName)
+                .record(timeoutMs, java.util.concurrent.TimeUnit.MILLISECONDS)
+            if (index < poolCount - 1) {
+                logger.warn(
+                    "Segment <{}> timed out after {}ms on pool[{}] ({}:{}), trying pool[{}]",
+                    articleId, timeoutMs,
+                    index, entry.config.host, entry.config.port, index + 1
+                )
+                segmentsFallback.increment()
+            } else {
+                logger.warn(
+                    "Segment <{}> timed out after {}ms on all {} pool(s)",
+                    articleId, timeoutMs, poolCount
+                )
+            }
+            null
+        } catch (e: NntpException) {
+            breaker?.onError(
+                System.nanoTime() - callStart,
+                java.util.concurrent.TimeUnit.NANOSECONDS,
+                e,
+            )
+            settled = true
+            if (index < poolCount - 1) {
+                logger.warn(
+                    "Segment <{}> NNTP error on pool[{}] ({}:{}) — {}: {}",
+                    articleId, index, entry.config.host, entry.config.port,
+                    e::class.simpleName, e.message
+                )
+                segmentsFallback.increment()
+            }
+            null
+        } catch (e: IOException) {
+            breaker?.onError(
+                System.nanoTime() - callStart,
+                java.util.concurrent.TimeUnit.NANOSECONDS,
+                e,
+            )
+            settled = true
+            if (index < poolCount - 1) {
+                logger.warn(
+                    "Segment <{}> I/O error on pool[{}] ({}:{}) — {}: {}",
+                    articleId, index, entry.config.host, entry.config.port,
+                    e::class.simpleName, e.message
+                )
+                segmentsFallback.increment()
+            }
+            null
+        } finally {
+            if (!settled) breaker?.releasePermission()
+        }
     }
 
     override fun close() {
