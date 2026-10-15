@@ -347,7 +347,8 @@ class NntpStreamingService(
             username = config.username.ifEmpty { null },
             password = config.password.ifEmpty { null },
             maxConnections = config.maxConnections,
-            scope = scope
+            scope = scope,
+            verifyHostname = config.verifyHostname
         )
     }
 

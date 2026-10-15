@@ -297,6 +297,8 @@ class NzbStreamer private constructor(
         var password: String = ""
         var useTls: Boolean = true
         var maxConnections: Int = 8
+        /** See [NntpConfig.verifyHostname]. */
+        var verifyHostname: Boolean = true
 
         internal fun toConfig(): NntpConfig = NntpConfig(
             host = host,
@@ -304,7 +306,8 @@ class NzbStreamer private constructor(
             username = username,
             password = password,
             useTls = useTls,
-            maxConnections = maxConnections
+            maxConnections = maxConnections,
+            verifyHostname = verifyHostname
         )
     }
 
@@ -374,6 +377,7 @@ class NzbStreamer private constructor(
                         password = config.password
                         useTls = config.useTls
                         maxConnections = config.maxConnections
+                        verifyHostname = config.verifyHostname
                     }
                 }
                 prepare { verifySegments = prepareConfig.verifySegments }

@@ -10,7 +10,13 @@ data class NntpConfig(
     val password: String,
     val useTls: Boolean,
     val maxConnections: Int = 8,
-    val priority: Int = 0
+    val priority: Int = 0,
+    /**
+     * With [useTls], check that the server's certificate names [host] and send [host] as the
+     * server name (SNI). Turn off only for a server reached by an address its certificate
+     * doesn't list; the certificate must still be trusted.
+     */
+    val verifyHostname: Boolean = true
 )
 
 data class StreamingConfig(
