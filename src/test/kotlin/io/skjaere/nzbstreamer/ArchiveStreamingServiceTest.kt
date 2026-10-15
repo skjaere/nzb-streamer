@@ -537,5 +537,23 @@ class ArchiveStreamingServiceTest {
             assertEquals(1, splits.size)
             assertEquals(SplitInfo(1, 1300, 1500), splits[0])
         }
+
+        @Test
+        fun `an offset past the start volume's end starts the file in the volume it falls in`() {
+            // A 7z entry's offset is into the volumes laid end to end, from volume 0.
+            val nzb = archiveNzb(1000, 1000, 1000)
+            fun sevenZip(offset: Long, size: Long) = StreamableFile("e.mkv", size, 0, offset, 0, 0)
+
+            assertEquals(listOf(SplitInfo(1, 1500, 500), SplitInfo(2, 2000, 700)), sevenZip(1500, 1200).toSplits(nzb))
+            assertEquals(listOf(SplitInfo(1, 1000, 1000), SplitInfo(2, 2000, 200)), sevenZip(1000, 1200).toSplits(nzb))
+            assertEquals(listOf(SplitInfo(2, 2900, 100)), sevenZip(2900, 100).toSplits(nzb))
+        }
+
+        @Test
+        fun `a start volume past the archive's volumes gives no splits`() {
+            val file = StreamableFile("file.bin", 100, startVolumeIndex = 5, startOffsetInVolume = 0, continuationHeaderSize = 0, endOfArchiveSize = 0)
+
+            assertEquals(emptyList(), file.toSplits(archiveNzb(1000, 1000, 1000)))
+        }
     }
 }
