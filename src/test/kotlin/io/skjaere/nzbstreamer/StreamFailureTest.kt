@@ -25,6 +25,7 @@ import java.io.ByteArrayOutputStream
 import java.io.IOException
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
@@ -190,6 +191,27 @@ class StreamFailureTest {
             val ended = withTimeoutOrNull(2_000) { writer.channel.readToEnd() }
             assertTrue(ended != null, "the failure waited for the download in flight")
             assertTrue(ended.second.isMissingArticle(), "closed with: ${ended.second}")
+        }
+    }
+
+    /**
+     * One dropped connection is a passing failure: the segment is fetched again on another
+     * connection, and the reader gets every byte, each once.
+     */
+    @Test
+    fun `an article whose connection drops once mid-body is fetched again and the stream is whole`() = runBlocking<Unit> {
+        val dropped = 3
+        val drops = AtomicInteger()
+        val provider = FakeNntpServer(
+            body = { id -> YencEncoder.encodeSinglePart(segments[id.segment()], "data.bin").data },
+            dropAfter = { id -> 2_000.takeIf { id.segment() == dropped && drops.getAndIncrement() == 0 } },
+        ).also { servers += it }
+        service(provider).use { service ->
+            val writer = startStream(service)
+            val (received, cause) = writer.channel.readToEnd()
+            assertEquals(null, cause, "the stream ended with: $cause")
+            assertContentEquals(segments.reduce { a, b -> a + b }, received)
+            assertEquals(2, provider.bodiesRead.count { it.segment() == dropped }, "the article should have been asked for again")
         }
     }
 

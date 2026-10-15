@@ -1167,9 +1167,16 @@ class NntpStreamingService(
         return try {
             var result: ByteArray? = null
             withTimeout(timeoutMs.milliseconds) {
-                entry.pool.bodyYenc("<$articleId>", NntpPriority.STREAMING.value).collect { event ->
-                    if (event is YencEvent.Body) {
-                        result = event.data.toByteArray()
+                // Read inside withClient, not through pool.bodyYenc: there a connection that drops
+                // mid-article fails only the Body channel's reader, outside withClient, and the
+                // segment fails. Read here, the failure is withClient's, and the pool fetches the
+                // article again on another connection (its command retry). Nothing is handed on
+                // before the whole segment is read, so no byte is delivered twice.
+                entry.pool.withClient(NntpPriority.STREAMING.value) { client ->
+                    client.bodyYenc("<$articleId>").collect { event ->
+                        if (event is YencEvent.Body) {
+                            result = event.data.toByteArray()
+                        }
                     }
                 }
             }
