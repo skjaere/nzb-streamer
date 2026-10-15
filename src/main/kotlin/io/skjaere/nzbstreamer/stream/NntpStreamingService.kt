@@ -8,6 +8,7 @@ import io.github.resilience4j.micrometer.tagged.TaggedCircuitBreakerMetrics
 import io.ktor.network.selector.SelectorManager
 import io.ktor.utils.io.ByteReadChannel
 import io.ktor.utils.io.WriterJob
+import io.ktor.utils.io.cancel
 import io.ktor.utils.io.toByteArray
 import io.ktor.utils.io.writeFully
 import io.ktor.utils.io.writer
@@ -1019,8 +1020,8 @@ class NntpStreamingService(
      * Uses structured concurrency via [coroutineScope] — a segment download's failure is thrown
      * from here once [consume] returns or fails (the channel closes with it when the writer gets
      * to that segment), and cancellation of the caller cancels all in-flight downloads automatically.
-     * A [consume] that has what it wants may close the channel ([ByteReadChannel.cancel]) and
-     * return: the writer stops, and nothing that fails after that is thrown from here.
+     * A [consume] that has what it wants may return, closing the channel ([ByteReadChannel.cancel])
+     * or not: the writer stops, and nothing that fails after that is thrown from here.
      *
      * A segment that no pool delivers within the segment fetch timeout fails like any other, with a
      * [SegmentTimeoutException]; parts of a file its NZB lists no article for
@@ -1037,12 +1038,18 @@ class NntpStreamingService(
         activeStreams.incrementAndGet()
         val failure = java.util.concurrent.atomic.AtomicReference<Throwable?>()
         try {
-            coroutineScope {
+            val early = coroutineScope {
                 val writerJob = launchStreamSegments(queue, concurrency, readAheadSegments, bitrate, name) {
                     failure.compareAndSet(null, it)
                 }
                 try {
                     consume(writerJob.channel)
+                    // What failed before consume returned: the early end it may have taken for the
+                    // end (the writer records a failure before closing the channel with it). What
+                    // fails from here on, it didn't wait for. Cancelling the writer doesn't stop a
+                    // failure already on its way to it, so the channel is closed first: the writer
+                    // then finds it closed and records nothing.
+                    failure.get().also { writerJob.channel.cancel() }
                 } catch (e: CancellationException) {
                     throw e
                 } catch (e: Exception) {
@@ -1053,7 +1060,7 @@ class NntpStreamingService(
                 }
             }
             // consume may have taken the early end of the data for its end.
-            failure.get()?.let { throw it }
+            early?.let { throw it }
         } finally {
             activeStreams.decrementAndGet()
             releaseBitrateState(name)

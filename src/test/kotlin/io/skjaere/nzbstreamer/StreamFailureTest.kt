@@ -48,6 +48,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.withTimeoutOrNull
+import kotlinx.coroutines.yield
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.Test
 
@@ -314,6 +315,34 @@ class StreamFailureTest {
                     channel.cancel()
                 }
             }
+        }
+    }
+
+    /**
+     * A consume that has what it wants may also just return, leaving the channel open. A download
+     * that fails just then is not the stream failing either: consume didn't wait for it. Cancelling
+     * the writer doesn't stop a failure already on its way to it (a coroutine resumed with an
+     * exception gets it even when cancelled).
+     */
+    @Test
+    fun `streamSegments returns normally when consume returns as a download fails`() = runBlocking<Unit> {
+        val registry = SimpleMeterRegistry()
+        Metrics.addRegistry(registry)
+        try {
+            // The missing article says so once the reader has everything in front of it.
+            service(server(held = setOf(missing))).use { service ->
+                withTimeout(30_000) {
+                    service.streamSegments(queue(), concurrency = 4, readAheadSegments = 6, name = "test") { channel ->
+                        channel.readFully(ByteArray(beforeGap.size))
+                        gates[missing].countDown()
+                        // This thread runs the downloads, the writer and consume, in turn. Once the
+                        // download has failed, the writer is queued with its failure, behind consume.
+                        while (registry.counter("nzb.segments.failed").count() == 0.0) yield()
+                    }
+                }
+            }
+        } finally {
+            Metrics.removeRegistry(registry)
         }
     }
 

@@ -5,6 +5,8 @@ import io.ktor.utils.io.WriterJob
 import io.ktor.utils.io.cancel
 import io.ktor.utils.io.readAvailable
 import io.ktor.utils.io.readFully
+import io.micrometer.core.instrument.Metrics
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry
 import io.skjaere.compressionutils.Rar5Crypto
 import io.skjaere.compressionutils.SplitEncryptionInfo
 import io.skjaere.compressionutils.SplitInfo
@@ -49,6 +51,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.withTimeoutOrNull
+import kotlinx.coroutines.yield
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.Test
 
@@ -310,6 +313,40 @@ class EncryptedStreamTest {
                         channel.cancel()
                     }
             }
+        }
+    }
+
+    /**
+     * A consume that has what it wants may also just return, leaving the channel open. A download
+     * that fails just then is not the stream failing either: consume didn't wait for it. Cancelling
+     * the writer doesn't stop a failure already on its way to it (a coroutine resumed with an
+     * exception gets it even when cancelled).
+     */
+    @Test
+    fun `streamFile returns normally when consume returns as an encrypted file's download fails`() = runBlocking<Unit> {
+        val registry = SimpleMeterRegistry()
+        Metrics.addRegistry(registry)
+        try {
+            // The first article only the third chunk needs is missing, and says so once the reader
+            // has the first two: the download then waits at it, and the decrypting writer for it.
+            val missing = segmentOfPlaintext(2 * chunk) + 1
+            service(server(missing, longArchive, answer = { if (it == missing) gate.await(60, TimeUnit.SECONDS) })).use { service ->
+                withTimeout(30_000) {
+                    ArchiveStreamingService(service)
+                        .streamFile(nzb(longArchive), NamedSplits(listOf(longSplit), long.size.toLong(), "video.mkv")) { channel ->
+                            channel.readFully(ByteArray(2 * chunk))
+                            gate.countDown()
+                            // This thread runs the downloads, both writers and consume, in turn. Once
+                            // the download has failed, its writer is queued with the failure; a turn
+                            // on, that writer has closed the decrypting writer's source with it, and
+                            // the decrypting writer is queued behind consume.
+                            while (registry.counter("nzb.segments.failed").count() == 0.0) yield()
+                            yield()
+                        }
+                }
+            }
+        } finally {
+            Metrics.removeRegistry(registry)
         }
     }
 

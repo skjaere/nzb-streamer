@@ -181,10 +181,14 @@ class ArchiveStreamingService(
         consume: suspend (ByteReadChannel) -> Unit,
     ) {
         val failure = AtomicReference<Throwable?>()
-        coroutineScope {
+        val early = coroutineScope {
             val writerJob = launchEncryptedFileWriter(archiveNzb, splits, name) { failure.compareAndSet(null, it) }
             try {
                 consume(writerJob.channel)
+                // As in NntpStreamingService.streamSegments: what failed before consume returned is
+                // the early end it may have taken for the end; what fails from here on, it didn't
+                // wait for, and the closed channel keeps the writer from recording it.
+                failure.get().also { writerJob.channel.cancel() }
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
@@ -195,7 +199,7 @@ class ArchiveStreamingService(
             }
         }
         // consume may have taken the early end of the data for its end.
-        failure.get()?.let { throw it }
+        early?.let { throw it }
     }
 
     /**
