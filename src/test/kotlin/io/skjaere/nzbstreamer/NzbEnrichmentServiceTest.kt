@@ -10,6 +10,11 @@ import io.skjaere.nzbstreamer.nzb.NzbFile
 import io.skjaere.nzbstreamer.nzb.NzbSegment
 import io.skjaere.nzbstreamer.stream.NntpStreamingService
 import io.skjaere.yenc.RapidYenc
+import io.skjaere.yenc.YencEncoder
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import org.junit.jupiter.api.Test
 import java.io.BufferedReader
@@ -19,11 +24,14 @@ import java.net.ServerSocket
 import java.net.SocketException
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.test.assertEquals
 import kotlin.test.assertIs
 import kotlin.test.assertNotNull
 import kotlin.test.assertNull
+import kotlin.test.assertSame
 import kotlin.test.assertTrue
 
 class NzbEnrichmentServiceTest {
@@ -172,6 +180,54 @@ class NzbEnrichmentServiceTest {
                 assertIs<EnrichmentResult.Failure>(result)
                 assertIs<NntpConnectionException>(result.cause)
                 assertTrue("closed" in result.message, result.message)
+            }
+        }
+    }
+
+    /**
+     * A coroutine whose sibling fails is cancelled with that failure as its cancellation's cause.
+     * An NNTP failure there is someone else's: the caller is cancelled and gets no result.
+     */
+    @Test
+    fun `enrich rethrows its caller's cancellation even when the cause is an NNTP failure`() = runBlocking<Unit> {
+        for (siblingFailure in listOf(
+            ArticleNotFoundException("another release's article"),
+            NntpConnectionException("another provider dropped"),
+        )) {
+            val asked = CompletableDeferred<Unit>()
+            val answer = CountDownLatch(1)
+            val server = FakeNntpServer(body = {
+                asked.complete(Unit)
+                answer.await(10, TimeUnit.SECONDS)
+                YencEncoder.encodeSinglePart("content".toByteArray(), "file.rar").data
+            })
+            server.use {
+                createStreamingService(server.port).use { streamingService ->
+                    val enrichmentService = NzbEnrichmentService(streamingService)
+                    var returned: EnrichmentResult? = null
+                    var thrown: Throwable? = null
+                    val failure = runCatching {
+                        coroutineScope {
+                            launch {
+                                try {
+                                    returned = enrichmentService.enrich(createNzb("article@test"))
+                                } catch (e: Throwable) {
+                                    thrown = e
+                                    throw e
+                                }
+                            }
+                            // Fails while enrich waits for its BODY, then lets the server answer.
+                            launch {
+                                asked.await()
+                                answer.countDown()
+                                throw siblingFailure
+                            }
+                        }
+                    }.exceptionOrNull()
+                    assertSame(siblingFailure, failure)
+                    assertNull(returned, "a cancelled enrich returned ${returned?.let { it::class.simpleName }}")
+                    assertIs<CancellationException>(thrown)
+                }
             }
         }
     }

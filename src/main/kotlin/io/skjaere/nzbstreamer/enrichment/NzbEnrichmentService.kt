@@ -12,9 +12,12 @@ import io.skjaere.nzbstreamer.nzb.NzbFile
 import io.skjaere.nzbstreamer.queue.SegmentQueueService
 import io.skjaere.nzbstreamer.stream.NntpPriority
 import io.skjaere.nzbstreamer.stream.NntpStreamingService
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.sync.Semaphore
 import io.skjaere.compressionutils.Par2Parser
 import org.slf4j.LoggerFactory
@@ -73,6 +76,7 @@ class NzbEnrichmentService(
                 }.awaitAll()
             }
         } catch (@Suppress("TooGenericExceptionCaught") e: Exception) {
+            rethrowCancellation(e)
             classifyEnrichmentFailure(e, phase = "enrichment")?.let { return it }
             throw e
         }
@@ -97,6 +101,7 @@ class NzbEnrichmentService(
                     }.awaitAll()
             }
         } catch (@Suppress("TooGenericExceptionCaught") e: Exception) {
+            rethrowCancellation(e)
             classifyEnrichmentFailure(e, phase = "PAR2 download")?.let { return it }
             throw e
         }
@@ -104,6 +109,16 @@ class NzbEnrichmentService(
         sample.stop(enrichmentTimer)
         enrichmentFiles.increment(nzb.files.size.toDouble())
         return EnrichmentResult.Success(nzb)
+    }
+
+    /**
+     * Throws the caller's cancellation, and any other, rather than let it be classified: a
+     * cancellation's cause may be an NNTP failure that isn't this NZB's (a sibling's that cancelled
+     * the caller), and a cancelled caller's scope throws its children's failures in its place.
+     */
+    private suspend fun rethrowCancellation(e: Exception) {
+        currentCoroutineContext().ensureActive()
+        if (e is CancellationException) throw e
     }
 
     /**
