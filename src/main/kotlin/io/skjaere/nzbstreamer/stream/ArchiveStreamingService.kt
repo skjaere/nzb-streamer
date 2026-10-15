@@ -131,6 +131,15 @@ class ArchiveStreamingService(
         streamingService.streamSegments(combinedQueue, name = namedSplits.name, consume = consume)
     }
 
+    /**
+     * Starts streaming the file (or [range] of it) and returns at once with the [WriterJob] whose
+     * channel delivers it. The writer runs as a child of the calling coroutine's job: cancelling
+     * that job (or [WriterJob.job], or the channel) stops it, and that job doesn't complete until
+     * the writer has. A failure (an article no provider has, a timeout) never fails the caller's
+     * job: the channel closes with it as its cause ([ByteReadChannel.closedCause]) once everything
+     * in front of it has been written. Ktor drops the bytes the reader hasn't taken yet when a
+     * channel closes with a cause.
+     */
     suspend fun launchStreamFile(
         archiveNzb: NzbDocument,
         namedSplits: NamedSplits,
@@ -189,27 +198,31 @@ class ArchiveStreamingService(
             ?: error("Encrypted RAR5 archive but NzbDocument has no password metadata (file=$name)")
         val callerScope = CoroutineScope(currentCoroutineContext())
         return callerScope.writer(autoFlush = false) {
-            val seekableStream = NntpSeekableInputStream(archiveNzb, streamingService)
-            try {
-                for (split in splits) {
-                    val enc = checkNotNull(split.encryption) {
-                        "encrypted-streaming path got an unencrypted split (file=$name, split=$split)"
+            // A scoped coroutine: a failure in here is thrown to the writer, which closes the
+            // channel with it, instead of failing the caller's job.
+            coroutineScope {
+                val seekableStream = NntpSeekableInputStream(archiveNzb, streamingService)
+                try {
+                    for (split in splits) {
+                        val enc = checkNotNull(split.encryption) {
+                            "encrypted-streaming path got an unencrypted split (file=$name, split=$split)"
+                        }
+                        val key = deriveKeyCached(password, enc.salt, enc.kdfIterationsLog2)
+                        Rar5DataAreaDecryptor(key).streamDataAreaPlaintext(
+                            sourceStream = seekableStream,
+                            blockIvPosition = split.dataStartPosition,
+                            plaintextHeaderSize = enc.plaintextHeaderSize,
+                            dataAreaPlaintextOffset = enc.dataAreaPlaintextOffset,
+                            length = split.dataSize,
+                            dataAreaIv = enc.dataAreaIv,
+                        ) { buf, off, len ->
+                            // ktor's writeFully takes (startIndex, endIndex), not (offset, length).
+                            channel.writeFully(buf, off, off + len)
+                        }
                     }
-                    val key = deriveKeyCached(password, enc.salt, enc.kdfIterationsLog2)
-                    Rar5DataAreaDecryptor(key).streamDataAreaPlaintext(
-                        sourceStream = seekableStream,
-                        blockIvPosition = split.dataStartPosition,
-                        plaintextHeaderSize = enc.plaintextHeaderSize,
-                        dataAreaPlaintextOffset = enc.dataAreaPlaintextOffset,
-                        length = split.dataSize,
-                        dataAreaIv = enc.dataAreaIv,
-                    ) { buf, off, len ->
-                        // ktor's writeFully takes (startIndex, endIndex), not (offset, length).
-                        channel.writeFully(buf, off, off + len)
-                    }
+                } finally {
+                    seekableStream.close()
                 }
-            } finally {
-                seekableStream.close()
             }
         }
     }
@@ -368,6 +381,7 @@ class ArchiveStreamingService(
         streamFile(archiveNzb, namedSplits, range, consume = consume)
     }
 
+    /** Starts streaming [file]; see the [NamedSplits] overload for the writer's lifetime and failures. */
     suspend fun launchStreamFile(
         archiveNzb: NzbDocument,
         file: StreamableFile,

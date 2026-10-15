@@ -119,6 +119,15 @@ class NzbStreamer private constructor(
         archiveStreamingService.streamFile(metadata.orderedArchiveNzb, namedSplits, range, consume = consume)
     }
 
+    /**
+     * Starts streaming the file (or [range] of it) and returns at once with the [WriterJob] whose
+     * channel delivers it. The writer runs as a child of the calling coroutine's job: cancelling
+     * that job (or [WriterJob.job], or the channel) stops it, and that job doesn't complete until
+     * the writer has, so call this from a coroutine that outlives the reading. A failure (an
+     * article no provider has, a timeout) never fails the caller's job: the channel closes with it
+     * as its cause ([ByteReadChannel.closedCause]) once everything in front of it has been
+     * written. Ktor drops the bytes the reader hasn't taken yet when a channel closes with a cause.
+     */
     suspend fun launchStreamFile(
         metadata: ExtractedMetadata,
         namedSplits: NamedSplits,
@@ -186,6 +195,7 @@ class NzbStreamer private constructor(
         archiveStreamingService.streamFile(nzbDocument, file, range, streamName, consume)
     }
 
+    /** Starts streaming [file]; see the [NamedSplits] overload for the writer's lifetime and failures. */
     suspend fun launchStreamFile(
         metadata: ExtractedMetadata,
         file: StreamableFile,
@@ -195,6 +205,7 @@ class NzbStreamer private constructor(
         return archiveStreamingService.launchStreamFile(metadata.orderedArchiveNzb, file, range, streamName)
     }
 
+    /** Starts streaming [file]; see the [NamedSplits] overload for the writer's lifetime and failures. */
     suspend fun launchStreamFile(
         nzbDocument: NzbDocument,
         file: StreamableFile,

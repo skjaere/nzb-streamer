@@ -34,6 +34,8 @@ import kotlinx.coroutines.channels.ReceiveChannel
 import kotlinx.coroutines.channels.consumeEach
 import kotlinx.coroutines.channels.produce
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.supervisorScope
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.isActive
@@ -835,9 +837,9 @@ class NntpStreamingService(
 
     /**
      * Streams segments concurrently and passes the resulting [ByteReadChannel] to [consume].
-     * Uses structured concurrency via [coroutineScope] — exceptions from segment downloads
-     * propagate directly to the caller, and cancellation of the caller cancels all in-flight
-     * downloads automatically.
+     * Uses structured concurrency via [coroutineScope] — a segment download's failure is thrown
+     * from here once [consume] returns or fails (the channel closes with it when the writer gets
+     * to that segment), and cancellation of the caller cancels all in-flight downloads automatically.
      */
     suspend fun streamSegments(
         queue: Flow<SegmentQueueItem>,
@@ -848,15 +850,23 @@ class NntpStreamingService(
     ) {
         val bitrate = acquireBitrateState(name)
         activeStreams.incrementAndGet()
+        val failure = java.util.concurrent.atomic.AtomicReference<Throwable?>()
         try {
             coroutineScope {
-                val writerJob = launchStreamSegments(queue, concurrency, readAheadSegments, bitrate, name)
+                val writerJob = launchStreamSegments(queue, concurrency, readAheadSegments, bitrate, name, failure::set)
                 try {
                     consume(writerJob.channel)
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    // Most likely the channel closing with the download's failure: throw that.
+                    throw failure.get() ?: e
                 } finally {
                     writerJob.job.cancel()
                 }
             }
+            // consume may have taken the early end of the data for its end.
+            failure.get()?.let { throw it }
         } finally {
             activeStreams.decrementAndGet()
             releaseBitrateState(name)
@@ -864,8 +874,15 @@ class NntpStreamingService(
     }
 
     /**
-     * Launches segment streaming as a child of the caller's coroutine scope, returning a [WriterJob]
-     * whose channel can be read independently. The caller manages the job's lifecycle.
+     * Starts streaming the segments of [queue] and returns at once with the [WriterJob] whose
+     * channel delivers them.
+     *
+     * The writer runs as a child of the calling coroutine's job: cancelling that job (or
+     * [WriterJob.job], or the channel) stops it, and that job doesn't complete until the writer
+     * has. A failure (an article no provider has, a timeout) never fails the caller's job: the
+     * writer writes everything in front of the failing segment, then closes the channel with the
+     * failure as its cause ([ByteReadChannel.closedCause]). Ktor drops the bytes the reader hasn't
+     * taken yet when a channel closes with a cause.
      */
     suspend fun launchStreamSegments(
         queue: Flow<SegmentQueueItem>,
@@ -879,98 +896,129 @@ class NntpStreamingService(
         return writerJob
     }
 
+    /**
+     * [onFailure] gets the writer's failure (not its cancellation) before the channel closes with it.
+     */
+    @Suppress("LongParameterList")
     private suspend fun launchStreamSegments(
         queue: Flow<SegmentQueueItem>,
         concurrency: Int,
         readAheadSegments: Int,
         bitrate: BitrateState,
         name: String,
+        onFailure: (Throwable) -> Unit = {},
     ): WriterJob {
         val callerScope = CoroutineScope(currentCoroutineContext())
         return callerScope.writer(autoFlush = false) {
-            // Phase timestamps for the FIRST item only. Logged at INFO when the first
-            // byte hits the output channel, so each stream startup leaves exactly one
-            // structured trace line. Lets us localize stall causes without a thread dump:
-            //   t0           = writer entry
-            //   tResolved    = first item emitted by the queue Flow
-            //   tToList      = queue.toList() finished (entire item list realized)
-            //   tFirstAcq    = first downloadSemaphore.acquire() returned
-            //   tFirstAsync  = first async{} launched
-            //   tFirstSend   = first send(item to deferred) returned
-            //   tFirstRecv   = first consumeEach iteration received its pair
-            //   tFirstAwait  = first deferred.await() returned (download complete)
-            //   tFirstWrite  = first channel.writeFully() returned
-            val t0 = System.nanoTime()
-            var tResolved = 0L
-            var tFirstAcq = 0L
-            var tFirstAsync = 0L
-            var tFirstSend = 0L
-            var tFirstRecv = 0L
-            var tFirstAwait = 0L
-            var firstArticleId: String? = null
+            try {
+                // A scoped coroutine: a failure in here is thrown to the writer, which closes the
+                // channel with it, instead of failing the caller's job.
+                coroutineScope {
+                    // Phase timestamps for the FIRST item only. Logged at INFO when the first
+                    // byte hits the output channel, so each stream startup leaves exactly one
+                    // structured trace line. Lets us localize stall causes without a thread dump:
+                    //   t0           = writer entry
+                    //   tResolved    = first item emitted by the queue Flow
+                    //   tToList      = queue.toList() finished (entire item list realized)
+                    //   tFirstAcq    = first downloadSemaphore.acquire() returned
+                    //   tFirstAsync  = first async{} launched
+                    //   tFirstSend   = first send(item to deferred) returned
+                    //   tFirstRecv   = first consumeEach iteration received its pair
+                    //   tFirstAwait  = first deferred.await() returned (download complete)
+                    //   tFirstWrite  = first channel.writeFully() returned
+                    val t0 = System.nanoTime()
+                    var tResolved = 0L
+                    var tFirstAcq = 0L
+                    var tFirstAsync = 0L
+                    var tFirstSend = 0L
+                    var tFirstRecv = 0L
+                    var tFirstAwait = 0L
+                    var firstArticleId: String? = null
 
-            val resolveSample = Timer.start(registry)
-            var firstResolved = false
-            val items = queue.onEach {
-                if (!firstResolved) {
-                    resolveSample.stop(firstArticleResolvedTimer)
-                    tResolved = System.nanoTime()
-                    firstResolved = true
-                }
-            }.toList()
-            val tToList = System.nanoTime()
-            if (items.isEmpty()) return@writer
+                    val resolveSample = Timer.start(registry)
+                    var firstResolved = false
+                    val items = queue.onEach {
+                        if (!firstResolved) {
+                            resolveSample.stop(firstArticleResolvedTimer)
+                            tResolved = System.nanoTime()
+                            firstResolved = true
+                        }
+                    }.toList()
+                    val tToList = System.nanoTime()
+                    if (items.isEmpty()) return@coroutineScope
 
-            val downloadSemaphore = Semaphore(concurrency)
+                    val downloadSemaphore = Semaphore(concurrency)
 
-            @OptIn(ExperimentalCoroutinesApi::class)
-            produce(capacity = readAheadSegments) {
-                items.forEachIndexed { index, item ->
-                    downloadSemaphore.acquire()
-                    if (index == 0) {
-                        tFirstAcq = System.nanoTime()
-                        firstArticleId = item.segment.articleId
-                    }
-                    val deferred = async {
-                        try {
-                            downloadSegment(item.segment.articleId)
-                        } finally {
-                            downloadSemaphore.release()
+                    // The read-ahead downloads are children of a supervisor: one that fails (an
+                    // article no provider has) cancels neither the others nor the writer. Its
+                    // failure is thrown when the writer gets to it and awaits it, after everything
+                    // in front of it has been written.
+                    supervisorScope {
+                        @OptIn(ExperimentalCoroutinesApi::class)
+                        produce(capacity = readAheadSegments) {
+                            items.forEachIndexed { index, item ->
+                                downloadSemaphore.acquire()
+                                if (index == 0) {
+                                    tFirstAcq = System.nanoTime()
+                                    firstArticleId = item.segment.articleId
+                                }
+                                val deferred = this@supervisorScope.async {
+                                    try {
+                                        downloadSegment(item.segment.articleId)
+                                    } finally {
+                                        downloadSemaphore.release()
+                                    }
+                                }
+                                if (index == 0) tFirstAsync = System.nanoTime()
+                                send(item to deferred)
+                                if (index == 0) tFirstSend = System.nanoTime()
+                            }
+                        }.consumeEach { (item, deferred) ->
+                            if (tFirstRecv == 0L) tFirstRecv = System.nanoTime()
+                            val data = try {
+                                deferred.await()
+                            } catch (e: Throwable) {
+                                // Close the channel with it at once: the downloads still in flight
+                                // are cancelled and cleaned up before it leaves this scope.
+                                if (e !is CancellationException) onFailure(e)
+                                channel.cancel(e)
+                                throw e
+                            }
+                            if (tFirstAwait == 0L) tFirstAwait = System.nanoTime()
+
+                            val start = minOf(item.readStart.toInt(), data.size)
+                            val end = minOf(item.readEnd.toInt(), data.size)
+                            if (end > start) {
+                                val written = (end - start).toLong()
+                                channel.writeFully(data, start, end)
+                                // Hand each segment to the reader as it's written, not once 1 MB
+                                // has piled up: what a failure further on would otherwise drop.
+                                channel.flush()
+                                bitrate.addBytes(written)
+                                // One-shot startup trace on first successful write. Subsequent writes
+                                // are sustained-throughput and the bitrate gauge already covers them.
+                                if (tFirstAwait != 0L && firstArticleId != null) {
+                                    val tFirstWrite = System.nanoTime()
+                                    val ms = { ns: Long -> if (ns == 0L) -1L else (ns - t0) / 1_000_000 }
+                                    logger.info(
+                                        "Stream startup trace [{}] articleId={}: " +
+                                            "resolved={}ms toList={}ms acquire={}ms async={}ms " +
+                                            "send={}ms recv={}ms await={}ms write={}ms " +
+                                            "(items={}, concurrency={}, readAhead={})",
+                                        name, firstArticleId,
+                                        ms(tResolved), ms(tToList), ms(tFirstAcq), ms(tFirstAsync),
+                                        ms(tFirstSend), ms(tFirstRecv), ms(tFirstAwait), ms(tFirstWrite),
+                                        items.size, concurrency, readAheadSegments,
+                                    )
+                                    firstArticleId = null
+                                }
+                            }
                         }
                     }
-                    if (index == 0) tFirstAsync = System.nanoTime()
-                    send(item to deferred)
-                    if (index == 0) tFirstSend = System.nanoTime()
                 }
-            }.consumeEach { (item, deferred) ->
-                if (tFirstRecv == 0L) tFirstRecv = System.nanoTime()
-                val data = deferred.await()
-                if (tFirstAwait == 0L) tFirstAwait = System.nanoTime()
-
-                val start = minOf(item.readStart.toInt(), data.size)
-                val end = minOf(item.readEnd.toInt(), data.size)
-                if (end > start) {
-                    val written = (end - start).toLong()
-                    channel.writeFully(data, start, end)
-                    bitrate.addBytes(written)
-                    // One-shot startup trace on first successful write. Subsequent writes
-                    // are sustained-throughput and the bitrate gauge already covers them.
-                    if (tFirstAwait != 0L && firstArticleId != null) {
-                        val tFirstWrite = System.nanoTime()
-                        val ms = { ns: Long -> if (ns == 0L) -1L else (ns - t0) / 1_000_000 }
-                        logger.info(
-                            "Stream startup trace [{}] articleId={}: " +
-                                "resolved={}ms toList={}ms acquire={}ms async={}ms " +
-                                "send={}ms recv={}ms await={}ms write={}ms " +
-                                "(items={}, concurrency={}, readAhead={})",
-                            name, firstArticleId,
-                            ms(tResolved), ms(tToList), ms(tFirstAcq), ms(tFirstAsync),
-                            ms(tFirstSend), ms(tFirstRecv), ms(tFirstAwait), ms(tFirstWrite),
-                            items.size, concurrency, readAheadSegments,
-                        )
-                        firstArticleId = null
-                    }
-                }
+            } catch (e: Throwable) {
+                if (e !is CancellationException) onFailure(e)
+                throw e
             }
         }
     }
