@@ -459,10 +459,11 @@ class NntpStreamingService(
      *    should be retried elsewhere)
      *  - [NntpConnectionException] / [IOException] (transient network failure to
      *    this pool — exhausted by the inner pool's `.retry()` budget already)
+     *  - [NntpAuthenticationException] (this pool's login was rejected: an expired
+     *    account, or too many connections on it; the pool throws it at once, and
+     *    another provider's account may well serve the call)
      *
      * Not caught (propagated directly):
-     *  - [NntpAuthenticationException] — credentials problem, every pool would
-     *    likely fail the same way; fail loudly so the operator notices.
      *  - [kotlinx.coroutines.CancellationException] — structured-concurrency
      *    cancellation, not our exception to swallow.
      *
@@ -558,11 +559,6 @@ class NntpStreamingService(
                 Unit,
             )
             result
-        } catch (e: io.skjaere.nntp.NntpAuthenticationException) {
-            // Credentials issue — every pool would fail the same way. Release
-            // the permit without recording, then rethrow so the operator sees it.
-            breaker?.releasePermission()
-            throw e
         } catch (e: ArticleNotFoundException) {
             // Clean 430 — the pool is healthy, the article just isn't there.
             breaker?.releasePermission()
@@ -576,6 +572,8 @@ class NntpStreamingService(
             }
             null
         } catch (e: io.skjaere.nntp.NntpException) {
+            // A rejected login (NntpAuthenticationException) lands here too: it is this pool's
+            // account that fails, and it counts against this pool's breaker like any other failure.
             breaker?.onError(
                 System.nanoTime() - callStart,
                 java.util.concurrent.TimeUnit.NANOSECONDS,

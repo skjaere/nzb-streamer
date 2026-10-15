@@ -20,8 +20,9 @@ import kotlin.concurrent.thread
  * an article, the connection drops after that many bytes of its body, as a provider's can; when
  * [dropOnStat] is true for an id, the connection drops instead of answering its STAT, and when
  * [statError] gives a status line for an id, that line answers its STAT. [login] takes the user and
- * password of an AUTHINFO login (true: 281, false: 481). [quit] runs before a QUIT is answered and
- * may block.
+ * password of an AUTHINFO login (true: 281, false: 481); when [loginError] gives a status line for
+ * a user, that line answers its AUTHINFO PASS instead (e.g. 502 for too many connections). [quit]
+ * runs before a QUIT is answered and may block.
  */
 class FakeNntpServer(
     private val stat: (id: String) -> Boolean = { false },
@@ -30,6 +31,7 @@ class FakeNntpServer(
     private val dropOnStat: (id: String) -> Boolean = { false },
     private val statError: (id: String) -> String? = { null },
     private val login: (user: String, password: String) -> Boolean = { _, _ -> true },
+    private val loginError: (user: String) -> String? = { null },
     private val quit: () -> Unit = {},
 ) : Closeable {
     private val server = ServerSocket(0, 50, InetAddress.getLoopbackAddress())
@@ -78,7 +80,10 @@ class FakeNntpServer(
                             user = value
                             out.line("381 Password required")
                         }
-                        "PASS" -> out.line(if (login(user, value)) "281 Authentication accepted" else "481 Authentication failed")
+                        "PASS" -> out.line(
+                            loginError(user)
+                                ?: if (login(user, value)) "281 Authentication accepted" else "481 Authentication failed"
+                        )
                         else -> out.line("501 Syntax error")
                     }
                 }
