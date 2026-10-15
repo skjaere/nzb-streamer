@@ -69,7 +69,11 @@ class NntpStreamingService(
 ) : Closeable {
     constructor(config: NntpConfig) : this(listOf(config))
 
-    private data class PoolEntry(val config: NntpConfig, val pool: NntpClientPool)
+    /**
+     * [name] is the pool's identity: it keys its circuit breaker and tags its metrics (see
+     * [nameFor]), so two accounts on one server don't share either.
+     */
+    private data class PoolEntry(val config: NntpConfig, val pool: NntpClientPool, val name: String)
 
     private val scope = CoroutineScope(SupervisorJob())
     private val logger = LoggerFactory.getLogger(NntpStreamingService::class.java)
@@ -78,7 +82,7 @@ class NntpStreamingService(
     private val poolLock = ReentrantReadWriteLock()
 
     /**
-     * Per-pool circuit breaker. Each pool gets a CircuitBreaker named `host:port`,
+     * Per-pool circuit breaker. Each pool gets a CircuitBreaker named after the pool ([PoolEntry.name]),
      * sharing the same config (count-based sliding window, threshold + cooldown
      * from [StreamingConfig]). Failures that count: timeouts, IOExceptions, and
      * NntpException family — anything we can't blame on a clean server 430.
@@ -143,7 +147,7 @@ class NntpStreamingService(
 
     private fun circuitBreakerFor(entry: PoolEntry): CircuitBreaker =
         circuitBreakerRegistry.circuitBreaker(
-            "${entry.config.host}:${entry.config.port}",
+            entry.name,
             buildCircuitBreakerConfig(currentCircuitBreakerFailureThreshold, currentCircuitBreakerCooldownMs),
         )
 
@@ -332,15 +336,31 @@ class NntpStreamingService(
     suspend fun connect() {
         selectorManager = SelectorManager(EmptyCoroutineContext)
         initialConfigs.forEachIndexed { index, config ->
-            pools.add(PoolEntry(config, createPool(config)))
+            pools.add(createPool(config))
             logger.info(
-                "NNTP pool[{}] initialized: {}:{} maxConnections={}",
-                index, config.host, config.port, config.maxConnections
+                "NNTP pool[{}] initialized: {} maxConnections={}",
+                index, pools.last().name, config.maxConnections
             )
         }
     }
 
-    private fun createPool(config: NntpConfig): NntpClientPool {
+    /**
+     * A name for a new pool on [config]'s server, unique among [pools]: `host:port`, or
+     * `host:port#2`, `#3`, ... for further pools on the same server (a second account, or one
+     * provider listed twice). A pool keeps its name; one that is removed frees it.
+     */
+    private fun nameFor(config: NntpConfig): String {
+        val server = "${config.host}:${config.port}"
+        val taken = pools.map { it.name }.toSet()
+        return generateSequence(1) { it + 1 }.map { if (it == 1) server else "$server#$it" }.first { it !in taken }
+    }
+
+    private fun createPool(config: NntpConfig): PoolEntry {
+        val name = nameFor(config)
+        return PoolEntry(config, newPool(config, name), name)
+    }
+
+    private fun newPool(config: NntpConfig, name: String): NntpClientPool {
         return NntpClientPool(
             host = config.host,
             port = config.port,
@@ -350,32 +370,43 @@ class NntpStreamingService(
             password = config.password.ifEmpty { null },
             maxConnections = config.maxConnections,
             scope = scope,
-            verifyHostname = config.verifyHostname
+            verifyHostname = config.verifyHostname,
+            name = name
         )
     }
 
+    /**
+     * Adds a pool for [config]. Another account on a server that already has a pool gets a pool
+     * of its own; the same config twice is refused, as [removePool] tells pools apart by config.
+     */
     fun addPool(config: NntpConfig) {
         poolLock.write {
-            require(pools.none { it.config.host == config.host && it.config.port == config.port }) {
-                "Pool already exists for ${config.host}:${config.port}"
+            require(pools.none { it.config == config }) {
+                "Pool already exists for this config of ${config.host}:${config.port}"
             }
-            pools.add(PoolEntry(config, createPool(config)))
+            val entry = createPool(config)
+            pools.add(entry)
             logger.info(
-                "NNTP pool added at runtime: {}:{} maxConnections={} (total pools: {})",
-                config.host, config.port, config.maxConnections, pools.size
+                "NNTP pool added at runtime: {} maxConnections={} (total pools: {})",
+                entry.name, config.maxConnections, pools.size
             )
         }
     }
 
+    /**
+     * Closes and removes the pool for [config], and its circuit breaker: a pool added later under
+     * the same name starts with a closed one.
+     */
     fun removePool(config: NntpConfig) {
         poolLock.write {
             val index = pools.indexOfFirst { it.config == config }
             require(index >= 0) { "No pool found for ${config.host}:${config.port}" }
             val entry = pools.removeAt(index)
             entry.pool.close()
+            circuitBreakerRegistry.remove(entry.name)
             logger.info(
-                "NNTP pool removed at runtime: {}:{} (total pools: {})",
-                config.host, config.port, pools.size
+                "NNTP pool removed at runtime: {} (total pools: {})",
+                entry.name, pools.size
             )
         }
     }
@@ -1315,7 +1346,7 @@ class NntpStreamingService(
             }
             null
         } catch (e: TimeoutCancellationException) {
-            val poolName = "${entry.config.host}:${entry.config.port}"
+            val poolName = entry.name
             breaker?.onError(
                 System.nanoTime() - callStart,
                 java.util.concurrent.TimeUnit.NANOSECONDS,
