@@ -1177,8 +1177,9 @@ class NntpStreamingService(
                             }
                             if (tFirstAwait == 0L) tFirstAwait = System.nanoTime()
 
-                            val start = minOf(item.readStart.toInt(), data.size)
-                            val end = minOf(item.readEnd.toInt(), data.size)
+                            // Clamped as Longs: an item sized past 2 GiB would wrap as an Int.
+                            val start = minOf(item.readStart, data.size.toLong()).toInt()
+                            val end = minOf(item.readEnd, data.size.toLong()).toInt()
                             if (end > start) {
                                 val written = (end - start).toLong()
                                 channel.writeFully(data, start, end)
