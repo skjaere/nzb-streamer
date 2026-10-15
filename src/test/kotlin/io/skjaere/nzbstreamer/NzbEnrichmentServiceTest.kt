@@ -90,7 +90,7 @@ class NzbEnrichmentServiceTest {
     }
 
     @Test
-    fun `enrich returns Success when all files enriched`() = runBlocking {
+    fun `enrich returns Success when all files enriched`() = runBlocking<Unit> {
         val data = "test file content".toByteArray()
         val server = startServer { reader, out ->
             val cmd = reader.readLine() // BODY <article1@test>
@@ -115,7 +115,7 @@ class NzbEnrichmentServiceTest {
     }
 
     @Test
-    fun `enrich returns MissingArticles when server responds 430`() = runBlocking {
+    fun `enrich returns MissingArticles when server responds 430`() = runBlocking<Unit> {
         val server = startServer { reader, out ->
             reader.readLine() // BODY command
             out.write("430 No Such Article Found\r\n".toByteArray())
@@ -136,12 +136,30 @@ class NzbEnrichmentServiceTest {
         }
     }
 
+    /**
+     * Greets every client and closes the connection at once. Accepting only one client would
+     * leave the pool's retry connecting to a socket nobody serves, and the test would pass on
+     * the pool's 30 s acquire timeout instead of the dropped connection.
+     */
+    private fun startClosingServer(): ServerSocket {
+        val server = ServerSocket(0)
+        Thread {
+            while (!server.isClosed) {
+                val client = try {
+                    server.accept()
+                } catch (_: SocketException) {
+                    return@Thread
+                }
+                client.use { it.getOutputStream().run { write("200 welcome\r\n".toByteArray()); flush() } }
+            }
+        }.start()
+        return server
+    }
+
     @Test
-    fun `enrich returns Failure on NNTP connection error`() = runBlocking {
-        // Server immediately closes the connection after welcome, causing a connection error
-        val server = startServer { _, _ ->
-            // Don't read or respond - just exit, closing the socket
-        }
+    fun `enrich returns Failure on NNTP connection error`() = runBlocking<Unit> {
+        // Server closes every connection right after the welcome, causing a connection error
+        val server = startClosingServer()
 
         server.use {
             val streamingService = createStreamingService(server.localPort)
@@ -153,6 +171,7 @@ class NzbEnrichmentServiceTest {
 
                 assertIs<EnrichmentResult.Failure>(result)
                 assertIs<NntpConnectionException>(result.cause)
+                assertTrue("closed" in result.message, result.message)
             }
         }
     }
@@ -189,7 +208,7 @@ class NzbEnrichmentServiceTest {
     }
 
     @Test
-    fun `enrich returns MissingArticles when second file has missing article`() = runBlocking {
+    fun `enrich returns MissingArticles when second file has missing article`() = runBlocking<Unit> {
         val data1 = "content of file 1".toByteArray()
         val server = startServer { reader, out ->
             // First file succeeds

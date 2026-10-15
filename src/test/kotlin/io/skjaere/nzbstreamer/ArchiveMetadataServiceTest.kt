@@ -95,7 +95,7 @@ class ArchiveMetadataServiceTest {
      * never at Success, regardless of how many files are in the underlying NZB.
      */
     @Test
-    fun `prepare returns MissingArticles when server responds 430 to all BODY requests`() = runBlocking {
+    fun `prepare returns MissingArticles when server responds 430 to all BODY requests`() = runBlocking<Unit> {
         val server = startServer { reader, out ->
             while (true) {
                 val line = reader.readLine() ?: break
