@@ -7,15 +7,20 @@ import io.skjaere.compressionutils.ArchiveService
 import io.skjaere.compressionutils.ListFilesResult
 import io.skjaere.compressionutils.Par2Parser
 import io.skjaere.compressionutils.VolumeMetaData
+import io.skjaere.nntp.ArticleNotFoundException
+import io.skjaere.nntp.NntpException
 import io.skjaere.nzbstreamer.config.PrepareConfig
 import io.skjaere.nzbstreamer.enrichment.EnrichmentResult
 import io.skjaere.nzbstreamer.enrichment.NzbEnrichmentService
 import io.skjaere.nzbstreamer.enrichment.VerificationResult
 import io.skjaere.nzbstreamer.enrichment.VerificationService
+import io.skjaere.nzbstreamer.enrichment.firstCauseOfType
+import io.skjaere.nzbstreamer.enrichment.rethrowCancellation
 import io.skjaere.nzbstreamer.nzb.NzbDocument
 import io.skjaere.nzbstreamer.seekable.SegmentRandomAccessStream
 import io.skjaere.nzbstreamer.stream.NntpStreamingService
 import org.slf4j.LoggerFactory
+import java.io.IOException
 
 class ArchiveMetadataService(
     private val streamingService: NntpStreamingService,
@@ -45,6 +50,12 @@ class ArchiveMetadataService(
         return result
     }
 
+    /**
+     * Enriches [nzb] and reads its archive's headers. An article no provider has, an NNTP failure
+     * (a dropped connection, a timeout) and an archive the parser can't read come back as
+     * [PrepareResult.MissingArticles] or [PrepareResult.Failure], with the exception as the cause,
+     * not thrown; the caller's cancellation is thrown.
+     */
     suspend fun prepare(nzb: NzbDocument): PrepareResult {
         val sample = Timer.start(registry)
         try {
@@ -77,7 +88,13 @@ class ArchiveMetadataService(
                             )
                         )
                     } else {
-                        when (val mr = extractMetadata(enrichedNzb)) {
+                        val mr = try {
+                            extractMetadata(enrichedNzb)
+                        } catch (@Suppress("TooGenericExceptionCaught") e: Exception) {
+                            rethrowCancellation(e)
+                            return classifyHeaderWalkFailure(e) ?: throw e
+                        }
+                        when (mr) {
                             is MetadataResult.Success -> PrepareResult.Success(mr.metadata)
                             is MetadataResult.Encrypted -> PrepareResult.Encrypted(
                                 message = "Archive '${mr.info.archiveName ?: "<unknown>"}' is " +
@@ -97,6 +114,23 @@ class ArchiveMetadataService(
         } finally {
             sample.stop(prepareTimer)
         }
+    }
+
+    /**
+     * What a failure while reading the archive's headers means for the release, as enrichment
+     * classifies its own: an article no provider has is [PrepareResult.MissingArticles]; an NNTP
+     * failure (a connection that dropped, a timeout) or an archive the parser can't read
+     * ([io.skjaere.compressionutils.MalformedRarArchiveException], its other IOExceptions) is a
+     * [PrepareResult.Failure] with [e] as the cause. Null for anything else, a bug, which is thrown.
+     */
+    private fun classifyHeaderWalkFailure(e: Exception): PrepareResult? {
+        e.firstCauseOfType<ArticleNotFoundException>()?.let { cause ->
+            logger.warn("Article not found while reading the archive headers: {}", cause.message)
+            return PrepareResult.MissingArticles(cause.message ?: "Article not found", e)
+        }
+        val cause = e.firstCauseOfType<NntpException>() ?: e.firstCauseOfType<IOException>() ?: return null
+        logger.warn("Reading the archive headers failed: {}", cause.toString(), e)
+        return PrepareResult.Failure(cause.message ?: cause.toString(), e)
     }
 
     suspend fun extractMetadata(nzb: NzbDocument): MetadataResult {

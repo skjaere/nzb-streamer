@@ -21,6 +21,7 @@ import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.sync.Semaphore
 import io.skjaere.compressionutils.Par2Parser
 import org.slf4j.LoggerFactory
+import java.io.IOException
 import kotlin.math.min
 
 class NzbEnrichmentService(
@@ -112,16 +113,6 @@ class NzbEnrichmentService(
     }
 
     /**
-     * Throws the caller's cancellation, and any other, rather than let it be classified: a
-     * cancellation's cause may be an NNTP failure that isn't this NZB's (a sibling's that cancelled
-     * the caller), and a cancelled caller's scope throws its children's failures in its place.
-     */
-    private suspend fun rethrowCancellation(e: Exception) {
-        currentCoroutineContext().ensureActive()
-        if (e is CancellationException) throw e
-    }
-
-    /**
      * Classifies an exception thrown from a per-file fan-out as either a missing-article
      * condition or a generic NNTP failure, returning the corresponding [EnrichmentResult].
      *
@@ -132,8 +123,11 @@ class NzbEnrichmentService(
      * check would miss the wrapper and propagate up, where it gets logged at ERROR with
      * a stack trace and shipped to GlitchTip as if it were an application bug.
      *
-     * Returns null for exceptions that don't carry an NntpException anywhere in the
-     * cause chain — those are genuinely unexpected and the caller propagates.
+     * A connection that drops can surface as a plain [IOException] (Ktor's EOFException when the
+     * socket closes mid-answer), with no NntpException in its chain: that is a failure too.
+     *
+     * Returns null for exceptions that carry neither an NntpException nor an IOException
+     * anywhere in the cause chain — those are genuinely unexpected and the caller propagates.
      */
     private fun classifyEnrichmentFailure(e: Throwable, phase: String): EnrichmentResult? {
         e.firstCauseOfType<ArticleNotFoundException>()?.let { cause ->
@@ -150,15 +144,12 @@ class NzbEnrichmentService(
                 e,
             )
         }
-        return null
-    }
-
-    private inline fun <reified T : Throwable> Throwable.firstCauseOfType(): T? {
-        var current: Throwable? = this
-        val seen = mutableSetOf<Throwable>()
-        while (current != null && seen.add(current)) {
-            if (current is T) return current
-            current = current.cause
+        e.firstCauseOfType<IOException>()?.let { cause ->
+            logger.error("Connection failure during {}: {}", phase, cause.toString(), e)
+            return EnrichmentResult.Failure(
+                cause.message ?: cause.toString(),
+                e,
+            )
         }
         return null
     }
@@ -187,4 +178,25 @@ class NzbEnrichmentService(
         }
         logger.debug("Downloaded PAR2 file: {} ({} bytes)", file.yencHeaders?.name, file.par2Data?.size)
     }
+}
+
+/**
+ * Throws the caller's cancellation, and any other, rather than let it be classified: a
+ * cancellation's cause may be an NNTP failure that isn't this NZB's (a sibling's that cancelled
+ * the caller), and a cancelled caller's scope throws its children's failures in its place.
+ */
+internal suspend fun rethrowCancellation(e: Exception) {
+    currentCoroutineContext().ensureActive()
+    if (e is CancellationException) throw e
+}
+
+/** The first throwable of type [T] in this one's cause chain, this one included. */
+internal inline fun <reified T : Throwable> Throwable.firstCauseOfType(): T? {
+    var current: Throwable? = this
+    val seen = mutableSetOf<Throwable>()
+    while (current != null && seen.add(current)) {
+        if (current is T) return current
+        current = current.cause
+    }
+    return null
 }
