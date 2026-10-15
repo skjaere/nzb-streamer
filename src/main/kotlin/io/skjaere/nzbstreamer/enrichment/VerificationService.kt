@@ -7,6 +7,7 @@ import io.skjaere.nntp.NntpException
 import io.skjaere.nzbstreamer.nzb.NzbDocument
 import io.skjaere.nzbstreamer.stream.NntpPriority
 import io.skjaere.nzbstreamer.stream.NntpStreamingService
+import io.skjaere.nzbstreamer.stream.StatCheck
 import org.slf4j.LoggerFactory
 
 class VerificationService(
@@ -104,7 +105,7 @@ class VerificationService(
         progress: ((checked: Int, total: Int) -> Unit)?,
     ): VerificationResult {
         // Pipelined STATs across the connections (one round trip per batch, not per article),
-        // stopping at the first article no provider has.
+        // stopping at the first article no provider has or can answer for.
         val check = try {
             streamingService.statUntilMissing(
                 segmentsToVerify.map { it.segment.articleId }, currentConcurrency, priority, progress,
@@ -119,7 +120,8 @@ class VerificationService(
 
         verificationSegments.increment(check.answered.toDouble())
 
-        val missing = check.missing.firstOrNull()?.let { segmentsToVerify[it] } ?: return VerificationResult.Success
+        val missing = check.missing.firstOrNull()?.let { segmentsToVerify[it] }
+            ?: return check.failure?.let { failed(check, segmentsToVerify, it) } ?: VerificationResult.Success
         verificationMissing.increment(1.0)
         // Include position/total/filename so we can see WHERE in the file the
         // first missing segment sits — telling us whether the NZB is broken at
@@ -141,5 +143,19 @@ class VerificationService(
             answeredCount = check.answered,
             totalCount = check.total,
         )
+    }
+
+    /**
+     * No provider could answer for an article (each failed other than with a 430, or the rest said
+     * 430): whether the release is complete is unknown, so the check fails with the [cause].
+     */
+    private fun failed(check: StatCheck, segmentsToVerify: List<SegmentToCheck>, cause: Throwable): VerificationResult {
+        val where = check.unanswered.firstOrNull()?.let { segmentsToVerify[it] }?.let {
+            " for article ${it.segment.articleId} at position ${it.positionInFile}/${it.totalSegmentsInFile} " +
+                "of file '${it.fileName}'"
+        }.orEmpty()
+        val message = "No provider could answer$where: ${cause.message ?: cause}"
+        logger.warn(message)
+        return VerificationResult.Failure(message, cause)
     }
 }

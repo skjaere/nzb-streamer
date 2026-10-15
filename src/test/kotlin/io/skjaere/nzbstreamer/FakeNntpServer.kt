@@ -18,13 +18,17 @@ import kotlin.concurrent.thread
  * yEnc article, or null for 430). Both get the id with its angle brackets and may block, e.g. on a
  * latch, which holds back that connection's later answers too. When [dropAfter] gives a number for
  * an article, the connection drops after that many bytes of its body, as a provider's can; when
- * [dropOnStat] is true for an id, the connection drops instead of answering its STAT.
+ * [dropOnStat] is true for an id, the connection drops instead of answering its STAT, and when
+ * [statError] gives a status line for an id, that line answers its STAT. [login] takes the user and
+ * password of an AUTHINFO login (true: 281, false: 481).
  */
 class FakeNntpServer(
     private val stat: (id: String) -> Boolean = { false },
     private val body: (id: String) -> ByteArray? = { null },
     private val dropAfter: (id: String) -> Int? = { null },
     private val dropOnStat: (id: String) -> Boolean = { false },
+    private val statError: (id: String) -> String? = { null },
+    private val login: (user: String, password: String) -> Boolean = { _, _ -> true },
 ) : Closeable {
     private val server = ServerSocket(0, 50, InetAddress.getLoopbackAddress())
     private val sockets = CopyOnWriteArrayList<Socket>()
@@ -55,6 +59,7 @@ class FakeNntpServer(
         val reader = socket.getInputStream().bufferedReader(Charsets.ISO_8859_1)
         val out = socket.getOutputStream()
         out.line("200 fake server ready")
+        var user = ""
         while (true) {
             val command = reader.readLine() ?: break
             val id = command.substringAfter(' ', "").trim()
@@ -62,7 +67,18 @@ class FakeNntpServer(
                 "STAT" -> {
                     statsRead += id
                     if (dropOnStat(id)) break
-                    out.line(if (stat(id)) "223 0 $id" else "430 No such article")
+                    out.line(statError(id) ?: if (stat(id)) "223 0 $id" else "430 No such article")
+                }
+                "AUTHINFO" -> {
+                    val value = id.substringAfter(' ', "")
+                    when (id.substringBefore(' ').uppercase()) {
+                        "USER" -> {
+                            user = value
+                            out.line("381 Password required")
+                        }
+                        "PASS" -> out.line(if (login(user, value)) "281 Authentication accepted" else "481 Authentication failed")
+                        else -> out.line("501 Syntax error")
+                    }
                 }
                 "BODY" -> {
                     bodiesRead += id

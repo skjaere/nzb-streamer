@@ -17,5 +17,10 @@ sealed interface VerificationResult {
         val totalCount: Int = answeredCount,
     ) : VerificationResult
 
+    /**
+     * The check couldn't tell, e.g. no provider could answer for an article: each failed other
+     * than with a 430 (its login refused, unreachable, its connection dropped) or the rest said
+     * 430. [cause] is the first provider's failure.
+     */
     data class Failure(val message: String, val cause: Throwable) : VerificationResult
 }

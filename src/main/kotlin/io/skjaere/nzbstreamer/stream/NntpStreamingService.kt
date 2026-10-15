@@ -1,5 +1,6 @@
 package io.skjaere.nzbstreamer.stream
 
+import io.github.resilience4j.circuitbreaker.CallNotPermittedException
 import io.github.resilience4j.circuitbreaker.CircuitBreaker
 import io.github.resilience4j.circuitbreaker.CircuitBreakerConfig
 import io.github.resilience4j.circuitbreaker.CircuitBreakerRegistry
@@ -26,6 +27,7 @@ import java.io.IOException
 import java.time.Duration
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.cancel
@@ -623,7 +625,9 @@ class NntpStreamingService(
      * pool is still answering the others.
      *
      * [onProgress] gets (answered, total) as articles get their final answer: found on a pool, or
-     * missing on the last one.
+     * missing on every one. A pool that fails other than with a 430 passes the articles it hasn't
+     * answered on to the next pool, as [statUntilMissing] does; when no pool can answer for an
+     * article, this throws the first pool's failure for it.
      */
     suspend fun statManyAcrossPools(
         articleIds: List<String>,
@@ -631,8 +635,9 @@ class NntpStreamingService(
         priority: NntpPriority = NntpPriority.HEALTH_CHECK,
         onProgress: ((answered: Int, total: Int) -> Unit)? = null,
     ): List<Boolean> {
-        val missing = statPipelinedAcrossPools(articleIds, concurrency, priority, onProgress, stopAtMissing = false)
-            .missing.toSet()
+        val check = statPipelinedAcrossPools(articleIds, concurrency, priority, onProgress, stopAtMissing = false)
+        check.failure?.let { throw it }
+        val missing = check.missing.toSet()
         return articleIds.indices.map { it !in missing }
     }
 
@@ -641,6 +646,13 @@ class NntpStreamingService(
      * availability checks where one missing article settles the answer. The STATs still owed are
      * cancelled, so the pool drains those connections (or discards them if the server is slow to
      * answer), and the ones not sent yet never go out.
+     *
+     * An article is missing only when every pool answered 430 for it. A pool that fails other than
+     * with a 430 (its login refused, unreachable, a connection that drops or times out, an error
+     * answer, the pool closed) is given up on for this check: the articles it hasn't answered go on
+     * to the next pool at once. A pool whose circuit breaker is open is skipped (unless every
+     * pool's is, as in streaming). When no pool can answer for an article, the check stops there
+     * and [StatCheck.failure] says why.
      */
     suspend fun statUntilMissing(
         articleIds: List<String>,
@@ -664,44 +676,65 @@ class NntpStreamingService(
             return StatCheck(missing, missing.size, total)
         }
         val missing = java.util.concurrent.ConcurrentLinkedQueue<Int>()
+        val unanswered = java.util.concurrent.ConcurrentLinkedQueue<Int>()
+        val failure = java.util.concurrent.atomic.AtomicReference<Throwable?>()
         val answered = java.util.concurrent.atomic.AtomicInteger()
         val passedOn = java.util.concurrent.atomic.AtomicIntegerArray(snapshot.size)
         val timer = StatCheckTimer(snapshot)
-        // asks[p]: the articles to ask pool p for. Those it lacks go on to asks[p + 1] as soon as
-        // it says so, and asks[p + 1] closes once pool p has answered everything.
-        val asks = snapshot.map { Channel<Int>(Channel.UNLIMITED) }
-        articleIds.indices.forEach { asks[0].trySend(it) }
+        val skipped = breakerSkips(snapshot)
+        // asks[p]: the articles to ask pool p for. Those it lacks or can't answer go on to
+        // asks[p + 1] as soon as it says so, and asks[p + 1] closes once pool p is done.
+        val asks = snapshot.map { Channel<StatAsk>(Channel.UNLIMITED) }
+        articleIds.indices.forEach { asks[0].trySend(StatAsk(it, failure = null)) }
         asks[0].close()
         try {
             coroutineScope {
                 launch {
                     val check = coroutineContext.job
+                    // Pool p gave no answer for [ask]: [cause] says why, null for a 430.
+                    fun passOn(p: Int, ask: StatAsk, cause: Throwable?) {
+                        val failed = ask.failure ?: cause
+                        when {
+                            p < snapshot.lastIndex -> {
+                                passedOn.incrementAndGet(p)
+                                asks[p + 1].trySend(StatAsk(ask.index, failed))
+                            }
+                            failed == null -> {
+                                missing += ask.index
+                                val done = answered.incrementAndGet()
+                                onProgress?.invoke(done, total)
+                                if (stopAtMissing) check.cancel()
+                            }
+                            else -> {
+                                // The check's answer can only be a failure now.
+                                unanswered += ask.index
+                                failure.compareAndSet(null, failed)
+                                check.cancel()
+                            }
+                        }
+                    }
                     snapshot.forEachIndexed { p, entry ->
                         launch {
-                            askPool(entry, p, asks[p], articleIds, concurrency, priority, timer) { index, result ->
-                                when {
-                                    result is StatResult.Found -> {
+                            val skip = skipped[p]
+                            if (skip != null) {
+                                for (ask in asks[p]) passOn(p, ask, skip)
+                            } else {
+                                askPool(
+                                    entry, p, asks[p], articleIds, concurrency, priority, timer,
+                                    onFailed = { ask, cause -> passOn(p, ask, cause) },
+                                ) { ask, result ->
+                                    if (result is StatResult.Found) {
                                         val done = answered.incrementAndGet()
                                         onProgress?.invoke(done, total)
-                                    }
-                                    // Not a 430: statPipelined throws for it once its batch is done.
-                                    result is StatResult.NotFound && result.code != 430 -> Unit
-                                    p < snapshot.lastIndex -> {
-                                        passedOn.incrementAndGet(p)
-                                        asks[p + 1].trySend(index)
-                                    }
-                                    else -> {
-                                        missing += index
-                                        val done = answered.incrementAndGet()
-                                        onProgress?.invoke(done, total)
-                                        if (stopAtMissing) check.cancel()
+                                    } else {
+                                        passOn(p, ask, cause = null)
                                     }
                                 }
                             }
                             asks.getOrNull(p + 1)?.close()
                             if (passedOn[p] > 0) {
                                 logger.debug(
-                                    "{} of {} articles not on pool[{}] ({}:{}), asked of the next pool",
+                                    "{} of {} articles not answered by pool[{}] ({}:{}), asked of the next pool",
                                     passedOn[p], total, p, entry.config.host, entry.config.port,
                                 )
                             }
@@ -710,37 +743,104 @@ class NntpStreamingService(
                 }
             }
         } finally {
-            timer.log(total, answered.get(), missing.size, stopped = stopAtMissing && missing.isNotEmpty())
+            timer.log(
+                total, answered.get(), missing.size, unanswered.size,
+                stopped = (stopAtMissing && missing.isNotEmpty()) || unanswered.isNotEmpty(),
+            )
         }
-        return StatCheck(missing.toList(), answered.get(), total)
+        return StatCheck(missing.toList(), answered.get(), total, unanswered.toList(), failure.get())
     }
 
     /**
-     * Asks [entry]'s pool for every article [asks] brings (indices into [articleIds]), in
-     * pipelined batches on up to [concurrency] of its connections, until [asks] is closed.
+     * An article on its way through the pools of a [statPipelinedAcrossPools] check: [index] into
+     * the ids, and the first failure of a pool it went through (null while every pool asked so
+     * far answered 430).
+     */
+    private class StatAsk(val index: Int, val failure: Throwable?)
+
+    /**
+     * Per pool, why a STAT check skips it: its circuit breaker is open. Null for a pool to ask.
+     * As in streaming, the breakers only count with more than one pool, and not while every
+     * pool's is open: then there is nothing healthy to protect.
+     */
+    private fun breakerSkips(snapshot: List<PoolEntry>): List<Throwable?> {
+        val breakers = snapshot.map(::circuitBreakerFor)
+        val open = breakers.map { it.state == CircuitBreaker.State.OPEN || it.state == CircuitBreaker.State.FORCED_OPEN }
+        if (snapshot.size < 2 || open.all { it }) return snapshot.map { null }
+        return breakers.zip(open) { breaker, isOpen ->
+            if (isOpen) CallNotPermittedException.createCallNotPermittedException(breaker) else null
+        }
+    }
+
+    /**
+     * Asks [entry]'s pool for every article [asks] brings, in pipelined batches on up to
+     * [concurrency] of its connections, until [asks] is closed. [onAnswer] gets each 223 or 430.
+     *
+     * A batch that fails other than with a 430 (after the pool's own retry) gives the pool up for
+     * this check: the batches still running are cancelled, and every article the pool hasn't
+     * answered, those still to come included, goes to [onFailed] with the failure.
      */
     @Suppress("LongParameterList")
     private suspend fun askPool(
         entry: PoolEntry,
         poolIndex: Int,
-        asks: ReceiveChannel<Int>,
+        asks: ReceiveChannel<StatAsk>,
         articleIds: List<String>,
         concurrency: Int,
         priority: NntpPriority,
         timer: StatCheckTimer,
-        onAnswer: (index: Int, result: StatResult) -> Unit,
+        onFailed: (ask: StatAsk, cause: Throwable) -> Unit,
+        onAnswer: (ask: StatAsk, result: StatResult) -> Unit,
     ) = coroutineScope {
         val connections = minOf(concurrency, entry.config.maxConnections).coerceAtLeast(1)
         // Enough batches to use the connections, each big enough to keep a pipeline full.
         val batchSize = maxOf(STAT_CHUNK_MIN, (articleIds.size + connections - 1) / connections)
+        val failure = java.util.concurrent.atomic.AtomicReference<Throwable?>()
+        val running = ConcurrentHashMap.newKeySet<Job>()
+        fun failed(e: Throwable) {
+            if (!failure.compareAndSet(null, e)) return
+            logger.warn(
+                "STAT check: pool[{}] ({}:{}) failed, asking the next pool for the articles it hasn't answered: {}",
+                poolIndex, entry.config.host, entry.config.port, e.toString(),
+            )
+            running.forEach { it.cancel() }
+        }
+        // One batch on its own job, which the pool failing cancels; the articles it leaves
+        // unanswered then go to onFailed.
+        suspend fun ask(batch: List<StatAsk>) {
+            // Set for each article a 223 or 430 settles; read once the batch is done.
+            val settled = BooleanArray(batch.size)
+            val job = launch {
+                try {
+                    statBatch(entry, poolIndex, batch.map { articleIds[it.index] }, priority, timer) { i, result ->
+                        // Any other answer is the pool failing: statPipelined throws it once the
+                        // batch is done.
+                        if (result is StatResult.Found || (result is StatResult.NotFound && result.code == 430)) {
+                            settled[i] = true
+                            onAnswer(batch[i], result)
+                        }
+                    }
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (@Suppress("TooGenericExceptionCaught") e: Exception) {
+                    failed(e)
+                }
+            }
+            running += job
+            if (failure.get() != null) job.cancel()
+            job.join()
+            running -= job
+            failure.get()?.let { cause ->
+                batch.filterIndexed { i, _ -> !settled[i] }.forEach { onFailed(it, cause) }
+            }
+        }
         repeat(connections) {
             launch {
                 for (first in asks) {
                     val batch = mutableListOf(first)
                     while (batch.size < batchSize) batch += asks.tryReceive().getOrNull() ?: break
-                    statBatch(entry, poolIndex, batch.map { articleIds[it] }, priority, timer) { i, result ->
-                        onAnswer(batch[i], result)
-                    }
+                    val cause = failure.get()
+                    if (cause == null) ask(batch) else batch.forEach { onFailed(it, cause) }
                 }
             }
         }
@@ -748,8 +848,10 @@ class NntpStreamingService(
 
     /**
      * STATs [ids] pipelined on one connection of [entry]'s pool, passing each answer to
-     * [onResult] (an index into [ids]). Stops at the next answer once the calling coroutine is
+     * [onResult] (an index into [ids]) once. Stops at the next answer once the calling coroutine is
      * cancelled, even when the rest are already buffered: the pool then drains what's still owed.
+     * When the pool's own retry runs the batch again on a new connection, only the articles still
+     * without an answer are asked.
      */
     @Suppress("LongParameterList")
     private suspend fun statBatch(
@@ -766,26 +868,29 @@ class NntpStreamingService(
         var firstAnswer = 0L
         var answers = 0
         var connection = -1L
+        val done = BooleanArray(ids.size)
         try {
             entry.pool.withClient(priority.value) { client ->
                 connected = System.nanoTime()
                 connection = client.connection.id
                 timer.waitedForConnection(connected - asked)
-                client.statPipelined(ids.map { "<$it>" }) { i, result ->
+                val asking = ids.indices.filterNot { done[it] }
+                client.statPipelined(asking.map { "<${ids[it]}>" }) { i, result ->
                     context.ensureActive()
                     if (answers++ == 0) firstAnswer = System.nanoTime()
                     timer.answered()
-                    onResult(i, result)
+                    done[asking[i]] = true
+                    onResult(asking[i], result)
                 }
             }
         } finally {
             val ms = { from: Long, to: Long -> if (from == 0L || to == 0L) -1L else (to - from) / 1_000_000 }
-            val done = System.nanoTime()
+            val end = System.nanoTime()
             logger.debug(
                 "STAT batch on pool[{}] conn={}: {} of {} answered; waited {} ms for the connection, " +
                     "first answer after {} ms, {} ms in all{}",
                 poolIndex, connection, answers, ids.size, ms(asked, connected), ms(connected, firstAnswer),
-                ms(asked, done), if (context.isActive) "" else " (stopped)",
+                ms(asked, end), if (context.isActive) "" else " (stopped)",
             )
         }
     }
@@ -807,15 +912,20 @@ class NntpStreamingService(
             firstAnswerNs.compareAndSet(0, System.nanoTime() - start)
         }
 
-        fun log(total: Int, answered: Int, missing: Int, stopped: Boolean) {
+        fun log(total: Int, answered: Int, missing: Int, unanswered: Int, stopped: Boolean) {
             val ms = (System.nanoTime() - start) / 1_000_000
             val opened = snapshot.zip(openedBefore) { entry, before -> entry.pool.connectionsOpened - before }
             logger.info(
-                "STAT check of {} articles on {} pool(s){}: {} answered, {} missing in {} ms; " +
+                "STAT check of {} articles on {} pool(s){}: {} answered, {} missing, {} unanswerable in {} ms; " +
                     "first answer after {} ms, longest wait for a connection {} ms, {} answers/s, " +
                     "connections opened per pool {}",
-                total, snapshot.size, if (stopped) " stopped at a missing article" else "",
-                answered, missing, ms,
+                total, snapshot.size,
+                when {
+                    !stopped -> ""
+                    unanswered > 0 -> " stopped at an article no pool could answer"
+                    else -> " stopped at a missing article"
+                },
+                answered, missing, unanswered, ms,
                 if (firstAnswerNs.get() == 0L) -1 else firstAnswerNs.get() / 1_000_000,
                 longestWaitNs.get() / 1_000_000,
                 if (ms == 0L) answers.get() else answers.get() * 1000L / ms,
