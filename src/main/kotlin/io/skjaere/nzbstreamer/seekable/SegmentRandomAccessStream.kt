@@ -5,6 +5,7 @@ import io.skjaere.nzbstreamer.nzb.NzbDocument
 import io.skjaere.nzbstreamer.queue.SegmentQueueItem
 import io.skjaere.nzbstreamer.queue.SegmentQueueService
 import io.skjaere.nzbstreamer.stream.NntpStreamingService
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Deferred
@@ -146,6 +147,8 @@ class SegmentRandomAccessStream(
 
     private suspend fun segment(index: Int): Deferred<ByteArray> {
         cache[index]?.let { return it }
+        // Parts the NZB lists no article for: reading them fails, with nothing to fetch.
+        layout[index].gap?.let { gap -> return CompletableDeferred<ByteArray>().apply { completeExceptionally(gap.toException()) } }
         val s = scope ?: CoroutineScope(currentCoroutineContext().minusKey(Job) + SupervisorJob()).also { scope = it }
         val articleId = layout[index].segment.articleId
         val deferred = s.async(start = CoroutineStart.DEFAULT) {

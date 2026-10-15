@@ -26,7 +26,9 @@ import io.skjaere.nzbstreamer.nzb.printable
 import io.skjaere.nzbstreamer.queue.SegmentQueueItem
 import java.io.IOException
 import java.time.Duration
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.Job
@@ -1021,7 +1023,8 @@ class NntpStreamingService(
      * return: the writer stops, and nothing that fails after that is thrown from here.
      *
      * A segment that no pool delivers within the segment fetch timeout fails like any other, with a
-     * [SegmentTimeoutException].
+     * [SegmentTimeoutException]; parts of a file its NZB lists no article for
+     * ([SegmentQueueItem.gap]) fail with an [io.skjaere.nntp.ArticleNotFoundException].
      */
     suspend fun streamSegments(
         queue: Flow<SegmentQueueItem>,
@@ -1063,10 +1066,10 @@ class NntpStreamingService(
      *
      * The writer runs as a child of the calling coroutine's job: cancelling that job (or
      * [WriterJob.job], or the channel) stops it, and that job doesn't complete until the writer
-     * has. A failure (an article no provider has, a timeout) never fails the caller's job: the
-     * writer writes everything in front of the failing segment, then closes the channel with the
-     * failure as its cause ([ByteReadChannel.closedCause]). Ktor drops the bytes the reader hasn't
-     * taken yet when a channel closes with a cause.
+     * has. A failure (an article no provider has or the NZB doesn't list, a timeout) never fails
+     * the caller's job: the writer writes everything in front of the failing segment, then closes
+     * the channel with the failure as its cause ([ByteReadChannel.closedCause]). Ktor drops the
+     * bytes the reader hasn't taken yet when a channel closes with a cause.
      */
     suspend fun launchStreamSegments(
         queue: Flow<SegmentQueueItem>,
@@ -1148,6 +1151,13 @@ class NntpStreamingService(
                         @OptIn(ExperimentalCoroutinesApi::class)
                         produce(capacity = readAheadSegments) {
                             items.forEachIndexed { index, item ->
+                                // Parts the NZB lists no article for: the writer fails there, after
+                                // everything in front of them, so nothing past them is fetched.
+                                item.gap?.let { gap ->
+                                    val unlisted: Deferred<ByteArray> = CompletableDeferred<ByteArray>().apply { completeExceptionally(gap.toException()) }
+                                    send(item to unlisted)
+                                    return@produce
+                                }
                                 downloadSemaphore.acquire()
                                 if (index == 0) {
                                     tFirstAcq = System.nanoTime()

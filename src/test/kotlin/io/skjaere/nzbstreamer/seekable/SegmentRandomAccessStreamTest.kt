@@ -124,8 +124,9 @@ class SegmentRandomAccessStreamTest {
 
     @Test
     fun `reading past the bytes a segment delivered ends the stream, however far in`() = runBlocking<Unit> {
-        // segmentLayout gives the last listed segment the rest of the file, so an NZB missing articles
-        // declares one huge segment whose article holds only one part.
+        // When the parts' sizes can't be told, segmentLayout gives the last listed segment the rest
+        // of the file, so an NZB missing articles declares one huge segment whose article holds only
+        // one part. (When they can, the parts it lacks are a gap, which fails a read.)
         val declared = 5_000_000_000L
         val short = listOf(SegmentQueueItem(NzbSegment(bytes = 1000, number = 1, articleId = "s0"), 0, 0, declared, 0, 0, declared))
         SegmentRandomAccessStream(short, { data.copyOf(segmentSize) }).use { s ->
