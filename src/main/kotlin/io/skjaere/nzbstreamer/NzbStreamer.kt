@@ -333,14 +333,38 @@ class NzbStreamer private constructor(
         }
 
         fun build(): NzbStreamer {
-            val configs = poolBuilders.map { it.toConfig() }
             val streamingConfig = StreamingConfig(
                 concurrency = concurrency,
                 verificationConcurrency = verificationConcurrency ?: concurrency,
                 readAheadSegments = readAheadSegments ?: (concurrency * 3)
             )
             val prepareConfig = PrepareConfig(verifySegments = prepareBuilder.verifySegments)
-            val streamingService = NntpStreamingService(configs, streamingConfig, segmentCache)
+            return create(poolBuilders.map { it.toConfig() }, streamingConfig, prepareConfig, segmentCache)
+        }
+    }
+
+    companion object {
+        operator fun invoke(block: Builder.() -> Unit): NzbStreamer {
+            return Builder().apply(block).build()
+        }
+
+        /** A streamer with exactly these configs: every setting in them applies, and [getPoolConfigs] returns [nntpConfigs]. */
+        fun fromConfig(
+            nntpConfigs: List<NntpConfig>,
+            streamingConfig: StreamingConfig = StreamingConfig(),
+            prepareConfig: PrepareConfig = PrepareConfig(),
+            segmentCache: SegmentCache? = null,
+        ): NzbStreamer = create(nntpConfigs, streamingConfig, prepareConfig, segmentCache)
+
+        // The configs go through as they are: copying them field by field (through the builder)
+        // dropped the fields nobody remembered to copy.
+        private fun create(
+            nntpConfigs: List<NntpConfig>,
+            streamingConfig: StreamingConfig,
+            prepareConfig: PrepareConfig,
+            segmentCache: SegmentCache?,
+        ): NzbStreamer {
+            val streamingService = NntpStreamingService(nntpConfigs, streamingConfig, segmentCache)
             runBlocking { streamingService.connect() }
 
             val metadataService = ArchiveMetadataService(
@@ -350,38 +374,6 @@ class NzbStreamer private constructor(
             val archiveStreamingService = ArchiveStreamingService(streamingService)
 
             return NzbStreamer(streamingService, metadataService, verificationService, archiveStreamingService)
-        }
-    }
-
-    companion object {
-        operator fun invoke(block: Builder.() -> Unit): NzbStreamer {
-            return Builder().apply(block).build()
-        }
-
-        fun fromConfig(
-            nntpConfigs: List<NntpConfig>,
-            streamingConfig: StreamingConfig = StreamingConfig(),
-            prepareConfig: PrepareConfig = PrepareConfig(),
-            segmentCache: SegmentCache? = null,
-        ): NzbStreamer {
-            return invoke {
-                concurrency = streamingConfig.concurrency
-                verificationConcurrency = streamingConfig.verificationConcurrency
-                readAheadSegments = streamingConfig.readAheadSegments
-                this.segmentCache = segmentCache
-                nntpConfigs.forEach { config ->
-                    nntp {
-                        host = config.host
-                        port = config.port
-                        username = config.username
-                        password = config.password
-                        useTls = config.useTls
-                        maxConnections = config.maxConnections
-                        verifyHostname = config.verifyHostname
-                    }
-                }
-                prepare { verifySegments = prepareConfig.verifySegments }
-            }
         }
 
         /** Single-pool convenience overload. */
