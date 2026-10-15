@@ -14,11 +14,13 @@ import io.skjaere.nzbstreamer.stream.NntpStreamingService
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.test.assertEquals
 import kotlin.test.assertIs
 import kotlin.test.assertNotNull
 import kotlin.test.assertTrue
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
@@ -320,6 +322,64 @@ class AvailabilityCheckTest {
         service(listOf(config(primary, connections = 1), config(fill))).use { service ->
             assertIs<VerificationResult.Success>(service.check())
             assertEquals(listOf("<s5@test>"), fill.statsRead)
+        }
+    }
+
+    /**
+     * A provider whose first connection answers s5's STAT with an error and drops at s6's, as a
+     * server that sends "400" and closes does; the pool's retry is answered normally, and s5 is
+     * missing there.
+     */
+    private fun errorThenDrop(): FakeNntpServer {
+        val errorSent = AtomicBoolean()
+        val dropped = AtomicBoolean()
+        return FakeNntpServer(
+            stat = { it != "<s5@test>" },
+            statError = { id -> "400 Closing connection".takeIf { id == "<s5@test>" && errorSent.compareAndSet(false, true) } },
+            dropOnStat = { id -> id == "<s6@test>" && dropped.compareAndSet(false, true) },
+        ).also { servers += it }
+    }
+
+    @Test
+    fun `an error answer and then a dropped connection - the pool's retry asks that article again`() = runBlocking<Unit> {
+        val primary = errorThenDrop()
+        service(listOf(config(primary, connections = 1))).use { service ->
+            val result = service.check()
+            assertIs<VerificationResult.MissingArticles>(result)
+            assertTrue(result.message.contains("s5@test"), result.message)
+            assertEquals(2, primary.statsRead.count { it == "<s5@test>" }, "STATs of s5: ${primary.statsRead}")
+        }
+    }
+
+    @Test
+    fun `an error answer and then a dropped connection - with a second provider, that article is asked of it`() = runBlocking<Unit> {
+        val primary = errorThenDrop()
+        val fill = server { true }
+        service(listOf(config(primary, connections = 1), config(fill))).use { service ->
+            assertIs<VerificationResult.Success>(service.check())
+            assertEquals(listOf("<s5@test>"), fill.statsRead)
+        }
+    }
+
+    /**
+     * A batch that ends with articles unanswered while its provider hasn't failed and the check
+     * goes on (here a CancellationException out of the progress callback, which cancels neither)
+     * leaves none of them out: they are asked of the next provider.
+     */
+    @Test
+    fun `a batch ended by a stray CancellationException - the articles it left unanswered are asked of the next provider`() = runBlocking<Unit> {
+        val primary = server { true }
+        val fill = server { true }
+        service(listOf(config(primary, connections = 1), config(fill, connections = 1))).use { service ->
+            val thrown = AtomicBoolean()
+            val check = withTimeout(deadProviderBound) {
+                service.statUntilMissing(ids(10), concurrency = 1, onProgress = { _, _ ->
+                    if (thrown.compareAndSet(false, true)) throw CancellationException("stray")
+                })
+            }
+            assertEquals(emptyList(), check.missing)
+            assertEquals(10, check.answered)
+            assertEquals(stats(10).drop(1).toSet(), fill.statsRead.toSet())
         }
     }
 

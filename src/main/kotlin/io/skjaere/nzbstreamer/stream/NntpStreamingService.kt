@@ -68,6 +68,10 @@ import kotlin.concurrent.write
 /** Smallest STAT batch worth a pipeline of its own. */
 private const val STAT_CHUNK_MIN = 32
 
+/** A STAT answer that settles an article on a pool: a 223, or a 430. Any other is the pool failing. */
+private val StatResult.settles: Boolean
+    get() = this is StatResult.Found || (this is StatResult.NotFound && code == 430)
+
 class NntpStreamingService(
     initialConfigs: List<NntpConfig>,
     private val streamingConfig: StreamingConfig = StreamingConfig(),
@@ -826,7 +830,8 @@ class NntpStreamingService(
      *
      * A batch that fails other than with a 430 (after the pool's own retry) gives the pool up for
      * this check: the batches still running are cancelled, and every article the pool hasn't
-     * answered, those still to come included, goes to [onFailed] with the failure.
+     * answered, those still to come included, goes to [onFailed] with the failure. So does a batch
+     * that ends with articles unanswered while the check goes on, whatever ended it.
      */
     @Suppress("LongParameterList")
     private suspend fun askPool(
@@ -861,12 +866,15 @@ class NntpStreamingService(
             // Set when onAnswer (the caller's progress callback) throws: the check's failure,
             // not the pool's.
             var answerFailed = false
+            // The CancellationException that ended the batch, if one did.
+            var cancelled: CancellationException? = null
             val job = launch {
                 try {
                     statBatch(entry, poolIndex, batch.map { articleIds[it.index] }, priority, timer) { i, result ->
                         // Any other answer is the pool failing: statPipelined throws it once the
-                        // batch is done.
-                        if (result is StatResult.Found || (result is StatResult.NotFound && result.code == 430)) {
+                        // batch is done, unless the connection fails first and the pool's retry
+                        // asks that article again.
+                        if (result.settles) {
                             settled[i] = true
                             try {
                                 onAnswer(batch[i], result)
@@ -877,6 +885,7 @@ class NntpStreamingService(
                         }
                     }
                 } catch (e: CancellationException) {
+                    cancelled = e
                     throw e
                 } catch (@Suppress("TooGenericExceptionCaught") e: Exception) {
                     if (answerFailed) throw e
@@ -887,9 +896,23 @@ class NntpStreamingService(
             if (failure.get() != null) job.cancel()
             job.join()
             running -= job
-            failure.get()?.let { cause ->
-                batch.filterIndexed { i, _ -> !settled[i] }.forEach { onFailed(it, cause) }
+            val unsettled = batch.filterIndexed { i, _ -> !settled[i] }
+            if (unsettled.isEmpty()) return
+            if (failure.get() == null) {
+                // The check stopping (or failing) ends its batches too, and leaves nothing to ask.
+                ensureActive()
+                // Here neither the check nor the pool ended the batch (a stray CancellationException,
+                // say), yet no answer settled these: count that as the pool failing for them.
+                failed(
+                    IllegalStateException(
+                        "A STAT batch on pool[$poolIndex] (${entry.config.host}:${entry.config.port}) ended " +
+                            "with ${unsettled.size} of ${batch.size} articles unanswered",
+                        cancelled,
+                    )
+                )
             }
+            val cause = checkNotNull(failure.get())
+            unsettled.forEach { onFailed(it, cause) }
         }
         repeat(connections) {
             launch {
@@ -905,12 +928,13 @@ class NntpStreamingService(
 
     /**
      * STATs [ids] pipelined on one connection of [entry]'s pool, passing each answer to
-     * [onResult] (an index into [ids]) once. Stops once the calling coroutine is cancelled, at the
+     * [onResult] (an index into [ids]). Stops once the calling coroutine is cancelled, at the
      * next answer even when the rest are already buffered, or right after the answer that
      * cancelled it (the 430 that ends a check), and sends no more STATs: the pool then drains
      * what's still owed.
      * When the pool's own retry runs the batch again on a new connection, only the articles still
-     * without an answer are asked.
+     * without a 223 or 430 are asked: one answered with an error (which statPipelined would have
+     * thrown at the end) is asked again, so [onResult] gets its error and then the retry's answer.
      */
     @Suppress("LongParameterList")
     private suspend fun statBatch(
@@ -938,7 +962,7 @@ class NntpStreamingService(
                     context.ensureActive()
                     if (answers++ == 0) firstAnswer = System.nanoTime()
                     timer.answered()
-                    done[asking[i]] = true
+                    if (result.settles) done[asking[i]] = true
                     onResult(asking[i], result)
                     // An answer that ends the check cancels this coroutine: stop before
                     // statPipelined tops up its window with STATs nobody wants.
