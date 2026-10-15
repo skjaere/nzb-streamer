@@ -17,6 +17,7 @@ import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.flow.flow
 import org.slf4j.LoggerFactory
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicReference
 
 sealed interface FileResolveResult {
     data class Streamable(val namedSplits: NamedSplits) : FileResolveResult {
@@ -179,50 +180,69 @@ class ArchiveStreamingService(
         name: String,
         consume: suspend (ByteReadChannel) -> Unit,
     ) {
+        val failure = AtomicReference<Throwable?>()
         coroutineScope {
-            val writerJob = launchEncryptedFileWriter(archiveNzb, splits, name)
+            val writerJob = launchEncryptedFileWriter(archiveNzb, splits, name) { failure.compareAndSet(null, it) }
             try {
                 consume(writerJob.channel)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                // Most likely the channel closing with the writer's failure: throw that.
+                throw failure.get() ?: e
             } finally {
                 writerJob.cancel()
             }
         }
+        // consume may have taken the early end of the data for its end.
+        failure.get()?.let { throw it }
     }
 
+    /**
+     * [onFailure] gets the writer's failure (not its cancellation) before the channel closes with it,
+     * unless the reader has closed the channel first: a write to the closed channel then is not the
+     * stream failing.
+     */
     private suspend fun launchEncryptedFileWriter(
         archiveNzb: NzbDocument,
         splits: List<SplitInfo>,
         name: String,
+        onFailure: (Throwable) -> Unit = {},
     ): WriterJob {
         val password = archiveNzb.password
             ?: error("Encrypted RAR5 archive but NzbDocument has no password metadata (file=$name)")
         val callerScope = CoroutineScope(currentCoroutineContext())
         return callerScope.writer(autoFlush = false) {
-            // A scoped coroutine: a failure in here is thrown to the writer, which closes the
-            // channel with it, instead of failing the caller's job.
-            coroutineScope {
-                val seekableStream = NntpSeekableInputStream(archiveNzb, streamingService, end = splits.maxOf(::encryptedReadEnd))
-                try {
-                    for (split in splits) {
-                        val enc = checkNotNull(split.encryption) {
-                            "encrypted-streaming path got an unencrypted split (file=$name, split=$split)"
+            try {
+                // A scoped coroutine: a failure in here is thrown to the writer, which closes the
+                // channel with it, instead of failing the caller's job.
+                coroutineScope {
+                    val seekableStream = NntpSeekableInputStream(archiveNzb, streamingService, end = splits.maxOf(::encryptedReadEnd))
+                    try {
+                        for (split in splits) {
+                            val enc = checkNotNull(split.encryption) {
+                                "encrypted-streaming path got an unencrypted split (file=$name, split=$split)"
+                            }
+                            val key = deriveKeyCached(password, enc.salt, enc.kdfIterationsLog2)
+                            Rar5DataAreaDecryptor(key).streamDataAreaPlaintext(
+                                sourceStream = seekableStream,
+                                blockIvPosition = split.dataStartPosition,
+                                plaintextHeaderSize = enc.plaintextHeaderSize,
+                                dataAreaPlaintextOffset = enc.dataAreaPlaintextOffset,
+                                length = split.dataSize,
+                                dataAreaIv = enc.dataAreaIv,
+                            ) { buf, off, len ->
+                                // ktor's writeFully takes (startIndex, endIndex), not (offset, length).
+                                channel.writeFully(buf, off, off + len)
+                            }
                         }
-                        val key = deriveKeyCached(password, enc.salt, enc.kdfIterationsLog2)
-                        Rar5DataAreaDecryptor(key).streamDataAreaPlaintext(
-                            sourceStream = seekableStream,
-                            blockIvPosition = split.dataStartPosition,
-                            plaintextHeaderSize = enc.plaintextHeaderSize,
-                            dataAreaPlaintextOffset = enc.dataAreaPlaintextOffset,
-                            length = split.dataSize,
-                            dataAreaIv = enc.dataAreaIv,
-                        ) { buf, off, len ->
-                            // ktor's writeFully takes (startIndex, endIndex), not (offset, length).
-                            channel.writeFully(buf, off, off + len)
-                        }
+                    } finally {
+                        seekableStream.close()
                     }
-                } finally {
-                    seekableStream.close()
                 }
+            } catch (e: Throwable) {
+                if (e !is CancellationException && !channel.isClosedForWrite) onFailure(e)
+                throw e
             }
         }
     }

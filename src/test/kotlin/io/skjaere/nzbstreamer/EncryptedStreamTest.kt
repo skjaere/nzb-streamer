@@ -2,7 +2,9 @@ package io.skjaere.nzbstreamer
 
 import io.ktor.utils.io.ByteReadChannel
 import io.ktor.utils.io.WriterJob
+import io.ktor.utils.io.cancel
 import io.ktor.utils.io.readAvailable
+import io.ktor.utils.io.readFully
 import io.skjaere.compressionutils.Rar5Crypto
 import io.skjaere.compressionutils.SplitEncryptionInfo
 import io.skjaere.compressionutils.SplitInfo
@@ -38,6 +40,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.withTimeoutOrNull
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.Test
@@ -181,6 +184,42 @@ class EncryptedStreamTest {
             val (_, cause) = startStream(service).channel.readToEnd()
             assertTrue(cause.chain().any { it is ArticleNotFoundException }, "closed with: ${cause.chain()}")
             assertEquals(emptyList(), uncaught.toList(), "reached the exception handler")
+        }
+    }
+
+    @Test
+    fun `streamFile throws a missing article in an encrypted file even when consume takes the early end for the end`() = runBlocking<Unit> {
+        val missing = segmentOf(blockStart + 16 + blocks(headerSize.toInt()) + 20_000)
+        service(server(missing)).use { service ->
+            val failure = runCatching {
+                ArchiveStreamingService(service)
+                    .streamFile(nzb(), NamedSplits(listOf(split), plaintext.size.toLong(), "video.mkv")) { it.readToEnd() }
+            }.exceptionOrNull()
+            assertTrue(failure.chain().any { it is ArticleNotFoundException }, "failed with: ${failure.chain()}")
+        }
+    }
+
+    /**
+     * A consume that has what it wants closes the channel and returns: the writer, held up in a
+     * flush by the megabyte nobody reads, then finds the channel closed, which is not the stream
+     * failing.
+     */
+    @Test
+    fun `streamFile returns normally when consume closes an encrypted file's channel early`() = runBlocking<Unit> {
+        val large = ByteArray(3 * 1024 * 1024) { (it % 253).toByte() }
+        val largeArchive = ByteArray(blockStart) + ByteArray(16) { 7 } + ByteArray(blocks(headerSize.toInt())) +
+            encrypt(large) + ByteArray(12 * segmentSize) { 1 }
+        val largeSplit = split.copy(dataSize = large.size.toLong())
+        service(server(archive = largeArchive)).use { service ->
+            withTimeout(60_000) {
+                ArchiveStreamingService(service)
+                    .streamFile(nzb(largeArchive), NamedSplits(listOf(largeSplit), large.size.toLong(), "video.mkv")) { channel ->
+                        channel.awaitWriterHeldUp()
+                        val first = ByteArray(1000).also { channel.readFully(it) }
+                        assertContentEquals(large.copyOf(1000), first)
+                        channel.cancel()
+                    }
+            }
         }
     }
 

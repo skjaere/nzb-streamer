@@ -2,6 +2,7 @@ package io.skjaere.nzbstreamer
 
 import io.ktor.utils.io.ByteReadChannel
 import io.ktor.utils.io.WriterJob
+import io.ktor.utils.io.cancel
 import io.ktor.utils.io.readAvailable
 import io.ktor.utils.io.readFully
 import io.ktor.utils.io.toByteArray
@@ -38,6 +39,7 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.withTimeoutOrNull
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.Test
@@ -68,10 +70,10 @@ class StreamFailureTest {
     private val missing = 3
     private val beforeGap = segments.take(missing).reduce { a, b -> a + b }
 
-    private fun file() = NzbFile(
+    private fun file(parts: List<ByteArray> = segments) = NzbFile(
         poster = "test", date = 0, subject = "data.bin", groups = listOf("alt.binaries.test"),
-        segments = segments.indices.map { NzbSegment(segmentSize.toLong(), it + 1, "seg$it@test") },
-        yencHeaders = YencHeaders(line = 128, size = segmentSize.toLong() * segments.size, name = "data.bin", partEnd = segmentSize.toLong()),
+        segments = parts.indices.map { NzbSegment(parts[it].size.toLong(), it + 1, "seg$it@test") },
+        yencHeaders = YencHeaders(line = 128, size = parts.sumOf { it.size.toLong() }, name = "data.bin", partEnd = parts[0].size.toLong()),
     )
 
     private fun queue() = SegmentQueueService.createFileQueue(file(), 0, 0L)
@@ -259,6 +261,29 @@ class StreamFailureTest {
             assertFailsWith<ArticleNotFoundException> {
                 service.streamSegments(queue(), concurrency = 4, readAheadSegments = 6, name = "test") { channel ->
                     channel.readToEnd()
+                }
+            }
+        }
+    }
+
+    /**
+     * A consume that has what it wants closes the channel and returns: the writer, held up in a
+     * flush by the megabyte nobody reads, then finds the channel closed, which is not the stream
+     * failing.
+     */
+    @Test
+    fun `streamSegments returns normally when consume closes the channel early`() = runBlocking<Unit> {
+        val parts = (0 until 16).map { i -> ByteArray(256 * 1024) { (it * 5 + i).toByte() } }
+        val provider = FakeNntpServer(body = { id -> YencEncoder.encodeSinglePart(parts[id.segment()], "data.bin").data })
+            .also { servers += it }
+        service(provider).use { service ->
+            val queue = SegmentQueueService.createFileQueue(file(parts), 0, 0L)
+            withTimeout(30_000) {
+                service.streamSegments(queue, concurrency = 4, readAheadSegments = 6, name = "test") { channel ->
+                    val first = ByteArray(parts[0].size).also { channel.readFully(it) }
+                    assertContentEquals(parts[0], first)
+                    channel.awaitWriterHeldUp()
+                    channel.cancel()
                 }
             }
         }

@@ -845,6 +845,12 @@ class NntpStreamingService(
      * Uses structured concurrency via [coroutineScope] — a segment download's failure is thrown
      * from here once [consume] returns or fails (the channel closes with it when the writer gets
      * to that segment), and cancellation of the caller cancels all in-flight downloads automatically.
+     * A [consume] that has what it wants may close the channel ([ByteReadChannel.cancel]) and
+     * return: the writer stops, and nothing that fails after that is thrown from here.
+     *
+     * A segment that times out on every pool is not thrown from here yet: it closes the channel
+     * with a [CancellationException], which reads throw as such and [ByteReadChannel.isClosedForRead]
+     * takes for the end of the data.
      */
     suspend fun streamSegments(
         queue: Flow<SegmentQueueItem>,
@@ -858,7 +864,9 @@ class NntpStreamingService(
         val failure = java.util.concurrent.atomic.AtomicReference<Throwable?>()
         try {
             coroutineScope {
-                val writerJob = launchStreamSegments(queue, concurrency, readAheadSegments, bitrate, name, failure::set)
+                val writerJob = launchStreamSegments(queue, concurrency, readAheadSegments, bitrate, name) {
+                    failure.compareAndSet(null, it)
+                }
                 try {
                     consume(writerJob.channel)
                 } catch (e: CancellationException) {
@@ -902,7 +910,9 @@ class NntpStreamingService(
     }
 
     /**
-     * [onFailure] gets the writer's failure (not its cancellation) before the channel closes with it.
+     * [onFailure] gets the writer's failure (not its cancellation) before the channel closes with it,
+     * unless the reader has closed the channel first: what fails then (a write to the closed
+     * channel, a download nobody reads any more) is not the stream failing.
      */
     @Suppress("LongParameterList")
     private suspend fun launchStreamSegments(
@@ -915,6 +925,11 @@ class NntpStreamingService(
     ): WriterJob {
         val callerScope = CoroutineScope(currentCoroutineContext())
         return callerScope.writer(autoFlush = false) {
+            // Once the channel is closed (by the reader, or below by a failed download that has
+            // been reported already) nothing more is reported.
+            fun failed(e: Throwable) {
+                if (e !is CancellationException && !channel.isClosedForWrite) onFailure(e)
+            }
             try {
                 // A scoped coroutine: a failure in here is thrown to the writer, which closes the
                 // channel with it, instead of failing the caller's job.
@@ -985,7 +1000,7 @@ class NntpStreamingService(
                             } catch (e: Throwable) {
                                 // Close the channel with it at once: the downloads still in flight
                                 // are cancelled and cleaned up before it leaves this scope.
-                                if (e !is CancellationException) onFailure(e)
+                                failed(e)
                                 channel.cancel(e)
                                 throw e
                             }
@@ -1022,7 +1037,7 @@ class NntpStreamingService(
                     }
                 }
             } catch (e: Throwable) {
-                if (e !is CancellationException) onFailure(e)
+                failed(e)
                 throw e
             }
         }
