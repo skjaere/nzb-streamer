@@ -69,10 +69,11 @@ class NzbEnrichmentService(
 
     /**
      * Fetches the first article of each file of [nzb] that prepare needs to open the release (see
-     * [ReleaseFiles]: its archive volumes, or its content when it has none, and the PAR2 index),
-     * then downloads the PAR2 index. The enriched NZB holds those files, but for any left out: a
-     * file the release opens without (a PAR2 file, another episode's video or archive set) that
-     * lacks its first article, which is logged. A file it needs that lacks it is MissingArticles.
+     * [ReleaseFiles]: its archive volumes, or its content when it has none, and the PAR2 index or,
+     * without one, a recovery volume), then downloads the PAR2 index. The enriched NZB holds those
+     * files, but for any left out: a file the release opens without (a PAR2 file, another episode's
+     * video or archive set) that lacks its first article, which is logged. A file it needs that
+     * lacks it is MissingArticles.
      */
     suspend fun enrich(nzb: NzbDocument): EnrichmentResult {
         val sample = Timer.start(registry)
@@ -112,7 +113,9 @@ class NzbEnrichmentService(
 
         // After enrichment, download the base PAR2 file (contains recovery set metadata).
         // Skip .volXXX+YYY.par2 recovery volume files — they contain recovery blocks
-        // and can be very large (tens of MB each), causing OOM if loaded into memory.
+        // and can be very large (tens of MB each), causing OOM if loaded into memory. The one
+        // fetched in place of a missing index is downloaded only when its first 16 KB already
+        // name files: its blocks are that small.
         try {
             coroutineScope {
                 files

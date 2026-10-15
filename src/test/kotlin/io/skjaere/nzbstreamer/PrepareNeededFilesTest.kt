@@ -9,6 +9,8 @@ import io.skjaere.yenc.YencEncoder
 import kotlinx.coroutines.runBlocking
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.Test
+import org.junit.jupiter.params.ParameterizedTest
+import org.junit.jupiter.params.provider.ValueSource
 import kotlin.random.Random
 import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
@@ -145,6 +147,50 @@ class PrepareNeededFilesTest {
         }
     }
 
+    /**
+     * Volumes obfuscated one by one ("a8f7d6e5.rar", "b91c2d3e.rar", ...) don't group into a set,
+     * yet are one archive: none stands in for another (library issue N36).
+     */
+    @ParameterizedTest
+    @ValueSource(strings = ["rar", "7z"])
+    fun `a volume of an archive obfuscated volume by volume that lacks its first article still fails the release`(extension: String) {
+        val type = if (extension == "rar") ContainerType.RAR5 else ContainerType.SEVENZIP
+        val volumes = ArchiveGenerator.generate(bytes("movie", 200_000), 64L * 1024, type, "Movie.2020.mkv")
+        val names = volumes.indices.map { v -> "${OBFUSCATED[v]}.$extension" }
+        volumes.forEachIndexed { v, volume -> post(names[v], volume.data) }
+        missing += firstArticle(names[1])
+
+        withStreamer { streamer, _ ->
+            val result = streamer.prepare(nzb())
+            assertIs<PrepareResult.MissingArticles>(result, "prepare: $result")
+        }
+    }
+
+    /**
+     * A release without a PAR2 index names its obfuscated volumes from a recovery volume: prepare
+     * fetches the smallest (library issue N36).
+     */
+    @Test
+    fun `a recovery volume names obfuscated volumes when the release has no PAR2 index`() {
+        val payload = bytes("movie", 200_000)
+        val volumes = ArchiveGenerator.generate(payload, 64L * 1024, ContainerType.RAR5, "Movie.2020.mkv")
+        val named = volumes.mapIndexed { v, volume -> "Movie.2020.part${v + 1}.rar" to volume.data }
+        // Posted under names that tell nothing, in another order than the archive's.
+        volumes.indices.reversed().forEach { v -> post(OBFUSCATED[v], volumes[v].data) }
+        post("0b1c2d3e.vol01+02.par2", buildPar2File(named, recoveryBlock = 8 * 1024))
+        post("0b1c2d3e.vol00+01.par2", buildPar2File(named, recoveryBlock = 4 * 1024))
+
+        withStreamer { streamer, server ->
+            val prepared = assertIs<PrepareResult.Success>(streamer.prepare(nzb()), "prepare")
+            assertEquals(named.map { it.first }, prepared.metadata.response.volumes)
+            val movie = streamer.resolveStreamableFiles(prepared.metadata).single()
+            var streamed = ByteArray(0)
+            streamer.streamFile(prepared.metadata, movie) { streamed = it.toByteArray() }
+            assertContentEquals(payload, streamed)
+            assertTrue(firstArticle("0b1c2d3e.vol01+02.par2") !in server.bodiesRead, "the larger recovery volume was fetched")
+        }
+    }
+
     /** Not a subtitle archive in place of the movie: what stands in for a set must be of its size. */
     @Test
     fun `a small archive set doesn't open a release whose main set lacks a first article`() {
@@ -196,5 +242,10 @@ class PrepareNeededFilesTest {
             assertIs<PrepareResult.Success>(streamer.prepare(nzb()), "prepare")
             assertTrue("<Movie.2020.par2-2@test>" in server.bodiesRead, "the PAR2 index wasn't downloaded")
         }
+    }
+
+    private companion object {
+        /** Names that look like an obfuscating poster's, one per volume. */
+        val OBFUSCATED = listOf("a8f7d6e5", "b91c2d3e", "c07e4f1a", "d2b5a9c4", "e6f3c8b1", "f4a1d7e9")
     }
 }

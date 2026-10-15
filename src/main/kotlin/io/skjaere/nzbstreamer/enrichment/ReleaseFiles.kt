@@ -13,14 +13,16 @@ import io.skjaere.nzbstreamer.nzb.printable
  * A release with archive volumes is opened from them alone (prepare lists nothing else): prepare
  * fetches those, the PAR2 index (which names obfuscated volumes) and any file whose name tells
  * nothing. A release without them is streamed file by file: prepare fetches its content (videos,
- * other files, unnamed ones) and the PAR2 index. PAR2 recovery volumes are never fetched, nor are
- * NFOs, SFVs and the like, and samples, unless they are all the release has.
+ * other files, unnamed ones) and the PAR2 index. PAR2 recovery volumes are not fetched, but for the
+ * smallest when the release has no index (each carries the index's names), nor are NFOs, SFVs and
+ * the like, and samples, unless they are all the release has.
  *
  * A file prepare doesn't need to open the release may lack its first article: it is left out. So
  * may another episode's: a video (or other content beside videos) while one of its size is there,
  * and an archive set (with all its volumes) when the release has several, each from its first
- * volume, while another set of its size is whole. Of its size: at least half as big, so a subtitle
- * or a trailer doesn't stand in for the movie. Any other file that lacks it fails the release.
+ * volume and named like a release, while another set of its size is whole. Of its size: at least
+ * half as big, so a subtitle or a trailer doesn't stand in for the movie. Any other file that lacks
+ * it fails the release.
  */
 internal class ReleaseFiles(files: List<NzbFile>) {
     private enum class Role { ARCHIVE, VIDEO, PAR2, RECOVERY, SIDE, OTHER, UNKNOWN }
@@ -34,16 +36,23 @@ internal class ReleaseFiles(files: List<NzbFile>) {
     // NFOs and the like are the content of a release that has nothing else, listed as they are.
     private val sideIsContent = roles.none { it in CONTENT }
 
+    // Without an index, the smallest recovery volume names the files in its place.
+    private val indexStandIn = roles.indices.filter { roles[it] == Role.RECOVERY }.minByOrNull { sizes[it] }
+        .takeIf { Role.PAR2 !in roles }
+
     /** Archive volumes by set: the volumes of one archive share a name but for their suffix. */
     private val sets = roles.indices.filter { roles[it] == Role.ARCHIVE }
         .groupBy { names[it]!!.replace(VOLUME_SUFFIX, "").lowercase() }.values
 
-    // Several sets, each from its first volume: one per episode, which open on their own. Names
-    // that don't group like that (obfuscated per volume) are one archive as far as anyone can tell.
-    private val setsApart = sets.size > 1 && sets.all { set -> set.any { isFirstVolume(names[it]!!) } }
+    // Several sets, each from its first volume and named like a release: one per episode, which
+    // open on their own. Names that don't group like that, or that look obfuscated (a8f7d6e5.rar,
+    // b91c2d3e.rar: a volume each, each named like a first one), are one archive as far as anyone
+    // can tell.
+    private val setsApart = sets.size > 1 &&
+        sets.all { set -> set.any { isFirstVolume(names[it]!!) } && !isObfuscatedSet(names[set.first()]!!) }
 
     /** Indices of the files whose first article prepare fetches, in order. */
-    val toFetch: List<Int> = roles.indices.filter { fetched(roles[it]) }
+    val toFetch: List<Int> = roles.indices.filter { fetched(roles[it]) || it == indexStandIn }
 
     private fun fetched(role: Role) = when (role) {
         Role.ARCHIVE, Role.PAR2, Role.UNKNOWN -> true
@@ -57,10 +66,10 @@ internal class ReleaseFiles(files: List<NzbFile>) {
      * then decides once every file has been fetched.
      */
     fun mayLack(i: Int): Boolean = when (roles[i]) {
-        Role.PAR2, Role.VIDEO -> true
+        Role.PAR2, Role.RECOVERY, Role.VIDEO -> true
         Role.ARCHIVE -> setsApart
         Role.OTHER -> hasVideo
-        Role.SIDE, Role.UNKNOWN, Role.RECOVERY -> false
+        Role.SIDE, Role.UNKNOWN -> false
     }
 
     /**
@@ -107,6 +116,13 @@ internal class ReleaseFiles(files: List<NzbFile>) {
             SPLIT_7Z.find(name)?.let { return it.groupValues[1].toIntOrNull() == 1 }
             return name.endsWith(".rar", ignoreCase = true) || name.endsWith(".7z", ignoreCase = true)
         }
+
+        /**
+         * Whether the set volume [name] belongs to is named obfuscated: its name but for the volume
+         * suffix, which the heuristic judges without its extension (so it is given one).
+         */
+        fun isObfuscatedSet(name: String): Boolean =
+            ObfuscationHeuristic.isProbablyObfuscated(name.replace(VOLUME_SUFFIX, ".rar"))
 
         /**
          * Each file's role. A sample counts as one only beside a file of its kind that isn't one: a
