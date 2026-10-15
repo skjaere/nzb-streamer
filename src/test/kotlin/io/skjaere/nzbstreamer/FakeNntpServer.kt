@@ -20,7 +20,8 @@ import kotlin.concurrent.thread
  * an article, the connection drops after that many bytes of its body, as a provider's can; when
  * [dropOnStat] is true for an id, the connection drops instead of answering its STAT, and when
  * [statError] gives a status line for an id, that line answers its STAT. [login] takes the user and
- * password of an AUTHINFO login (true: 281, false: 481).
+ * password of an AUTHINFO login (true: 281, false: 481). [quit] runs before a QUIT is answered and
+ * may block.
  */
 class FakeNntpServer(
     private val stat: (id: String) -> Boolean = { false },
@@ -29,6 +30,7 @@ class FakeNntpServer(
     private val dropOnStat: (id: String) -> Boolean = { false },
     private val statError: (id: String) -> String? = { null },
     private val login: (user: String, password: String) -> Boolean = { _, _ -> true },
+    private val quit: () -> Unit = {},
 ) : Closeable {
     private val server = ServerSocket(0, 50, InetAddress.getLoopbackAddress())
     private val sockets = CopyOnWriteArrayList<Socket>()
@@ -99,6 +101,7 @@ class FakeNntpServer(
                 }
                 "DATE" -> out.line("111 20261015000000")
                 "QUIT" -> {
+                    quit()
                     out.line("205 bye")
                     break
                 }

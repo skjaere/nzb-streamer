@@ -55,8 +55,10 @@ import org.slf4j.LoggerFactory
 import java.io.Closeable
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.locks.ReentrantLock
 import java.util.concurrent.locks.ReentrantReadWriteLock
 import kotlin.concurrent.read
+import kotlin.concurrent.withLock
 import kotlin.concurrent.write
 
 /** Smallest STAT batch worth a pipeline of its own. */
@@ -80,6 +82,10 @@ class NntpStreamingService(
     private val pools = mutableListOf<PoolEntry>()
     private lateinit var selectorManager: SelectorManager
     private val poolLock = ReentrantReadWriteLock()
+
+    // Serializes addPool and removePool. A pool being removed keeps its name until it has closed,
+    // as its close removes the metrics under that name; poolLock is held only to change the list.
+    private val poolChangeLock = ReentrantLock()
 
     /**
      * Per-pool circuit breaker. Each pool gets a CircuitBreaker named after the pool ([PoolEntry.name]),
@@ -380,33 +386,39 @@ class NntpStreamingService(
      * of its own; the same config twice is refused, as [removePool] tells pools apart by config.
      */
     fun addPool(config: NntpConfig) {
-        poolLock.write {
-            require(pools.none { it.config == config }) {
-                "Pool already exists for this config of ${config.host}:${config.port}"
+        poolChangeLock.withLock {
+            poolLock.write {
+                require(pools.none { it.config == config }) {
+                    "Pool already exists for this config of ${config.host}:${config.port}"
+                }
+                val entry = createPool(config)
+                pools.add(entry)
+                logger.info(
+                    "NNTP pool added at runtime: {} maxConnections={} (total pools: {})",
+                    entry.name, config.maxConnections, pools.size
+                )
             }
-            val entry = createPool(config)
-            pools.add(entry)
-            logger.info(
-                "NNTP pool added at runtime: {} maxConnections={} (total pools: {})",
-                entry.name, config.maxConnections, pools.size
-            )
         }
     }
 
     /**
      * Closes and removes the pool for [config], and its circuit breaker: a pool added later under
-     * the same name starts with a closed one.
+     * the same name starts with a closed one. The pool leaves the list before it closes, so the
+     * other pools serve on while it does; this returns once it has closed.
      */
     fun removePool(config: NntpConfig) {
-        poolLock.write {
-            val index = pools.indexOfFirst { it.config == config }
-            require(index >= 0) { "No pool found for ${config.host}:${config.port}" }
-            val entry = pools.removeAt(index)
+        poolChangeLock.withLock {
+            val (entry, remaining) = poolLock.write {
+                val index = pools.indexOfFirst { it.config == config }
+                require(index >= 0) { "No pool found for ${config.host}:${config.port}" }
+                pools.removeAt(index) to pools.size
+            }
+            // Closing waits for the pool's connections (QUIT), so not under poolLock.
             entry.pool.close()
             circuitBreakerRegistry.remove(entry.name)
             logger.info(
                 "NNTP pool removed at runtime: {} (total pools: {})",
-                entry.name, pools.size
+                entry.name, remaining
             )
         }
     }
