@@ -15,7 +15,6 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.io.EOFException
 import org.slf4j.LoggerFactory
@@ -25,7 +24,8 @@ private const val FORWARD_THRESHOLD_BYTES = 102400L
 /**
  * The decoded bytes of [nzb] as one seekable stream, downloaded from the current position on as
  * they're read. A read starts that download as a child of the reading coroutine: [close], or a seek
- * that reopens it, ends it, and until then the reading coroutine's job doesn't complete. A
+ * that reopens it, ends it, and until then the reading coroutine's job doesn't complete. [close]
+ * doesn't wait for the download to stop; the reading coroutine's job completes once it has. A
  * download that fails makes [read] throw why. Downloads never go past [end] (the whole of [nzb] by
  * default): reads there end the stream.
  */
@@ -92,13 +92,14 @@ class NntpSeekableInputStream @JvmOverloads constructor(
 
     override fun size(): Long = totalSize
 
-    override fun close() { // TODO: close() should be suspendable
+    // Cancels without joining: the download runs in the reading coroutine's context, so blocking
+    // here until it stops deadlocks a reader with one thread (Android's main thread), and the
+    // reading coroutine's job waits for its child anyway.
+    override fun close() {
         val job = currentJob
         currentJob = null
         currentChannel = null
-        if (job != null) {
-            runBlocking { job.cancelAndJoin() }
-        }
+        job?.cancel()
     }
 
     private suspend fun ensureChannel() {

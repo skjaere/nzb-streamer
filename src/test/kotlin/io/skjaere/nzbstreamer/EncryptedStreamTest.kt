@@ -23,10 +23,13 @@ import java.io.ByteArrayOutputStream
 import java.io.IOException
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import javax.crypto.Cipher
 import javax.crypto.spec.IvParameterSpec
 import javax.crypto.spec.SecretKeySpec
+import kotlin.coroutines.CoroutineContext
+import kotlin.coroutines.EmptyCoroutineContext
 import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
@@ -37,6 +40,7 @@ import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
@@ -122,14 +126,15 @@ class EncryptedStreamTest {
         NntpConfig("127.0.0.1", server.port, "", "", useTls = false, maxConnections = 4)
     ).also { runBlocking { it.connect() } }
 
-    /** Starts streaming the decrypted file from a session coroutine, as the app does. */
+    /** Starts streaming the decrypted file from a session coroutine (in [context]), as the app does. */
     private suspend fun startStream(
         service: NntpStreamingService,
         split: SplitInfo = this.split,
         archive: ByteArray = this.archive,
+        context: CoroutineContext = EmptyCoroutineContext,
     ): WriterJob {
         val writer = CompletableDeferred<WriterJob>()
-        sessions.launch {
+        sessions.launch(context) {
             writer.complete(
                 ArchiveStreamingService(service)
                     .launchStreamFile(nzb(archive), NamedSplits(listOf(split), plaintext.size.toLong(), "video.mkv"))
@@ -154,6 +159,10 @@ class EncryptedStreamTest {
     }
 
     private fun Throwable?.chain() = generateSequence(this) { it.cause }.toList()
+
+    /** A dispatcher with one thread, as Android's main thread is. A daemon: a test that hangs it can't hold up the JVM. */
+    private fun singleThread() =
+        Executors.newSingleThreadExecutor { Thread(it, "single").apply { isDaemon = true } }.asCoroutineDispatcher()
 
     @Test
     fun `an encrypted file decrypts whole`() = runBlocking<Unit> {
@@ -273,6 +282,38 @@ class EncryptedStreamTest {
                 assertTrue(outcome.chain().any { it is ArticleNotFoundException }, "threw: ${outcome.chain()}")
             } finally {
                 stream.close()
+            }
+        }
+    }
+
+    @Test
+    fun `an encrypted file decrypts whole when its session runs on a single thread`() = runBlocking<Unit> {
+        singleThread().use { single ->
+            service(server()).use { service ->
+                // The writer closes its stream once the block is decrypted, on the session's thread.
+                val (received, cause) = withTimeoutOrNull(30_000) {
+                    startStream(service, context = single).channel.readToEnd()
+                } ?: fail("the stream never ended: closing its download blocked the session's only thread")
+                assertEquals(null, cause)
+                assertContentEquals(plaintext, received)
+            }
+        }
+    }
+
+    @Test
+    fun `close on a single-threaded reader ends the download without blocking the thread`() = runBlocking<Unit> {
+        singleThread().use { single ->
+            service(server()).use { service ->
+                val closed = CompletableDeferred<Unit>()
+                val reader = sessions.launch(single) {
+                    val stream = NntpSeekableInputStream(nzb(), service)
+                    stream.read(ByteArray(16), 0, 16)
+                    stream.close()
+                    closed.complete(Unit)
+                }
+                withTimeoutOrNull(10_000) { closed.await() } ?: fail("close() blocked the reading coroutine's only thread")
+                // The download stops all the same: the reading coroutine's job completes.
+                withTimeoutOrNull(10_000) { reader.join() } ?: fail("the reading coroutine never completed")
             }
         }
     }

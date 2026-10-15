@@ -237,6 +237,7 @@ class ArchiveStreamingService(
                             }
                         }
                     } finally {
+                        // Ends the download; this scope waits for it to stop.
                         seekableStream.close()
                     }
                 }
