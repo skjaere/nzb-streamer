@@ -201,7 +201,7 @@ class ArchiveStreamingService(
             // A scoped coroutine: a failure in here is thrown to the writer, which closes the
             // channel with it, instead of failing the caller's job.
             coroutineScope {
-                val seekableStream = NntpSeekableInputStream(archiveNzb, streamingService)
+                val seekableStream = NntpSeekableInputStream(archiveNzb, streamingService, end = splits.maxOf(::encryptedReadEnd))
                 try {
                     for (split in splits) {
                         val enc = checkNotNull(split.encryption) {
@@ -228,6 +228,20 @@ class ArchiveStreamingService(
     }
 
     companion object {
+        private const val AES_BLOCK = 16
+
+        /**
+         * Where decrypting [split] stops reading: its IV, the header's ciphertext, then the data
+         * area's up to the end of the range. Exact with a per-file IV; past the end without one
+         * (header and data area one CBC stream), by at most a block.
+         */
+        private fun encryptedReadEnd(split: SplitInfo): Long {
+            val enc = checkNotNull(split.encryption)
+            fun ciphertext(plaintext: Long) = (plaintext + AES_BLOCK - 1) / AES_BLOCK * AES_BLOCK
+            return split.dataStartPosition + AES_BLOCK + ciphertext(enc.plaintextHeaderSize) +
+                ciphertext(enc.dataAreaPlaintextOffset + split.dataSize)
+        }
+
         private fun splitOverlapsRange(
             fileOffset: Long,
             split: SplitInfo,

@@ -22,13 +22,22 @@ import org.slf4j.LoggerFactory
 
 private const val FORWARD_THRESHOLD_BYTES = 102400L
 
-class NntpSeekableInputStream(
+/**
+ * The decoded bytes of [nzb] as one seekable stream, downloaded from the current position on as
+ * they're read. A read starts that download as a child of the reading coroutine: [close], or a seek
+ * that reopens it, ends it, and until then the reading coroutine's job doesn't complete. A
+ * download that fails makes [read] throw why. Downloads never go past [end] (the whole of [nzb] by
+ * default): reads there end the stream.
+ */
+class NntpSeekableInputStream @JvmOverloads constructor(
     private val nzb: NzbDocument,
-    private val streamingService: NntpStreamingService
+    private val streamingService: NntpStreamingService,
+    end: Long = Long.MAX_VALUE,
 ) : SeekableInputStream {
     private val logger = LoggerFactory.getLogger(NntpSeekableInputStream::class.java)
     private val forwardThresholdBytes: Long = FORWARD_THRESHOLD_BYTES
     private val totalSize: Long = SegmentQueueService.getTotalDecodedSize(nzb)
+    private val end: Long = minOf(end, totalSize)
     private var currentPosition: Long = 0
     private var currentJob: Job? = null
     private var currentChannel: ByteReadChannel? = null
@@ -42,6 +51,9 @@ class NntpSeekableInputStream(
         val bytesRead = channel.readAvailable(buffer, offset, length)
         if (bytesRead > 0) {
             currentPosition += bytesRead
+        } else if (bytesRead == -1) {
+            // The download stopped early: say why rather than end the stream.
+            channel.closedCause?.let { throw it }
         }
         return bytesRead
     }
@@ -55,6 +67,7 @@ class NntpSeekableInputStream(
             currentPosition++
             b
         } catch (_: EOFException) {
+            channel.closedCause?.let { throw it }
             -1
         }
     }
@@ -95,14 +108,15 @@ class NntpSeekableInputStream(
     }
 
     private suspend fun openChannel(position: Long) {
-        val remaining = totalSize - position
+        val remaining = end - position
         if (remaining <= 0) return
 
         val queue = SegmentQueueService.createRangeQueue(nzb, position, remaining)
         val channelReady = CompletableDeferred<ByteReadChannel>()
 
-        val scope = CoroutineScope(currentCoroutineContext() + Job())
-        currentJob = scope.launch {
+        // A child of the reading coroutine, so it's cancelled with it and its failures go to no
+        // exception handler: they reach the reader through the channel.
+        currentJob = CoroutineScope(currentCoroutineContext()).launch {
             streamingService.streamSegments(queue, name = "seek") { channel ->
                 channelReady.complete(channel)
                 suspendCancellableCoroutine<Unit> { }
