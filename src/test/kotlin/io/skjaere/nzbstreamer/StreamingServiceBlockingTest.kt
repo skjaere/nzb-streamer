@@ -9,13 +9,18 @@ import kotlin.concurrent.thread
 import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
 import kotlin.test.assertTrue
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeoutOrNull
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.Test
 
 /**
- * What the streaming service must not hold up while it waits: fetches from the other pools while
- * a pool is being removed.
+ * What the streaming service must not hold up while it waits, or wait on: fetches from the other
+ * pools while a pool is being removed, and its connections while Dispatchers.Default is busy.
  */
 class StreamingServiceBlockingTest {
     private val servers = mutableListOf<FakeNntpServer>()
@@ -65,6 +70,37 @@ class StreamingServiceBlockingTest {
                 removal.join()
             }
             assertEquals(listOf(config(other)), service.getPoolConfigs())
+        }
+    }
+
+    /**
+     * Connecting (its DNS lookup blocks) and the socket selector's loop (which blocks in select)
+     * are blocking I/O: on Dispatchers.Default they take its few workers (one per CPU core) from
+     * CPU-bound work, and wait while that work has them.
+     */
+    @Test
+    fun `a fetch connects and reads while every Dispatchers Default worker is busy`() = runBlocking<Unit> {
+        val provider = server()
+        service(listOf(config(provider))).use { service ->
+            // As many as Default runs at once (one per core, at least 2), all held.
+            val workers = Runtime.getRuntime().availableProcessors().coerceAtLeast(2)
+            val busy = CountDownLatch(workers)
+            val release = CountDownLatch(1)
+            val cpuWork = CoroutineScope(Dispatchers.Default)
+            repeat(workers) {
+                cpuWork.launch {
+                    busy.countDown()
+                    release.await()
+                }
+            }
+            try {
+                assertTrue(busy.await(10, TimeUnit.SECONDS), "Default's workers never all got busy")
+                val data = withTimeoutOrNull(3_000) { service.fetchSegment("x@test") }
+                assertContentEquals(articles["<x@test>"], data, "the fetch got nothing in 3 s while Default was busy")
+            } finally {
+                release.countDown()
+                cpuWork.cancel()
+            }
         }
     }
 }

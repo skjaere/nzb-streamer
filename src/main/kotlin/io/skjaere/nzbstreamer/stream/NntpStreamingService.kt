@@ -26,6 +26,7 @@ import io.skjaere.nzbstreamer.queue.SegmentQueueItem
 import java.io.IOException
 import java.time.Duration
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
@@ -49,7 +50,6 @@ import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.flow.toList
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.withTimeout
-import kotlin.coroutines.EmptyCoroutineContext
 import kotlin.time.Duration.Companion.milliseconds
 import org.slf4j.LoggerFactory
 import java.io.Closeable
@@ -77,7 +77,10 @@ class NntpStreamingService(
      */
     private data class PoolEntry(val config: NntpConfig, val pool: NntpClientPool, val name: String)
 
-    private val scope = CoroutineScope(SupervisorJob())
+    // The pools' connects (a blocking DNS lookup), keepalives, QUITs and drains run here, and the
+    // shared SelectorManager's loop (it blocks in select) on the same dispatcher: IO, not Default,
+    // whose few workers (one per core) are for CPU-bound work, which may hold them all.
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val logger = LoggerFactory.getLogger(NntpStreamingService::class.java)
     private val pools = mutableListOf<PoolEntry>()
     private lateinit var selectorManager: SelectorManager
@@ -340,7 +343,7 @@ class NntpStreamingService(
     }
 
     suspend fun connect() {
-        selectorManager = SelectorManager(EmptyCoroutineContext)
+        selectorManager = SelectorManager(Dispatchers.IO)
         initialConfigs.forEachIndexed { index, config ->
             pools.add(createPool(config))
             logger.info(
