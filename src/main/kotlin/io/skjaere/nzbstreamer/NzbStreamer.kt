@@ -43,7 +43,8 @@ class NzbStreamer private constructor(
     /**
      * STATs every segment of the NZB (pipelined across connections, falling back across pools),
      * reporting (checked, total) as answers arrive. Minutes on huge releases without pipelining;
-     * seconds to tens of seconds with it.
+     * seconds to tens of seconds with it. A file whose NZB lists fewer parts than its subject's
+     * "(1/N)" (or, once enriched, its yEnc sizes) says is missing articles too.
      */
     suspend fun verifySegments(
         nzbBytes: ByteArray,

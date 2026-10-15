@@ -6,8 +6,11 @@ import io.skjaere.compressionutils.generation.ContainerType
 import io.skjaere.nntp.ArticleNotFoundException
 import io.skjaere.nntp.YencHeaders
 import io.skjaere.nzbstreamer.config.NntpConfig
+import io.skjaere.nzbstreamer.enrichment.EnrichmentResult
+import io.skjaere.nzbstreamer.enrichment.VerificationResult
 import io.skjaere.nzbstreamer.metadata.ExtractedMetadata
 import io.skjaere.nzbstreamer.metadata.PrepareResult
+import io.skjaere.nzbstreamer.nzb.NzbDocument
 import io.skjaere.nzbstreamer.nzb.NzbParser
 import io.skjaere.nzbstreamer.seekable.NntpSeekableInputStream
 import io.skjaere.nzbstreamer.stream.NntpStreamingService
@@ -28,7 +31,8 @@ import kotlin.test.assertTrue
 /**
  * A file whose NZB lists fewer articles than the parts it was posted in (an indexer that missed
  * some): reading reaches the parts it doesn't list and fails there with a missing article, rather
- * than ending early or putting a later part's bytes in their place.
+ * than ending early or putting a later part's bytes in their place, and the availability check
+ * finds them missing.
  */
 class UnlistedPartsTest {
     private val partSize = 16 * 1024
@@ -41,21 +45,25 @@ class UnlistedPartsTest {
         servers.forEach { it.close() }
     }
 
-    /** Posts [data] as [name] in parts of [partSize]; the NZB lists all but the parts in [unlisted] (from 1). */
-    private fun post(name: String, data: ByteArray, unlisted: Set<Int> = emptySet()) {
+    /**
+     * Posts [data] as [name] in parts of [partSize]; the NZB lists all but the parts in [unlisted]
+     * (from 1), under a subject that gives their count unless [counted] is false.
+     */
+    private fun post(name: String, data: ByteArray, unlisted: Set<Int> = emptySet(), counted: Boolean = true) {
         val parts = YencEncoder.encodeMultiPart(data, name, partSize)
         parts.forEachIndexed { i, part -> articles["<$name-${i + 1}@test>"] = part.data }
         val segments = parts.indices.filterNot { it + 1 in unlisted }.joinToString("") { i ->
             """<segment bytes="${parts[i].data.size}" number="${i + 1}">$name-${i + 1}@test</segment>"""
         }
-        files += """<file poster="t" date="0" subject="&quot;$name&quot; yEnc (1/${parts.size})">""" +
+        val count = if (counted) " (1/${parts.size})" else ""
+        files += """<file poster="t" date="0" subject="&quot;$name&quot; yEnc$count">""" +
             """<groups><group>alt.binaries.test</group></groups><segments>$segments</segments></file>"""
     }
 
     private fun nzb() = ("""<?xml version="1.0" encoding="UTF-8"?>""" +
         """<nzb xmlns="http://www.newzbin.com/DTD/2003/nzb">${files.joinToString("")}</nzb>""").toByteArray()
 
-    private fun server() = FakeNntpServer(body = { id -> articles[id] }).also { servers += it }
+    private fun server() = FakeNntpServer(stat = { id -> id in articles }, body = { id -> articles[id] }).also { servers += it }
 
     private fun <T> withStreamer(block: suspend (NzbStreamer) -> T): T =
         NzbStreamer.fromConfig(NntpConfig("127.0.0.1", server().port, "", "", useTls = false, maxConnections = 4))
@@ -84,6 +92,10 @@ class UnlistedPartsTest {
         }
         return out.toByteArray() to failure
     }
+
+    /** What the availability check, of every article and of a sample, says of [nzb]. */
+    private suspend fun NzbStreamer.checks(nzb: NzbDocument) =
+        listOf("verifySegments" to verifySegments(nzb), "verifySample" to verifySample(nzb))
 
     private fun Throwable?.missingArticle() = generateSequence(this) { it.cause }.filterIsInstance<ArticleNotFoundException>().firstOrNull()
 
@@ -148,6 +160,63 @@ class UnlistedPartsTest {
         withStreamer { streamer ->
             val result = streamer.prepare(nzb())
             assertIs<PrepareResult.MissingArticles>(result, "prepare: $result")
+        }
+    }
+
+    /** The availability check finds the parts an NZB doesn't list missing (library issue N35). */
+    @Test
+    fun `the check of an enriched NZB finds the parts it lacks by the yEnc sizes`() {
+        post("Movie.2020.mkv", movie, unlisted = setOf(3), counted = false)
+
+        withStreamer { streamer ->
+            val enriched = assertIs<EnrichmentResult.Success>(streamer.enrich(nzb()), "enrich").enrichedNzb
+            streamer.checks(enriched).forEach { (check, result) ->
+                val missing = assertIs<VerificationResult.MissingArticles>(result, "$check: $result")
+                assertTrue("part 3 of 6" in missing.message, "$check: ${missing.message}")
+                assertEquals(1, missing.missingCount, check)
+            }
+        }
+    }
+
+    @Test
+    fun `the check of an NZB not enriched finds the parts it lacks by its subject's part count`() {
+        post("Movie.2020.mkv", movie, unlisted = setOf(5, 6))
+
+        withStreamer { streamer ->
+            streamer.checks(NzbParser.parse(nzb())).forEach { (check, result) ->
+                val missing = assertIs<VerificationResult.MissingArticles>(result, "$check: $result")
+                assertTrue("parts 5-6 of 6" in missing.message, "$check: ${missing.message}")
+                assertEquals(2, missing.missingCount, check)
+            }
+        }
+    }
+
+    /**
+     * NZB byte counts are only near the articles' sizes, and a file's first part needn't be the
+     * size of the others: a whole file whose first part, by its yEnc size, implies more parts than
+     * its NZB lists still passes, as long as the byte counts or the yEnc total tell otherwise.
+     */
+    @Test
+    fun `the check passes whole files whose sizes the NZB and the first part give only roughly`() {
+        post("Movie.2020.mkv", movie)
+
+        withStreamer { streamer ->
+            val parsed = NzbParser.parse(nzb())
+            val enriched = assertIs<EnrichmentResult.Success>(streamer.enrich(nzb()), "enrich").enrichedNzb
+            val file = enriched.files.single()
+            val rounded = file.copy(segments = file.segments.map { it.copy(bytes = (it.bytes + 999) / 1000 * 1000) })
+            // A first part of 12 KiB would make 8 of the file's size; its byte count says it is smaller than the rest.
+            val smallFirst = file.copy(
+                segments = file.segments.mapIndexed { i, segment -> if (i == 0) segment.copy(bytes = 12_600) else segment },
+                yencHeaders = file.yencHeaders!!.copy(partEnd = 12L * 1024, total = null),
+            )
+            // Its yEnc total says 6.
+            val totalled = smallFirst.copy(segments = file.segments, yencHeaders = smallFirst.yencHeaders!!.copy(total = 6))
+            val releases = listOf("parsed" to parsed, "enriched" to enriched) +
+                listOf("rounded" to rounded, "smallFirst" to smallFirst, "totalled" to totalled).map { (how, it) -> how to NzbDocument(listOf(it)) }
+            releases.forEach { (how, nzb) ->
+                streamer.checks(nzb).forEach { (check, result) -> assertIs<VerificationResult.Success>(result, "$how, $check: $result") }
+            }
         }
     }
 }

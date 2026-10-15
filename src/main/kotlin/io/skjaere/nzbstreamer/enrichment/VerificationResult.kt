@@ -7,7 +7,9 @@ sealed interface VerificationResult {
      * Articles are missing on every provider. A check stops at the first such article, so the
      * counts cover what was answered by then: [missingCount] of [answeredCount] answered articles
      * were missing, out of [totalCount] to check. All answered articles missing suggests the
-     * release was taken down; one among many, a gap.
+     * release was taken down; one among many, a gap. Parts of a file that its NZB lists no article
+     * for are missing too, whatever the providers say: when no listed article is, they are counted
+     * as answered and missing.
      */
     data class MissingArticles @JvmOverloads constructor(
         val message: String,

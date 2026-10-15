@@ -63,6 +63,14 @@ object SegmentQueueService {
         }
     }
 
+    /**
+     * The runs of parts [file] (enriched) was posted in that its NZB lists no article for, as its
+     * queue lays them out: none when it lists them all, or when the parts' sizes can't be told
+     * ([postedParts]).
+     */
+    internal fun unlistedParts(file: NzbFile): List<SegmentGap> =
+        createFileQueueList(file, 0, 0L).mapNotNull { it.gap }
+
     fun getTotalDecodedSize(nzb: NzbDocument): Long {
         return nzb.files.sumOf { getFileDecodedSize(it) }
     }

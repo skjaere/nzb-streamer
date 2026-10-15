@@ -4,8 +4,12 @@ import io.micrometer.core.instrument.Metrics
 import io.micrometer.core.instrument.Timer
 import io.skjaere.nntp.ArticleNotFoundException
 import io.skjaere.nntp.NntpException
+import io.skjaere.nzbstreamer.nzb.FilenameResolver
 import io.skjaere.nzbstreamer.nzb.NzbDocument
+import io.skjaere.nzbstreamer.nzb.NzbFile
 import io.skjaere.nzbstreamer.nzb.printable
+import io.skjaere.nzbstreamer.queue.SegmentGap
+import io.skjaere.nzbstreamer.queue.SegmentQueueService
 import io.skjaere.nzbstreamer.stream.NntpPriority
 import io.skjaere.nzbstreamer.stream.NntpStreamingService
 import io.skjaere.nzbstreamer.stream.StatCheck
@@ -50,7 +54,7 @@ class VerificationService(
         }
 
         logger.debug("Verifying {} additional segments", segmentsToVerify.size)
-        val result = check(segmentsToVerify, priority, progress)
+        val result = check(segmentsToVerify, unlistedParts(nzb), priority, progress)
         sample.stop(verificationTimer)
         if (result is VerificationResult.Success) {
             logger.debug("All {} segments verified successfully", segmentsToVerify.size)
@@ -64,6 +68,7 @@ class VerificationService(
      * NZB has many files). STATing every segment of a 7 GB release takes tens of seconds;
      * a sample takes about one round trip per [currentConcurrency] segments, and a release
      * with expired articles is usually missing whole stretches, which a spread sample hits.
+     * Parts the NZB lists no article for are found in every file, as [verifySegments] finds them.
      */
     suspend fun verifySample(
         nzb: NzbDocument,
@@ -78,7 +83,7 @@ class VerificationService(
         val spread = (0 until samples).map { i -> (i.toLong() * (all.size - 1) / maxOf(samples - 1, 1)).toInt() }
         val chosen = (ends + spread).distinct().sorted().map { all[it] }
         logger.debug("Verifying a sample of {} of {} segments", chosen.size, all.size)
-        return check(chosen, priority, progress)
+        return check(chosen, unlistedParts(nzb), priority, progress)
     }
 
     // Carry the per-segment position within its file (and the file's name/size)
@@ -101,8 +106,30 @@ class VerificationService(
         }
     }
 
+    /**
+     * The runs of parts the files of [nzb] were posted in that its NZB lists no article for, which
+     * no provider can have: an enriched file's as its stream lays them out (by its yEnc size and
+     * first part, see [SegmentQueueService.unlistedParts]), another's by its subject's yEnc part
+     * count, "(1/N)", when its articles are numbered within it.
+     */
+    private fun unlistedParts(nzb: NzbDocument): List<SegmentGap> = nzb.files.flatMap { file ->
+        if (file.yencHeaders != null) SegmentQueueService.unlistedParts(file) else unlistedBySubject(file)
+    }
+
+    private fun unlistedBySubject(file: NzbFile): List<SegmentGap> {
+        val posted = SUBJECT_PART_COUNT.find(file.subject)?.groupValues?.get(1)?.toIntOrNull()
+            ?.takeIf { it < Int.MAX_VALUE } ?: return emptyList()
+        val numbers = file.segments.map { it.number }.toSortedSet()
+        if (numbers.isEmpty() || numbers.size >= posted || numbers.first() < 1 || numbers.last() > posted) return emptyList()
+        val name = FilenameResolver.extractSubjectFilename(file.subject) ?: file.subject
+        return (listOf(0) + numbers + (posted + 1)).zipWithNext()
+            .filter { (before, after) -> after - before > 1 }
+            .map { (before, after) -> SegmentGap(name, before + 1 until after, posted) }
+    }
+
     private suspend fun check(
         segmentsToVerify: List<SegmentToCheck>,
+        unlisted: List<SegmentGap>,
         priority: NntpPriority,
         progress: ((checked: Int, total: Int) -> Unit)?,
     ): VerificationResult {
@@ -114,7 +141,7 @@ class VerificationService(
             )
         } catch (e: NntpException) {
             logger.error("NNTP failure during segment verification: {}", e.message, e)
-            return VerificationResult.Failure(
+            return unlistedMissing(unlisted, answered = 0, total = segmentsToVerify.size) ?: VerificationResult.Failure(
                 e.message ?: "NNTP failure during segment verification",
                 e
             )
@@ -123,7 +150,8 @@ class VerificationService(
         verificationSegments.increment(check.answered.toDouble())
 
         val missing = check.missing.firstOrNull()?.let { segmentsToVerify[it] }
-            ?: return check.failure?.let { failed(check, segmentsToVerify, it) } ?: VerificationResult.Success
+            ?: return unlistedMissing(unlisted, check.answered, check.total)
+                ?: check.failure?.let { failed(check, segmentsToVerify, it) } ?: VerificationResult.Success
         verificationMissing.increment(1.0)
         // Include position/total/filename so we can see WHERE in the file the
         // first missing segment sits — telling us whether the NZB is broken at
@@ -148,6 +176,27 @@ class VerificationService(
     }
 
     /**
+     * The release lacks the [unlisted] parts whatever the providers say, though none of the listed
+     * articles they answered for ([answered] of [total]) is missing: they count as answered and
+     * missing. Null when the NZB lists every part.
+     */
+    private fun unlistedMissing(unlisted: List<SegmentGap>, answered: Int, total: Int): VerificationResult.MissingArticles? {
+        val first = unlisted.firstOrNull() ?: return null
+        val parts = unlisted.sumOf { it.parts.last - it.parts.first + 1 }
+        verificationMissing.increment(1.0)
+        val message = "${first.toException().message} " +
+            "($parts unlisted part${if (parts == 1) "" else "s"} in all; $answered of $total listed articles answered)"
+        logger.warn(message)
+        return VerificationResult.MissingArticles(
+            message,
+            ArticleNotFoundException(message),
+            missingCount = parts,
+            answeredCount = answered + parts,
+            totalCount = total + parts,
+        )
+    }
+
+    /**
      * No provider could answer for an article (each failed other than with a 430, or the rest said
      * 430): whether the release is complete is unknown, so the check fails with the [cause].
      */
@@ -159,5 +208,10 @@ class VerificationService(
         val message = "No provider could answer$where: ${cause.message ?: cause}"
         logger.warn(message)
         return VerificationResult.Failure(message, cause)
+    }
+
+    private companion object {
+        // A yEnc subject's part count: the last "(x/N)" after "yEnc", e.g. "file.mkv" yEnc (1/120).
+        val SUBJECT_PART_COUNT = Regex("""(?i)\byEnc\b.*\(\s*\d+\s*/\s*(\d+)\s*\)""")
     }
 }
