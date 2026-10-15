@@ -122,6 +122,48 @@ class NestedArchivePrepareIntegrationTest {
         }
     }
 
+    /** Posts [outer], prepares it as a nested archive and streams the inner file [name], which must be [payload]. */
+    private suspend fun assertNestedFileStreams(outer: List<ArchiveVolume>, name: String, payload: ByteArray) {
+        val nzb = post(outer)
+        val config = NntpConfig(host = "localhost", port = socket.localPort, username = "", password = "", useTls = false, maxConnections = 4)
+        NzbStreamer.fromConfig(config).use { streamer ->
+            val prepared = streamer.prepare(nzb)
+            assertIs<PrepareResult.Success>(prepared, "prepare: $prepared")
+            assertIs<ExtractedMetadata.NestedArchive>(prepared.metadata)
+            val file = streamer.resolveStreamableFiles(prepared.metadata).single { it.path.endsWith(name) }
+            assertEquals(payload.size.toLong(), file.totalSize)
+            var streamed = ByteArray(0)
+            streamer.streamFile(prepared.metadata, file) { channel -> streamed = channel.readAll() }
+            assertContentEquals(payload, streamed)
+        }
+    }
+
+    @Test
+    @Timeout(value = 2, unit = TimeUnit.MINUTES)
+    fun `split 7z inside RAR5 prepares and streams byte-exact`() = runBlocking<Unit> {
+        val payload = Random(13).nextBytes(3 * 1024 * 1024)
+        // archive.7z.001, .002, ...: one 7z archive cut into volumes, inside an outer RAR5 set.
+        val inner = ArchiveGenerator.generate(payload, 512L * 1024, ContainerType.SEVENZIP, "Show.S01E02.1080p.WEB.mkv")
+        val outer = ArchiveGenerator.generate(inner.map { ArchiveFile(it.filename, it.data) }, 1024L * 1024, ContainerType.RAR5)
+        assertTrue(inner.size >= 3, "inner volumes: ${inner.size}")
+        assertTrue(outer.size >= 2, "outer volumes: ${outer.size}")
+
+        assertNestedFileStreams(outer, "Show.S01E02.1080p.WEB.mkv", payload)
+    }
+
+    @Test
+    @Timeout(value = 2, unit = TimeUnit.MINUTES)
+    fun `old-style RAR volumes inside RAR5 prepare and stream byte-exact`() = runBlocking<Unit> {
+        val payload = Random(17).nextBytes(3 * 1024 * 1024)
+        // archive.rar, .r00, .r01, ...: a RAR4 set, as in releases repacked inside another archive.
+        val inner = ArchiveGenerator.generate(payload, 512L * 1024, ContainerType.RAR4, "Show.S01E03.1080p.WEB.mkv")
+        val outer = ArchiveGenerator.generate(inner.map { ArchiveFile(it.filename, it.data) }, 1024L * 1024, ContainerType.RAR5)
+        assertTrue(inner.size >= 3, "inner volumes: ${inner.size}")
+        assertTrue(outer.size >= 2, "outer volumes: ${outer.size}")
+
+        assertNestedFileStreams(outer, "Show.S01E03.1080p.WEB.mkv", payload)
+    }
+
     @Test
     @Timeout(value = 3, unit = TimeUnit.MINUTES)
     fun `scene-shaped nested release - 72 inner volumes in many outer volumes - costs little more than one article per header`() = runBlocking<Unit> {
