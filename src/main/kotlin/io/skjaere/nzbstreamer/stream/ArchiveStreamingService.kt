@@ -234,6 +234,9 @@ class ArchiveStreamingService(
                             ) { buf, off, len ->
                                 // ktor's writeFully takes (startIndex, endIndex), not (offset, length).
                                 channel.writeFully(buf, off, off + len)
+                                // Hand each chunk to the reader as it's decrypted, not once 1 MB has
+                                // piled up: what a failure further on would otherwise drop.
+                                channel.flush()
                             }
                         }
                     } finally {

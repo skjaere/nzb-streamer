@@ -98,6 +98,16 @@ class EncryptedStreamTest {
 
     private fun segmentOf(position: Int) = position / segmentSize
 
+    // A file of four decryption chunks (the decryptor reads 64 KiB of ciphertext at a time).
+    private val chunk = 64 * 1024
+    private val long = ByteArray(4 * chunk) { (it % 247).toByte() }
+    private val longArchive = ByteArray(blockStart) + ByteArray(16) { 7 } + ByteArray(blocks(headerSize.toInt())) +
+        encrypt(long) + ByteArray(12 * segmentSize) { 1 }
+    private val longSplit = split.copy(dataSize = long.size.toLong())
+
+    /** The segment holding the file's plaintext byte [offset]: its data area follows the IV and the header. */
+    private fun segmentOfPlaintext(offset: Int) = segmentOf(blockStart + 16 + blocks(headerSize.toInt()) + offset)
+
     private fun nzb(archive: ByteArray = this.archive) = NzbDocument(
         listOf(
             NzbFile(
@@ -137,7 +147,7 @@ class EncryptedStreamTest {
         sessions.launch(context) {
             writer.complete(
                 ArchiveStreamingService(service)
-                    .launchStreamFile(nzb(archive), NamedSplits(listOf(split), plaintext.size.toLong(), "video.mkv"))
+                    .launchStreamFile(nzb(archive), NamedSplits(listOf(split), split.dataSize, "video.mkv"))
             )
         }
         return writer.await()
@@ -183,6 +193,45 @@ class EncryptedStreamTest {
             val (received, cause) = startStream(service, legacySplit, legacy).channel.readToEnd()
             assertEquals(null, cause)
             assertContentEquals(plaintext, received)
+        }
+    }
+
+    /** Each decrypted chunk goes to the reader as it's decrypted, not once a megabyte has piled up. */
+    @Test
+    fun `an encrypted file's first decrypted chunk reaches the reader while the rest is still downloading`() = runBlocking<Unit> {
+        // The last chunk's article is held back.
+        val held = segmentOfPlaintext(3 * chunk)
+        service(server(archive = longArchive, answer = { if (it == held) gate.await(60, TimeUnit.SECONDS) })).use { service ->
+            val channel = startStream(service, longSplit, longArchive).channel
+            val first = ByteArray(chunk)
+            val read = withTimeoutOrNull(5_000) { channel.readFully(first) } != null
+            gate.countDown()
+            assertTrue(read, "no decrypted byte reached the reader while a later article was downloading")
+            assertContentEquals(long.copyOf(chunk), first)
+        }
+    }
+
+    /** Nor does a failure further on take them with it: Ktor drops what the reader hasn't taken. */
+    @Test
+    fun `the bytes decrypted in front of a missing article reach the reader before the stream fails`() = runBlocking<Unit> {
+        // The last chunk's article is missing, and says so once the reader has the first chunk (or 5 s on).
+        val missing = segmentOfPlaintext(3 * chunk)
+        val readFirst = CountDownLatch(1)
+        val provider = server(missing, longArchive, answer = { if (it == missing) readFirst.await(5, TimeUnit.SECONDS) })
+        service(provider).use { service ->
+            val channel = startStream(service, longSplit, longArchive).channel
+            val first = ByteArray(chunk)
+            val read = try {
+                withTimeoutOrNull(10_000) { channel.readFully(first) } != null
+            } catch (_: IOException) {
+                false
+            }
+            readFirst.countDown()
+            assertTrue(read, "the bytes decrypted in front of the missing article never reached the reader")
+            assertContentEquals(long.copyOf(chunk), first)
+
+            val (_, cause) = channel.readToEnd()
+            assertTrue(cause.chain().any { it is ArticleNotFoundException }, "closed with: ${cause.chain()}")
         }
     }
 
