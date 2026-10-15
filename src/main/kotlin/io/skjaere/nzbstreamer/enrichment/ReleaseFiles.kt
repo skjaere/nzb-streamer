@@ -4,6 +4,7 @@ import io.skjaere.compressionutils.ArchiveService
 import io.skjaere.nzbstreamer.nzb.FilenameResolver
 import io.skjaere.nzbstreamer.nzb.NzbFile
 import io.skjaere.nzbstreamer.nzb.ObfuscationHeuristic
+import io.skjaere.nzbstreamer.nzb.printable
 
 /**
  * Which files of a release prepare fetches the first article of, and which of those may lack it,
@@ -83,8 +84,8 @@ internal class ReleaseFiles(files: List<NzbFile>) {
     /** The files to leave out when [lacking] lack their first article: those, and the rest of their archive sets. */
     fun leftOut(lacking: Set<Int>): Set<Int> = lacking + sets.filter { set -> set.any { it in lacking } }.flatten()
 
-    /** The name a file is known by before it is fetched (its subject's), for log lines. */
-    fun nameOf(i: Int): String = names[i] ?: "file ${i + 1}"
+    /** The name a file is known by before it is fetched (its subject's), escaped for log lines. */
+    fun nameOf(i: Int): String = names[i]?.printable() ?: "file ${i + 1}"
 
     private companion object {
         val CONTENT = setOf(Role.ARCHIVE, Role.VIDEO, Role.OTHER, Role.UNKNOWN)

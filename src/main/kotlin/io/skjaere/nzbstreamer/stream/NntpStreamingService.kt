@@ -22,6 +22,7 @@ import io.skjaere.nntp.StatResult
 import io.skjaere.nntp.YencEvent
 import io.skjaere.nzbstreamer.config.NntpConfig
 import io.skjaere.nzbstreamer.config.StreamingConfig
+import io.skjaere.nzbstreamer.nzb.printable
 import io.skjaere.nzbstreamer.queue.SegmentQueueItem
 import java.io.IOException
 import java.time.Duration
@@ -654,7 +655,7 @@ class NntpStreamingService(
                     if (index < ordered.size - 1) {
                         logger.debug(
                             "STAT {} not found on pool[{}] ({}:{}), trying next pool",
-                            articleId, index, entry.config.host, entry.config.port,
+                            articleId.printable(), index, entry.config.host, entry.config.port,
                         )
                     }
                     null
@@ -1195,7 +1196,7 @@ class NntpStreamingService(
                                             "resolved={}ms toList={}ms acquire={}ms async={}ms " +
                                             "send={}ms recv={}ms await={}ms write={}ms " +
                                             "(items={}, concurrency={}, readAhead={})",
-                                        name, firstArticleId,
+                                        name, firstArticleId?.printable(),
                                         ms(tResolved), ms(tToList), ms(tFirstAcq), ms(tFirstAsync),
                                         ms(tFirstSend), ms(tFirstRecv), ms(tFirstAwait), ms(tFirstWrite),
                                         items.size, concurrency, readAheadSegments,
@@ -1245,6 +1246,8 @@ class NntpStreamingService(
 
     private suspend fun fetchSegmentFromNntp(articleId: String): ByteArray {
         val sample = Timer.start(registry)
+        // The id as logged and reported: an NZB can put a CR/LF in it (it's never sent then).
+        val shown = articleId.printable()
         // Snapshot the timeout once so the warning log's "timed out after Nms" matches
         // the actual deadline used by withTimeout — a runtime override mid-fetch
         // shouldn't desync the log from the cancellation event.
@@ -1277,7 +1280,7 @@ class NntpStreamingService(
             if (breaker != null && !breaker.tryAcquirePermission()) {
                 logger.debug(
                     "Segment <{}> skipping pool[{}] ({}:{}) — circuit breaker is {}",
-                    articleId, index, entry.config.host, entry.config.port, breaker.state
+                    shown, index, entry.config.host, entry.config.port, breaker.state
                 )
                 segmentsFallback.increment()
                 return@firstNotNullOfOrNull null
@@ -1296,7 +1299,7 @@ class NntpStreamingService(
             logger.warn(
                 "Segment <{}>: every pool refused the breaker permit (likely HALF_OPEN with permit taken) — " +
                     "retrying with breakers disabled",
-                articleId,
+                shown,
             )
             fetchFromPools(useBreakers = false)
         } else {
@@ -1312,7 +1315,7 @@ class NntpStreamingService(
         segmentsFailed.increment()
         firstTimeout?.let { throw it }
         firstError?.let { throw it }
-        throw ArticleNotFoundException("Article <$articleId> not found on any pool")
+        throw ArticleNotFoundException("Article <$shown> not found on any pool")
     }
 
     /**
@@ -1331,6 +1334,7 @@ class NntpStreamingService(
         onFailure: (Exception) -> Unit,
     ): ByteArray? {
         val callStart = System.nanoTime()
+        val shown = articleId.printable()
         // Set once the breaker has heard how the call went. Any other way out (cancelled as the
         // reader seeks or stops, the pool closed, an error no arm below expects) hands the permit
         // back in the finally: a HALF_OPEN breaker has one, and if it's kept, the breaker stays
@@ -1361,7 +1365,7 @@ class NntpStreamingService(
                 )
                 settled = true
                 if (index > 0) {
-                    logger.debug("Segment <{}> served by fallback pool[{}]", articleId, index)
+                    logger.debug("Segment <{}> served by fallback pool[{}]", shown, index)
                 }
             }
             payload
@@ -1371,7 +1375,7 @@ class NntpStreamingService(
             if (index < poolCount - 1) {
                 logger.debug(
                     "Segment <{}> not found on pool[{}] ({}:{}), trying pool[{}]",
-                    articleId, index, entry.config.host, entry.config.port, index + 1
+                    shown, index, entry.config.host, entry.config.port, index + 1
                 )
                 segmentsFallback.increment()
             }
@@ -1382,7 +1386,7 @@ class NntpStreamingService(
             currentCoroutineContext().ensureActive()
             val poolName = entry.name
             val timeout = SegmentTimeoutException(
-                articleId, timeoutMs, "Segment <$articleId> timed out after ${timeoutMs}ms on pool[$index] ($poolName)", e,
+                articleId, timeoutMs, "Segment <$shown> timed out after ${timeoutMs}ms on pool[$index] ($poolName)", e,
             )
             breaker?.onError(
                 System.nanoTime() - callStart,
@@ -1407,14 +1411,14 @@ class NntpStreamingService(
             if (index < poolCount - 1) {
                 logger.warn(
                     "Segment <{}> timed out after {}ms on pool[{}] ({}:{}), trying pool[{}]",
-                    articleId, timeoutMs,
+                    shown, timeoutMs,
                     index, entry.config.host, entry.config.port, index + 1
                 )
                 segmentsFallback.increment()
             } else {
                 logger.warn(
                     "Segment <{}> timed out after {}ms on all {} pool(s)",
-                    articleId, timeoutMs, poolCount
+                    shown, timeoutMs, poolCount
                 )
             }
             null
@@ -1429,7 +1433,7 @@ class NntpStreamingService(
             if (index < poolCount - 1) {
                 logger.warn(
                     "Segment <{}> NNTP error on pool[{}] ({}:{}) — {}: {}",
-                    articleId, index, entry.config.host, entry.config.port,
+                    shown, index, entry.config.host, entry.config.port,
                     e::class.simpleName, e.message
                 )
                 segmentsFallback.increment()
@@ -1446,7 +1450,7 @@ class NntpStreamingService(
             if (index < poolCount - 1) {
                 logger.warn(
                     "Segment <{}> I/O error on pool[{}] ({}:{}) — {}: {}",
-                    articleId, index, entry.config.host, entry.config.port,
+                    shown, index, entry.config.host, entry.config.port,
                     e::class.simpleName, e.message
                 )
                 segmentsFallback.increment()

@@ -5,6 +5,7 @@ import io.micrometer.core.instrument.Timer
 import io.skjaere.nntp.ArticleNotFoundException
 import io.skjaere.nntp.NntpException
 import io.skjaere.nzbstreamer.nzb.NzbDocument
+import io.skjaere.nzbstreamer.nzb.printable
 import io.skjaere.nzbstreamer.stream.NntpPriority
 import io.skjaere.nzbstreamer.stream.NntpStreamingService
 import io.skjaere.nzbstreamer.stream.StatCheck
@@ -83,7 +84,8 @@ class VerificationService(
     // Carry the per-segment position within its file (and the file's name/size)
     // alongside each unit of work, so when a segment is missing we can log WHERE
     // in the file it sits — useful for distinguishing "this NZB is mostly broken"
-    // from "just one segment lost at position N/M".
+    // from "just one segment lost at position N/M". The name, and the id where it's
+    // reported, are escaped: an NZB can put a CR/LF in either.
     private data class SegmentToCheck(
         val segment: io.skjaere.nzbstreamer.nzb.NzbSegment,
         val fileName: String,
@@ -92,7 +94,7 @@ class VerificationService(
     )
 
     private fun segmentsOf(nzb: NzbDocument): List<SegmentToCheck> = nzb.files.flatMap { file ->
-        val name = file.yencHeaders?.name ?: file.subject
+        val name = (file.yencHeaders?.name ?: file.subject).printable()
         val total = file.segments.size
         file.segments.mapIndexed { idx, segment ->
             SegmentToCheck(segment, name, idx + 1, total)
@@ -130,7 +132,7 @@ class VerificationService(
         // segment.number is the NZB-declared segment number (sometimes differs
         // from list position when the NZB enumerates out of order). The counts tell
         // a takedown (every answered article missing) from a gap.
-        val message = "Missing article ${missing.segment.articleId} at " +
+        val message = "Missing article ${missing.segment.articleId.printable()} at " +
             "position ${missing.positionInFile}/${missing.totalSegmentsInFile} " +
             "(segment.number=${missing.segment.number}) " +
             "of file '${missing.fileName}' " +
@@ -151,7 +153,7 @@ class VerificationService(
      */
     private fun failed(check: StatCheck, segmentsToVerify: List<SegmentToCheck>, cause: Throwable): VerificationResult {
         val where = check.unanswered.firstOrNull()?.let { segmentsToVerify[it] }?.let {
-            " for article ${it.segment.articleId} at position ${it.positionInFile}/${it.totalSegmentsInFile} " +
+            " for article ${it.segment.articleId.printable()} at position ${it.positionInFile}/${it.totalSegmentsInFile} " +
                 "of file '${it.fileName}'"
         }.orEmpty()
         val message = "No provider could answer$where: ${cause.message ?: cause}"

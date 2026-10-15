@@ -8,7 +8,8 @@ import io.skjaere.nntp.NntpException
  * timeout, so not a [kotlinx.coroutines.CancellationException]: a caller can tell it from its own
  * cancellation, and a stream's reader gets it as the channel's cause. The article may still
  * exist; unlike [io.skjaere.nntp.ArticleNotFoundException], this says nothing about that. [cause]
- * is the timeout that fired on the first pool that timed out.
+ * is the timeout that fired on the first pool that timed out. [articleId] is the id as given; the
+ * message shows it with any control characters escaped.
  */
 class SegmentTimeoutException(
     val articleId: String,
