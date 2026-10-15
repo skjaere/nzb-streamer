@@ -11,15 +11,20 @@ import io.skjaere.nntp.ArticleNotFoundException
 import io.skjaere.nntp.NntpConnectionException
 import io.skjaere.nntp.YencEvent
 import io.skjaere.nntp.YencHeaders
+import io.micrometer.core.instrument.Metrics
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry
 import io.skjaere.nzbstreamer.config.NntpConfig
+import io.skjaere.nzbstreamer.config.StreamingConfig
 import io.skjaere.nzbstreamer.nzb.NzbDocument
 import io.skjaere.nzbstreamer.nzb.NzbFile
 import io.skjaere.nzbstreamer.nzb.NzbSegment
 import io.skjaere.nzbstreamer.queue.SegmentQueueService
+import io.skjaere.nzbstreamer.seekable.SegmentRandomAccessStream
 import io.skjaere.nzbstreamer.stream.ArchiveStreamingService
 import io.skjaere.nzbstreamer.stream.NamedSplits
 import io.skjaere.nzbstreamer.stream.NntpPriority
 import io.skjaere.nzbstreamer.stream.NntpStreamingService
+import io.skjaere.nzbstreamer.stream.SegmentTimeoutException
 import io.skjaere.yenc.YencEncoder
 import java.io.ByteArrayOutputStream
 import java.io.IOException
@@ -30,6 +35,7 @@ import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertTrue
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
@@ -308,6 +314,85 @@ class StreamFailureTest {
                     channel.cancel()
                 }
             }
+        }
+    }
+
+    // The library's own segment timeout reaches callers as a failure of its own, which they can
+    // tell from their own cancellation, and readers as the channel's cause, not an early end.
+
+    private val segmentTimeoutMs = 300L
+
+    /** Gives a segment [segmentTimeoutMs] on each pool. */
+    private fun impatientService(server: FakeNntpServer) = NntpStreamingService(
+        listOf(NntpConfig("127.0.0.1", server.port, "", "", useTls = false, maxConnections = 4)),
+        StreamingConfig(segmentFetchTimeoutMs = segmentTimeoutMs),
+    ).also { runBlocking { it.connect() } }
+
+    private fun Throwable?.isSegmentTimeout() =
+        generateSequence(this) { it.cause }.any { it is SegmentTimeoutException }
+
+    private val late = 2
+
+    @Test
+    fun `a segment that times out ends the read with the timeout as its cause`() = runBlocking<Unit> {
+        // Segment 2 is held back past the segment timeout.
+        impatientService(server(held = setOf(late))).use { service ->
+            val writer = startStream(service)
+            val before = ByteArray(segmentSize * late)
+            withTimeout(5_000) { writer.channel.readFully(before) }
+            assertContentEquals(segments[0] + segments[1], before)
+
+            val (after, cause) = withTimeout(5_000) { writer.channel.readToEnd() }
+            assertEquals(0, after.size)
+            assertTrue(cause.isSegmentTimeout(), "closed with: $cause")
+        }
+    }
+
+    @Test
+    fun `streamSegments throws a segment timeout, not a cancellation`() = runBlocking<Unit> {
+        impatientService(server(held = setOf(late))).use { service ->
+            val failure = runCatching {
+                withTimeout(5_000) {
+                    service.streamSegments(queue(), concurrency = 4, readAheadSegments = 6, name = "test") { channel ->
+                        channel.readToEnd()
+                    }
+                }
+            }.exceptionOrNull()
+            assertTrue(failure !is CancellationException && failure.isSegmentTimeout(), "failed with: $failure")
+        }
+    }
+
+    /** Preparing a release reads archive headers so, a segment at a time. */
+    @Test
+    fun `a random-access read of a segment that times out throws a segment timeout, not a cancellation`() = runBlocking<Unit> {
+        impatientService(server(held = setOf(late))).use { service ->
+            val stream = SegmentRandomAccessStream(NzbDocument(listOf(file())), service)
+            val failure = stream.use {
+                it.seek(segmentSize.toLong() * late)
+                runCatching { withTimeout(5_000) { it.read(ByteArray(16), 0, 16) } }.exceptionOrNull()
+            }
+            assertTrue(failure !is CancellationException && failure.isSegmentTimeout(), "failed with: $failure")
+        }
+    }
+
+    /**
+     * A caller's own timeout around a fetch is the caller's: it ends the fetch as the caller's
+     * cancellation, and doesn't count as the pool timing out.
+     */
+    @Test
+    fun `a caller's timeout around a fetch is not a segment timeout`() = runBlocking<Unit> {
+        val registry = SimpleMeterRegistry()
+        Metrics.addRegistry(registry)
+        try {
+            val provider = server(held = setOf(late))
+            // The segment timeout (5 s by default) is far off when the caller gives up.
+            service(provider).use { service ->
+                assertEquals(null, withTimeoutOrNull(300) { service.fetchSegment("seg$late@test") })
+                val timeouts = registry.find("nzb.segments.body_timeouts").tag("pool.name", "127.0.0.1:${provider.port}").counter()
+                assertEquals(0.0, timeouts?.count() ?: 0.0, "pool timeouts counted")
+            }
+        } finally {
+            Metrics.removeRegistry(registry)
         }
     }
 }

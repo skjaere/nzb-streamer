@@ -995,9 +995,8 @@ class NntpStreamingService(
      * A [consume] that has what it wants may close the channel ([ByteReadChannel.cancel]) and
      * return: the writer stops, and nothing that fails after that is thrown from here.
      *
-     * A segment that times out on every pool is not thrown from here yet: it closes the channel
-     * with a [CancellationException], which reads throw as such and [ByteReadChannel.isClosedForRead]
-     * takes for the end of the data.
+     * A segment that no pool delivers within the segment fetch timeout fails like any other, with a
+     * [SegmentTimeoutException].
      */
     suspend fun streamSegments(
         queue: Flow<SegmentQueueItem>,
@@ -1193,6 +1192,9 @@ class NntpStreamingService(
     /**
      * One decoded segment, through the segment cache and provider fallback like streaming.
      * For random access (archive headers), where streaming's read-ahead would be wasted.
+     *
+     * @throws SegmentTimeoutException when no pool delivers it and one timed out (the segment
+     *   fetch timeout), even if the others said 430: the one that timed out may have it.
      */
     suspend fun fetchSegment(articleId: String): ByteArray = downloadSegment(articleId)
 
@@ -1237,13 +1239,13 @@ class NntpStreamingService(
         // Track timeout failures across pools. ArticleNotFoundException means the server
         // gave a definitive 430; a timeout means we don't actually know whether the
         // article is missing or just slow. If ANY pool timed out, surface as a
-        // TimeoutCancellationException rather than ArticleNotFoundException — otherwise
+        // SegmentTimeoutException rather than ArticleNotFoundException — otherwise
         // a transient slow-NNTP incident gets misclassified as "article permanently
         // missing", which downstream (NzbImportService, NzbFileResource) treats as
         // DMCA/retention drop and blocklists the NZB or skips it silently. The same goes
         // for a pool that failed any other way (its connection dropped mid-article, a
         // protocol or decoding error): surface that failure if no pool timed out.
-        var firstTimeout: TimeoutCancellationException? = null
+        var firstTimeout: SegmentTimeoutException? = null
         var firstError: Exception? = null
         var anyAttempted = false
         suspend fun fetchFromPools(useBreakers: Boolean): ByteArray? = snapshot.withIndex().firstNotNullOfOrNull { (index, entry) ->
@@ -1259,7 +1261,7 @@ class NntpStreamingService(
             anyAttempted = true
             fetchFromPool(articleId, entry, index, snapshot.size, breaker, timeoutMs) { e ->
                 when {
-                    e is TimeoutCancellationException -> if (firstTimeout == null) firstTimeout = e
+                    e is SegmentTimeoutException -> if (firstTimeout == null) firstTimeout = e
                     firstError == null -> firstError = e
                 }
             }
@@ -1291,8 +1293,8 @@ class NntpStreamingService(
 
     /**
      * One attempt at [articleId] on [entry]'s pool, reporting to [breaker] (if any) how it went.
-     * Returns null to move on to the next pool; a failure other than a clean 430 (a timeout, a
-     * connection that dropped) also goes to [onFailure].
+     * Returns null to move on to the next pool; a failure other than a clean 430 (a timeout, as a
+     * [SegmentTimeoutException], a connection that dropped) also goes to [onFailure].
      */
     @Suppress("LongParameterList", "LongMethod")
     private suspend fun fetchFromPool(
@@ -1351,14 +1353,20 @@ class NntpStreamingService(
             }
             null
         } catch (e: TimeoutCancellationException) {
+            // This attempt's own timeout only: a caller's timeout (or other cancellation) has
+            // cancelled this coroutine too, and goes on up as the caller's.
+            currentCoroutineContext().ensureActive()
             val poolName = entry.name
+            val timeout = SegmentTimeoutException(
+                articleId, timeoutMs, "Segment <$articleId> timed out after ${timeoutMs}ms on pool[$index] ($poolName)", e,
+            )
             breaker?.onError(
                 System.nanoTime() - callStart,
                 java.util.concurrent.TimeUnit.NANOSECONDS,
-                e,
+                timeout,
             )
             settled = true
-            onFailure(e)
+            onFailure(timeout)
             // Count every per-pool timeout, regardless of whether a later pool
             // succeeded. Useful as its own rate panel even with the body-duration
             // fix below — easier to alert on "rate(timeouts) > N/min" than on a
