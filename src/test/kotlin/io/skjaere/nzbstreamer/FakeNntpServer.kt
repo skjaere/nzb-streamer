@@ -17,12 +17,14 @@ import kotlin.concurrent.thread
  * [stat] answers `STAT <id>` (true: 223, false: 430) and [body] answers `BODY <id>` (an encoded
  * yEnc article, or null for 430). Both get the id with its angle brackets and may block, e.g. on a
  * latch, which holds back that connection's later answers too. When [dropAfter] gives a number for
- * an article, the connection drops after that many bytes of its body, as a provider's can.
+ * an article, the connection drops after that many bytes of its body, as a provider's can; when
+ * [dropOnStat] is true for an id, the connection drops instead of answering its STAT.
  */
 class FakeNntpServer(
     private val stat: (id: String) -> Boolean = { false },
     private val body: (id: String) -> ByteArray? = { null },
     private val dropAfter: (id: String) -> Int? = { null },
+    private val dropOnStat: (id: String) -> Boolean = { false },
 ) : Closeable {
     private val server = ServerSocket(0, 50, InetAddress.getLoopbackAddress())
     private val sockets = CopyOnWriteArrayList<Socket>()
@@ -59,6 +61,7 @@ class FakeNntpServer(
             when (command.substringBefore(' ').uppercase()) {
                 "STAT" -> {
                     statsRead += id
+                    if (dropOnStat(id)) break
                     out.line(if (stat(id)) "223 0 $id" else "430 No such article")
                 }
                 "BODY" -> {

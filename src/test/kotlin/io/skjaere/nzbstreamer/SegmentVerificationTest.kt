@@ -28,7 +28,6 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.BeforeEach
-import org.junit.jupiter.api.Disabled
 import org.junit.jupiter.api.Test
 import java.net.ServerSocket
 
@@ -227,31 +226,35 @@ class SegmentVerificationTest {
         }
     }
 
-    // Never ran before (non-Unit test body); on running it, the cause is NntpProtocolException.
-    @Disabled("Pre-existing: closing the server mid-session surfaces NntpProtocolException, not NntpConnectionException")
+    // Stopping the mock server (cancelling its scope, closing its listening socket) leaves the
+    // connection it already accepted serving, and that answers an unmocked STAT with 500, a
+    // protocol error: this test never saw a connection error. This provider drops the connection
+    // when the STATs come, the retry's connection too.
     @Test
     fun `verifySegments returns Failure on NNTP connection error`() = runBlocking<Unit> {
         val data = "test file content".toByteArray()
-        registerYencBody("<seg1@test>", "testfile.rar", data)
+        val provider = FakeNntpServer(
+            body = { id -> YencEncoder.encodeSinglePart(data, "testfile.rar").data.takeIf { id == "<seg1@test>" } },
+            dropOnStat = { true },
+        )
 
-        val streamingService = createStreamingService(socket.localPort)
-        streamingService.use {
-            val enrichmentService = NzbEnrichmentService(streamingService)
-            val verificationService = VerificationService(streamingService, concurrency = 1)
-            val nzb = createMultiSegmentNzb(
-                "file1" to listOf("seg1@test", "seg2@test")
-            )
+        provider.use {
+            val streamingService = createStreamingService(provider.port)
+            streamingService.use {
+                val enrichmentService = NzbEnrichmentService(streamingService)
+                val verificationService = VerificationService(streamingService, concurrency = 1)
+                val nzb = createMultiSegmentNzb(
+                    "file1" to listOf("seg1@test", "seg2@test")
+                )
 
-            val enrichResult = enrichmentService.enrich(nzb)
-            assertIs<EnrichmentResult.Success>(enrichResult)
+                val enrichResult = enrichmentService.enrich(nzb)
+                assertIs<EnrichmentResult.Success>(enrichResult)
 
-            // Shut down the mock server to cause a connection error on STAT
-            serverScope.cancel()
-            socket.close()
-
-            val verifyResult = verificationService.verifySegments(enrichResult.enrichedNzb)
-            assertIs<VerificationResult.Failure>(verifyResult)
-            assertIs<NntpConnectionException>(verifyResult.cause)
+                val verifyResult = verificationService.verifySegments(enrichResult.enrichedNzb)
+                assertIs<VerificationResult.Failure>(verifyResult)
+                assertIs<NntpConnectionException>(verifyResult.cause)
+                assertTrue(provider.statsRead.isNotEmpty(), "the connection should drop at a STAT")
+            }
         }
     }
 
