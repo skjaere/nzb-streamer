@@ -103,9 +103,10 @@ class VerificationService(
         priority: NntpPriority,
         progress: ((checked: Int, total: Int) -> Unit)?,
     ): VerificationResult {
-        // Pipelined STATs across the connections (one round trip per batch, not per article).
-        val present = try {
-            streamingService.statManyAcrossPools(
+        // Pipelined STATs across the connections (one round trip per batch, not per article),
+        // stopping at the first article no provider has.
+        val check = try {
+            streamingService.statUntilMissing(
                 segmentsToVerify.map { it.segment.articleId }, currentConcurrency, priority, progress,
             )
         } catch (e: NntpException) {
@@ -115,26 +116,30 @@ class VerificationService(
                 e
             )
         }
-        val firstMissing = present.indexOfFirst { !it }.takeIf { it >= 0 }?.let { segmentsToVerify[it] }
 
-        verificationSegments.increment(segmentsToVerify.size.toDouble())
+        verificationSegments.increment(check.answered.toDouble())
 
-        val missing = firstMissing ?: return VerificationResult.Success
+        val missing = check.missing.firstOrNull()?.let { segmentsToVerify[it] } ?: return VerificationResult.Success
         verificationMissing.increment(1.0)
         // Include position/total/filename so we can see WHERE in the file the
         // first missing segment sits — telling us whether the NZB is broken at
         // the head, the middle, or the tail (which often correlates with the
         // root cause: head=indexer indexing miss, tail=expired retention).
         // segment.number is the NZB-declared segment number (sometimes differs
-        // from list position when the NZB enumerates out of order).
+        // from list position when the NZB enumerates out of order). The counts tell
+        // a takedown (every answered article missing) from a gap.
         val message = "Missing article ${missing.segment.articleId} at " +
             "position ${missing.positionInFile}/${missing.totalSegmentsInFile} " +
             "(segment.number=${missing.segment.number}) " +
-            "of file '${missing.fileName}'"
+            "of file '${missing.fileName}' " +
+            "(${check.missing.size} of ${check.answered} answered articles missing, ${check.total} to check)"
         logger.warn(message)
         return VerificationResult.MissingArticles(
             message,
-            ArticleNotFoundException(message)
+            ArticleNotFoundException(message),
+            missingCount = check.missing.size,
+            answeredCount = check.answered,
+            totalCount = check.total,
         )
     }
 }

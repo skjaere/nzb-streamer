@@ -1,0 +1,92 @@
+package io.skjaere.nzbstreamer
+
+import java.io.Closeable
+import java.io.OutputStream
+import java.net.InetAddress
+import java.net.ServerSocket
+import java.net.Socket
+import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.atomic.AtomicInteger
+import kotlin.concurrent.thread
+
+/**
+ * An NNTP server for tests that need to control when answers come. Each connection is served by
+ * its own thread, which reads one command, answers it, then reads the next: pipelined commands
+ * wait in the socket meanwhile, as on a server that answers them one by one.
+ *
+ * [stat] answers `STAT <id>` (true: 223, false: 430) and [body] answers `BODY <id>` (an encoded
+ * yEnc article, or null for 430). Both get the id with its angle brackets and may block, e.g. on a
+ * latch, which holds back that connection's later answers too.
+ */
+class FakeNntpServer(
+    private val stat: (id: String) -> Boolean = { false },
+    private val body: (id: String) -> ByteArray? = { null },
+) : Closeable {
+    private val server = ServerSocket(0, 50, InetAddress.getLoopbackAddress())
+    private val sockets = CopyOnWriteArrayList<Socket>()
+
+    val port: Int get() = server.localPort
+
+    /** Connections accepted so far. */
+    val connections = AtomicInteger()
+
+    /** STAT ids in the order this server read them (over all connections). */
+    val statsRead = CopyOnWriteArrayList<String>()
+
+    /** BODY ids in the order this server read them (over all connections). */
+    val bodiesRead = CopyOnWriteArrayList<String>()
+
+    init {
+        thread(isDaemon = true, name = "fake-nntp-accept") {
+            while (!server.isClosed) {
+                val socket = runCatching { server.accept() }.getOrNull() ?: break
+                connections.incrementAndGet()
+                sockets += socket
+                thread(isDaemon = true, name = "fake-nntp-conn") { runCatching { serve(socket) } }
+            }
+        }
+    }
+
+    private fun serve(socket: Socket) = socket.use {
+        val reader = socket.getInputStream().bufferedReader(Charsets.ISO_8859_1)
+        val out = socket.getOutputStream()
+        out.line("200 fake server ready")
+        while (true) {
+            val command = reader.readLine() ?: break
+            val id = command.substringAfter(' ', "").trim()
+            when (command.substringBefore(' ').uppercase()) {
+                "STAT" -> {
+                    statsRead += id
+                    out.line(if (stat(id)) "223 0 $id" else "430 No such article")
+                }
+                "BODY" -> {
+                    bodiesRead += id
+                    val article = body(id)
+                    if (article == null) {
+                        out.line("430 No such article")
+                    } else {
+                        out.write("222 0 $id\r\n".toByteArray(Charsets.ISO_8859_1))
+                        out.write(article)
+                        out.line(".")
+                    }
+                }
+                "DATE" -> out.line("111 20261015000000")
+                "QUIT" -> {
+                    out.line("205 bye")
+                    break
+                }
+                else -> out.line("500 What?")
+            }
+        }
+    }
+
+    private fun OutputStream.line(text: String) {
+        write("$text\r\n".toByteArray(Charsets.ISO_8859_1))
+        flush()
+    }
+
+    override fun close() {
+        server.close()
+        sockets.forEach { runCatching { it.close() } }
+    }
+}

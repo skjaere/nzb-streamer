@@ -28,12 +28,17 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
-import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.channels.ReceiveChannel
 import kotlinx.coroutines.channels.consumeEach
 import kotlinx.coroutines.channels.produce
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.job
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.onEach
@@ -598,13 +603,14 @@ class NntpStreamingService(
     }
 
     /**
-     * STATs many articles with pipelining ([NntpClientPool.statPipelined]): the ids are split
-     * into chunks run on up to [concurrency] connections of the first pool at once; articles
-     * that pool lacks are asked of the next pool, and so on. Returns, per article (in order),
-     * whether any pool has it.
+     * STATs many articles with pipelining ([io.skjaere.nntp.NntpClient.statPipelined]) and
+     * returns, per article (in order), whether any pool has it. Each pool's articles are split into
+     * batches run on up to [concurrency] of its connections at once (never more than the pool's
+     * maxConnections); an article a pool lacks is asked of the next pool straight away, while that
+     * pool is still answering the others.
      *
-     * [onProgress] gets (answered, total) as the first pool answers, so a progress bar moves
-     * steadily; re-asking other pools for the few missing ones happens after.
+     * [onProgress] gets (answered, total) as articles get their final answer: found on a pool, or
+     * missing on the last one.
      */
     suspend fun statManyAcrossPools(
         articleIds: List<String>,
@@ -612,38 +618,197 @@ class NntpStreamingService(
         priority: NntpPriority = NntpPriority.HEALTH_CHECK,
         onProgress: ((answered: Int, total: Int) -> Unit)? = null,
     ): List<Boolean> {
-        if (articleIds.isEmpty()) return emptyList()
+        val missing = statPipelinedAcrossPools(articleIds, concurrency, priority, onProgress, stopAtMissing = false)
+            .missing.toSet()
+        return articleIds.indices.map { it !in missing }
+    }
+
+    /**
+     * Like [statManyAcrossPools], but stops at the first article that no pool has, for
+     * availability checks where one missing article settles the answer. The STATs still owed are
+     * cancelled, so the pool drains those connections (or discards them if the server is slow to
+     * answer), and the ones not sent yet never go out.
+     */
+    suspend fun statUntilMissing(
+        articleIds: List<String>,
+        concurrency: Int,
+        priority: NntpPriority = NntpPriority.HEALTH_CHECK,
+        onProgress: ((answered: Int, total: Int) -> Unit)? = null,
+    ): StatCheck = statPipelinedAcrossPools(articleIds, concurrency, priority, onProgress, stopAtMissing = true)
+
+    private suspend fun statPipelinedAcrossPools(
+        articleIds: List<String>,
+        concurrency: Int,
+        priority: NntpPriority,
+        onProgress: ((answered: Int, total: Int) -> Unit)?,
+        stopAtMissing: Boolean,
+    ): StatCheck {
+        val total = articleIds.size
         val snapshot = poolLock.read { pools.toList() }
-        val present = BooleanArray(articleIds.size)
-        var pending = articleIds.indices.toList()
+        if (total == 0 || snapshot.isEmpty()) {
+            // With no pool, nothing is there.
+            val missing = articleIds.indices.toList().let { if (stopAtMissing) it.take(1) else it }
+            return StatCheck(missing, missing.size, total)
+        }
+        val missing = java.util.concurrent.ConcurrentLinkedQueue<Int>()
         val answered = java.util.concurrent.atomic.AtomicInteger()
-        snapshot.forEachIndexed { poolIndex, entry ->
-            if (pending.isEmpty()) return@forEachIndexed
-            val first = poolIndex == 0
-            // Enough chunks to use the connections, each big enough to keep a pipeline full.
-            val chunkSize = maxOf(STAT_CHUNK_MIN, (pending.size + concurrency - 1) / concurrency)
+        val passedOn = java.util.concurrent.atomic.AtomicIntegerArray(snapshot.size)
+        val timer = StatCheckTimer(snapshot)
+        // asks[p]: the articles to ask pool p for. Those it lacks go on to asks[p + 1] as soon as
+        // it says so, and asks[p + 1] closes once pool p has answered everything.
+        val asks = snapshot.map { Channel<Int>(Channel.UNLIMITED) }
+        articleIds.indices.forEach { asks[0].trySend(it) }
+        asks[0].close()
+        try {
             coroutineScope {
-                val semaphore = Semaphore(concurrency)
-                pending.chunked(chunkSize).map { chunk ->
-                    async {
-                        semaphore.acquire()
-                        try {
-                            val results = entry.pool.statPipelined(chunk.map { "<${articleIds[it]}>" }, priority.value) { _, _ ->
-                                if (first) onProgress?.invoke(answered.incrementAndGet(), articleIds.size)
+                launch {
+                    val check = coroutineContext.job
+                    snapshot.forEachIndexed { p, entry ->
+                        launch {
+                            askPool(entry, p, asks[p], articleIds, concurrency, priority, timer) { index, result ->
+                                when {
+                                    result is StatResult.Found -> {
+                                        val done = answered.incrementAndGet()
+                                        onProgress?.invoke(done, total)
+                                    }
+                                    // Not a 430: statPipelined throws for it once its batch is done.
+                                    result is StatResult.NotFound && result.code != 430 -> Unit
+                                    p < snapshot.lastIndex -> {
+                                        passedOn.incrementAndGet(p)
+                                        asks[p + 1].trySend(index)
+                                    }
+                                    else -> {
+                                        missing += index
+                                        val done = answered.incrementAndGet()
+                                        onProgress?.invoke(done, total)
+                                        if (stopAtMissing) check.cancel()
+                                    }
+                                }
                             }
-                            chunk.zip(results).forEach { (index, result) -> if (result is StatResult.Found) present[index] = true }
-                        } finally {
-                            semaphore.release()
+                            asks.getOrNull(p + 1)?.close()
+                            if (passedOn[p] > 0) {
+                                logger.debug(
+                                    "{} of {} articles not on pool[{}] ({}:{}), asked of the next pool",
+                                    passedOn[p], total, p, entry.config.host, entry.config.port,
+                                )
+                            }
                         }
                     }
-                }.awaitAll()
+                }
             }
-            pending = pending.filterNot { present[it] }
-            if (pending.isNotEmpty() && poolIndex < snapshot.size - 1) {
-                logger.debug("{} of {} articles not on pool[{}] ({}:{}), asking the next pool", pending.size, articleIds.size, poolIndex, entry.config.host, entry.config.port)
+        } finally {
+            timer.log(total, answered.get(), missing.size, stopped = stopAtMissing && missing.isNotEmpty())
+        }
+        return StatCheck(missing.toList(), answered.get(), total)
+    }
+
+    /**
+     * Asks [entry]'s pool for every article [asks] brings (indices into [articleIds]), in
+     * pipelined batches on up to [concurrency] of its connections, until [asks] is closed.
+     */
+    @Suppress("LongParameterList")
+    private suspend fun askPool(
+        entry: PoolEntry,
+        poolIndex: Int,
+        asks: ReceiveChannel<Int>,
+        articleIds: List<String>,
+        concurrency: Int,
+        priority: NntpPriority,
+        timer: StatCheckTimer,
+        onAnswer: (index: Int, result: StatResult) -> Unit,
+    ) = coroutineScope {
+        val connections = minOf(concurrency, entry.config.maxConnections).coerceAtLeast(1)
+        // Enough batches to use the connections, each big enough to keep a pipeline full.
+        val batchSize = maxOf(STAT_CHUNK_MIN, (articleIds.size + connections - 1) / connections)
+        repeat(connections) {
+            launch {
+                for (first in asks) {
+                    val batch = mutableListOf(first)
+                    while (batch.size < batchSize) batch += asks.tryReceive().getOrNull() ?: break
+                    statBatch(entry, poolIndex, batch.map { articleIds[it] }, priority, timer) { i, result ->
+                        onAnswer(batch[i], result)
+                    }
+                }
             }
         }
-        return present.toList()
+    }
+
+    /**
+     * STATs [ids] pipelined on one connection of [entry]'s pool, passing each answer to
+     * [onResult] (an index into [ids]). Stops at the next answer once the calling coroutine is
+     * cancelled, even when the rest are already buffered: the pool then drains what's still owed.
+     */
+    @Suppress("LongParameterList")
+    private suspend fun statBatch(
+        entry: PoolEntry,
+        poolIndex: Int,
+        ids: List<String>,
+        priority: NntpPriority,
+        timer: StatCheckTimer,
+        onResult: (index: Int, result: StatResult) -> Unit,
+    ) {
+        val context = currentCoroutineContext()
+        val asked = System.nanoTime()
+        var connected = 0L
+        var firstAnswer = 0L
+        var answers = 0
+        var connection = -1L
+        try {
+            entry.pool.withClient(priority.value) { client ->
+                connected = System.nanoTime()
+                connection = client.connection.id
+                timer.waitedForConnection(connected - asked)
+                client.statPipelined(ids.map { "<$it>" }) { i, result ->
+                    context.ensureActive()
+                    if (answers++ == 0) firstAnswer = System.nanoTime()
+                    timer.answered()
+                    onResult(i, result)
+                }
+            }
+        } finally {
+            val ms = { from: Long, to: Long -> if (from == 0L || to == 0L) -1L else (to - from) / 1_000_000 }
+            val done = System.nanoTime()
+            logger.debug(
+                "STAT batch on pool[{}] conn={}: {} of {} answered; waited {} ms for the connection, " +
+                    "first answer after {} ms, {} ms in all{}",
+                poolIndex, connection, answers, ids.size, ms(asked, connected), ms(connected, firstAnswer),
+                ms(asked, done), if (context.isActive) "" else " (stopped)",
+            )
+        }
+    }
+
+    /** Where a [statPipelinedAcrossPools] call's time goes, for its log line. */
+    private inner class StatCheckTimer(private val snapshot: List<PoolEntry>) {
+        private val start = System.nanoTime()
+        private val openedBefore = snapshot.map { it.pool.connectionsOpened }
+        private val firstAnswerNs = AtomicLong(0)
+        private val longestWaitNs = AtomicLong(0)
+        private val answers = java.util.concurrent.atomic.AtomicInteger()
+
+        fun waitedForConnection(ns: Long) {
+            longestWaitNs.accumulateAndGet(ns, ::maxOf)
+        }
+
+        fun answered() {
+            answers.incrementAndGet()
+            firstAnswerNs.compareAndSet(0, System.nanoTime() - start)
+        }
+
+        fun log(total: Int, answered: Int, missing: Int, stopped: Boolean) {
+            val ms = (System.nanoTime() - start) / 1_000_000
+            val opened = snapshot.zip(openedBefore) { entry, before -> entry.pool.connectionsOpened - before }
+            logger.info(
+                "STAT check of {} articles on {} pool(s){}: {} answered, {} missing in {} ms; " +
+                    "first answer after {} ms, longest wait for a connection {} ms, {} answers/s, " +
+                    "connections opened per pool {}",
+                total, snapshot.size, if (stopped) " stopped at a missing article" else "",
+                answered, missing, ms,
+                if (firstAnswerNs.get() == 0L) -1 else firstAnswerNs.get() / 1_000_000,
+                longestWaitNs.get() / 1_000_000,
+                if (ms == 0L) answers.get() else answers.get() * 1000L / ms,
+                opened,
+            )
+        }
     }
 
     private fun orderForStat(snapshot: List<PoolEntry>): List<PoolEntry> {
