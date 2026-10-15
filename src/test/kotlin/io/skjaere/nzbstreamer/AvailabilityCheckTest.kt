@@ -147,6 +147,21 @@ class AvailabilityCheckTest {
     }
 
     @Test
+    fun `one provider - the 430 that ends the check sends no more STATs`() = runBlocking<Unit> {
+        // s31's answer comes as half the window (64) is answered: where statPipelined tops it up.
+        val provider = server { id -> id != "<s31@test>" }
+        service(provider, connections = 1).use { service ->
+            val result = VerificationService(service, concurrency = 1).verifySegments(nzb(ids(1000)))
+            assertIs<VerificationResult.MissingArticles>(result)
+            assertTrue(result.message.contains("s31@test"), result.message)
+
+            // Once the drained connection is back, the server has read every STAT it was sent.
+            assertConnectionsInStep(service, connections = 1)
+            assertEquals(64, provider.statsRead.count { !it.startsWith("<probe") }, "STATs sent")
+        }
+    }
+
+    @Test
     fun `several providers - an article missing on the first but on the second is not missing`() = runBlocking<Unit> {
         val primary = server { id -> id != "<s3@test>" }
         val fill = server { id -> id == "<s3@test>" }

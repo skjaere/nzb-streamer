@@ -879,8 +879,10 @@ class NntpStreamingService(
 
     /**
      * STATs [ids] pipelined on one connection of [entry]'s pool, passing each answer to
-     * [onResult] (an index into [ids]) once. Stops at the next answer once the calling coroutine is
-     * cancelled, even when the rest are already buffered: the pool then drains what's still owed.
+     * [onResult] (an index into [ids]) once. Stops once the calling coroutine is cancelled, at the
+     * next answer even when the rest are already buffered, or right after the answer that
+     * cancelled it (the 430 that ends a check), and sends no more STATs: the pool then drains
+     * what's still owed.
      * When the pool's own retry runs the batch again on a new connection, only the articles still
      * without an answer are asked.
      */
@@ -912,6 +914,9 @@ class NntpStreamingService(
                     timer.answered()
                     done[asking[i]] = true
                     onResult(asking[i], result)
+                    // An answer that ends the check cancels this coroutine: stop before
+                    // statPipelined tops up its window with STATs nobody wants.
+                    context.ensureActive()
                 }
             }
         } finally {
