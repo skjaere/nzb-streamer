@@ -4,8 +4,11 @@ import io.ktor.utils.io.ByteReadChannel
 import io.ktor.utils.io.WriterJob
 import io.ktor.utils.io.readAvailable
 import io.ktor.utils.io.readFully
+import io.ktor.utils.io.toByteArray
 import io.skjaere.compressionutils.SplitInfo
 import io.skjaere.nntp.ArticleNotFoundException
+import io.skjaere.nntp.NntpConnectionException
+import io.skjaere.nntp.YencEvent
 import io.skjaere.nntp.YencHeaders
 import io.skjaere.nzbstreamer.config.NntpConfig
 import io.skjaere.nzbstreamer.nzb.NzbDocument
@@ -14,6 +17,7 @@ import io.skjaere.nzbstreamer.nzb.NzbSegment
 import io.skjaere.nzbstreamer.queue.SegmentQueueService
 import io.skjaere.nzbstreamer.stream.ArchiveStreamingService
 import io.skjaere.nzbstreamer.stream.NamedSplits
+import io.skjaere.nzbstreamer.stream.NntpPriority
 import io.skjaere.nzbstreamer.stream.NntpStreamingService
 import io.skjaere.yenc.YencEncoder
 import java.io.ByteArrayOutputStream
@@ -113,6 +117,19 @@ class StreamFailureTest {
 
     private fun Throwable?.isMissingArticle() = generateSequence(this) { it.cause }.any { it is ArticleNotFoundException }
 
+    private fun Throwable?.isConnectionFailure() = generateSequence(this) { it.cause }.any { it is NntpConnectionException }
+
+    /**
+     * Serves every segment, but the connection drops partway through [dropped]'s body each time
+     * it is asked for; [missing] there is 430 instead.
+     */
+    private fun droppingServer(dropped: Set<Int>, missing: Set<Int> = emptySet()) = FakeNntpServer(
+        body = { id -> id.segment().takeUnless { it in missing }?.let { YencEncoder.encodeSinglePart(segments[it], "data.bin").data } },
+        dropAfter = { id -> 2_000.takeIf { id.segment() in dropped } },
+    ).also { servers += it }
+
+    private fun String.segment() = removePrefix("<seg").substringBefore('@').toInt()
+
     @Test
     fun `every byte before a missing article is delivered, then the read fails with its cause`() = runBlocking<Unit> {
         // The missing article's 430 comes once the reader has everything in front of it.
@@ -171,6 +188,48 @@ class StreamFailureTest {
             val ended = withTimeoutOrNull(2_000) { writer.channel.readToEnd() }
             assertTrue(ended != null, "the failure waited for the download in flight")
             assertTrue(ended.second.isMissingArticle(), "closed with: ${ended.second}")
+        }
+    }
+
+    /**
+     * A connection that drops partway through an article says nothing about whether the provider
+     * has it: the stream ends with the connection failure, which a reader can retry, not as a
+     * missing article, which it would give up on (and a caller might blocklist the release for).
+     */
+    @Test
+    fun `a connection that drops mid-article ends the stream with the connection failure`() = runBlocking<Unit> {
+        service(droppingServer(dropped = setOf(missing))).use { service ->
+            val writer = startStream(service)
+            val (_, cause) = writer.channel.readToEnd()
+            assertTrue(cause.isConnectionFailure() && !cause.isMissingArticle(), "closed with: $cause")
+        }
+    }
+
+    @Test
+    fun `an article one provider lacks and another's connection drops on is not called missing`() = runBlocking<Unit> {
+        val lacking = droppingServer(dropped = emptySet(), missing = setOf(missing))
+        val dropping = droppingServer(dropped = setOf(missing))
+        val configs = listOf(lacking, dropping).map { NntpConfig("127.0.0.1", it.port, "", "", useTls = false, maxConnections = 4) }
+        NntpStreamingService(configs).also { runBlocking { it.connect() } }.use { service ->
+            val writer = startStream(service)
+            val (_, cause) = writer.channel.readToEnd()
+            assertTrue(cause.isConnectionFailure() && !cause.isMissingArticle(), "closed with: $cause")
+        }
+    }
+
+    /** The same for a read through [NntpStreamingService.withClient] (preparing a release reads its files' first articles so). */
+    @Test
+    fun `a read one provider's connection drops on and another lacks is not called missing`() = runBlocking<Unit> {
+        val dropping = droppingServer(dropped = setOf(missing))
+        val lacking = droppingServer(dropped = emptySet(), missing = setOf(missing))
+        val configs = listOf(dropping, lacking).map { NntpConfig("127.0.0.1", it.port, "", "", useTls = false, maxConnections = 4) }
+        NntpStreamingService(configs).also { runBlocking { it.connect() } }.use { service ->
+            val failure = runCatching {
+                service.withClient(NntpPriority.PREPARE) { client ->
+                    client.bodyYenc("<seg$missing@test>").collect { if (it is YencEvent.Body) it.data.toByteArray() }
+                }
+            }.exceptionOrNull()
+            assertTrue(failure.isConnectionFailure() && !failure.isMissingArticle(), "failed with: $failure")
         }
     }
 

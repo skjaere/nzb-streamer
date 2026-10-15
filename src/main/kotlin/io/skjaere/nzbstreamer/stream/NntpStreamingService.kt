@@ -413,7 +413,8 @@ class NntpStreamingService(
      *  - [kotlinx.coroutines.CancellationException] — structured-concurrency
      *    cancellation, not our exception to swallow.
      *
-     * Throws the last fallback-triggering exception if every pool fails.
+     * Throws the last fallback-triggering exception if every pool fails, except that a 430
+     * never replaces another failure: a pool whose connection dropped may have the article.
      */
     @Suppress("TooGenericExceptionCaught")
     private suspend fun <T> withFallback(
@@ -432,6 +433,10 @@ class NntpStreamingService(
         val effectiveBreakerActive = snapshot.size > 1 &&
             !snapshot.all { circuitBreakerFor(it).state == CircuitBreaker.State.OPEN }
         var lastException: Throwable? = null
+        fun record(e: Throwable) {
+            if (e is ArticleNotFoundException && lastException.let { it != null && it !is ArticleNotFoundException }) return
+            lastException = e
+        }
         var anyAttempted = false
         val result = snapshot.withIndex().firstNotNullOfOrNull { (index, entry) ->
             val breaker = if (effectiveBreakerActive) circuitBreakerFor(entry) else null
@@ -444,7 +449,7 @@ class NntpStreamingService(
                 return@firstNotNullOfOrNull null
             }
             anyAttempted = true
-            tryOnePool(entry, breaker, index, snapshot.size, logPrefix, block) { lastException = it }
+            tryOnePool(entry, breaker, index, snapshot.size, logPrefix, block, ::record)
         }
         if (result != null) return result
         if (lastException != null) throw lastException!!
@@ -472,7 +477,7 @@ class NntpStreamingService(
             logPrefix
         )
         return snapshot.withIndex().firstNotNullOfOrNull { (index, entry) ->
-            tryOnePool(entry, breaker = null, index, snapshot.size, logPrefix, block) { lastException = it }
+            tryOnePool(entry, breaker = null, index, snapshot.size, logPrefix, block, ::record)
         } ?: throw (lastException ?: IllegalStateException(
             "$logPrefix: retry-with-breakers-disabled also produced no result — anyAttempted=$anyAttempted"
         ))
@@ -1073,8 +1078,11 @@ class NntpStreamingService(
         // TimeoutCancellationException rather than ArticleNotFoundException — otherwise
         // a transient slow-NNTP incident gets misclassified as "article permanently
         // missing", which downstream (NzbImportService, NzbFileResource) treats as
-        // DMCA/retention drop and blocklists the NZB or skips it silently.
+        // DMCA/retention drop and blocklists the NZB or skips it silently. The same goes
+        // for a pool that failed any other way (its connection dropped mid-article, a
+        // protocol or decoding error): surface that failure if no pool timed out.
         var firstTimeout: TimeoutCancellationException? = null
+        var firstError: Exception? = null
         var anyAttempted = false
         suspend fun fetchFromPools(useBreakers: Boolean): ByteArray? = snapshot.withIndex().firstNotNullOfOrNull { (index, entry) ->
             val breaker = if (useBreakers) circuitBreakerFor(entry) else null
@@ -1088,7 +1096,10 @@ class NntpStreamingService(
             }
             anyAttempted = true
             fetchFromPool(articleId, entry, index, snapshot.size, breaker, timeoutMs) { e ->
-                if (firstTimeout == null) firstTimeout = e
+                when {
+                    e is TimeoutCancellationException -> if (firstTimeout == null) firstTimeout = e
+                    firstError == null -> firstError = e
+                }
             }
         }
         // Every pool refused a permit (a probe race, or each HALF_OPEN breaker's one permit
@@ -1112,12 +1123,14 @@ class NntpStreamingService(
         }
         segmentsFailed.increment()
         firstTimeout?.let { throw it }
+        firstError?.let { throw it }
         throw ArticleNotFoundException("Article <$articleId> not found on any pool")
     }
 
     /**
      * One attempt at [articleId] on [entry]'s pool, reporting to [breaker] (if any) how it went.
-     * Returns null to move on to the next pool; a timeout also goes to [onTimeout].
+     * Returns null to move on to the next pool; a failure other than a clean 430 (a timeout, a
+     * connection that dropped) also goes to [onFailure].
      */
     @Suppress("LongParameterList", "LongMethod")
     private suspend fun fetchFromPool(
@@ -1127,7 +1140,7 @@ class NntpStreamingService(
         poolCount: Int,
         breaker: CircuitBreaker?,
         timeoutMs: Long,
-        onTimeout: (TimeoutCancellationException) -> Unit,
+        onFailure: (Exception) -> Unit,
     ): ByteArray? {
         val callStart = System.nanoTime()
         // Set once the breaker has heard how the call went. Any other way out (cancelled as the
@@ -1176,7 +1189,7 @@ class NntpStreamingService(
                 e,
             )
             settled = true
-            onTimeout(e)
+            onFailure(e)
             // Count every per-pool timeout, regardless of whether a later pool
             // succeeded. Useful as its own rate panel even with the body-duration
             // fix below — easier to alert on "rate(timeouts) > N/min" than on a
@@ -1211,6 +1224,7 @@ class NntpStreamingService(
                 e,
             )
             settled = true
+            onFailure(e)
             if (index < poolCount - 1) {
                 logger.warn(
                     "Segment <{}> NNTP error on pool[{}] ({}:{}) — {}: {}",
@@ -1227,6 +1241,7 @@ class NntpStreamingService(
                 e,
             )
             settled = true
+            onFailure(e)
             if (index < poolCount - 1) {
                 logger.warn(
                     "Segment <{}> I/O error on pool[{}] ({}:{}) — {}: {}",
