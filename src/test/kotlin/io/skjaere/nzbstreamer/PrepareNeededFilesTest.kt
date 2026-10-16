@@ -892,6 +892,52 @@ class PrepareNeededFilesTest {
     }
 
     /**
+     * A release of files posted under their names, with no archive, needs no names from the PAR2
+     * data: no recovery volume is read in place of its index when that lacks its first article
+     * (NR-10).
+     */
+    @Test
+    fun `a release of files posted under their names reads no recovery volume in place of its index`() {
+        val movie = bytes("movie", 200_000)
+        post("Movie.2020.1080p.mkv", movie)
+        val described = listOf("Movie.2020.1080p.mkv" to movie)
+        post("Movie.2020.1080p.nfo", bytes("nfo", 1_000))
+        missing += post("Movie.2020.1080p.par2", buildPar2File(described)).first()
+        val recovery = post("Movie.2020.1080p.vol000+001.par2", buildPar2File(described, recoveryBlock = 64 * 1024)) +
+            post("Movie.2020.1080p.vol001+002.par2", buildPar2File(described, recoveryBlock = 64 * 1024, slices = 2))
+
+        withStreamer { streamer, server ->
+            val prepared = assertIs<PrepareResult.Success>(streamer.prepare(nzb()), "prepare")
+            assertEquals(listOf("Movie.2020.1080p.mkv"), streamer.resolveStreamableFiles(prepared.metadata).map { it.path })
+            assertContentEquals(movie, streamer.streamed(prepared))
+            assertEquals(emptyList(), recovery.filter { it in server.bodiesRead }, "recovery volume articles fetched")
+        }
+    }
+
+    /**
+     * The recovery volume read in place of the PAR2 index is read from the first article fetched of
+     * it, whole, not that article fetched again: here its descriptions follow its block in that
+     * article, past its first 16 KB. So with it fetched with the rest (no index) and after them (an
+     * index that lacks its first article) (NR-10).
+     */
+    @ParameterizedTest
+    @ValueSource(booleans = [false, true])
+    fun `a recovery volume's first article is fetched once`(indexLacking: Boolean) {
+        val payload = bytes("movie", 200_000)
+        val named = volumes("Movie.2020", "Movie.2020.mkv", payload)
+        named.indices.reversed().forEach { v -> post(OBFUSCATED[v], named[v].second) }
+        if (indexLacking) missing += post("0b1c2d3e.par2", buildPar2File(named)).first()
+        val ids = post("0b1c2d3e.vol00+01.par2", buildPar2File(named, recoveryBlock = 20 * 1024), partSize = 64 * 1024)
+        assertEquals(1, ids.size)
+
+        withStreamer { streamer, server ->
+            val prepared = assertIs<PrepareResult.Success>(streamer.prepare(nzb()), "prepare")
+            assertEquals(named.map { it.first }, prepared.metadata.response.volumes)
+            assertEquals(1, server.bodiesRead.count { it == ids.single() }, "times the recovery volume's first article was fetched")
+        }
+    }
+
+    /**
      * A recovery volume posted under a name that tells nothing is fetched (it may be a volume) and,
      * naming its files first, passes for an index: it too is read no further than its file
      * descriptions (N53).

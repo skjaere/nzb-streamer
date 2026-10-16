@@ -140,6 +140,23 @@ internal class ReleaseFiles(files: List<NzbFile>) {
     /** Whether file [i] is a PAR2 index by its name (a .par2 file that isn't a recovery volume). */
     fun isIndex(i: Int): Boolean = roles[i] == Role.PAR2
 
+    /**
+     * Whether the release needs the names its PAR2 data gives files, once the files of [kept] are
+     * fetched: it has archive volumes (the PAR2 data shows one posted under another name, or one it
+     * lacks, N52), files whose names tell nothing (one may be a volume), or files it would list under
+     * obfuscated names, which the PAR2 data's replace (N54). A release of files posted under their
+     * own names has its names, so no recovery volume is read for them (NR-10).
+     */
+    fun needsNames(files: List<NzbFile>, kept: List<Int>): Boolean = kept.any { i ->
+        when (roles[i]) {
+            Role.ARCHIVE, Role.UNKNOWN -> true
+            Role.PAR2, Role.RECOVERY -> false
+            Role.VIDEO, Role.OTHER, Role.SIDE ->
+                FilenameResolver.bestFilename(files[i].yencHeaders?.name, files[i].subject, par2Filename = null)
+                    .let { it.isBlank() || ObfuscationHeuristic.isProbablyObfuscated(it) }
+        }
+    }
+
     /** The name a file is known by before it is fetched (its subject's), escaped for log lines. */
     fun nameOf(i: Int): String = names[i]?.printable() ?: "file ${i + 1}"
 

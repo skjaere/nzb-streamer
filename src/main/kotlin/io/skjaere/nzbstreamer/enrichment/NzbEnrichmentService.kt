@@ -23,6 +23,7 @@ import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.toList
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.supervisorScope
 import kotlinx.coroutines.sync.Semaphore
@@ -43,7 +44,7 @@ class NzbEnrichmentService(
         // How many of a recovery set's volumes, smallest first, are read for its file descriptions.
         private const val STAND_INS_PER_SET = 2
 
-        // How many bytes of a PAR2 file are read for its file descriptions past its first 16 KB, in
+        // How many bytes of a PAR2 file are read for its file descriptions past what is held of it, in
         // how many reads: one, and one past each recovery slice skipped ([SKIP_OVER]), whose bytes
         // aren't read (NR-7).
         private const val PAR2_READ_LIMIT = 16L * 1024 * 1024
@@ -104,8 +105,10 @@ class NzbEnrichmentService(
         val sample = Timer.start(registry)
         val release = ReleaseFiles(nzb.files)
         val lacking = ConcurrentHashMap<Int, ArticleNotFoundException>()
+        // The first articles, whole, of the PAR2 files by name, which their reads start from (NR-10).
+        val heads = ConcurrentHashMap<Int, ByteArray>()
         try {
-            fetchFirstArticles(nzb, release.toFetch) { i, e ->
+            fetchFirstArticles(nzb, release.toFetch, { i, article -> if (release.isIndex(i) || release.isRecovery(i)) hold(heads, i, nzb.files[i], article) }) { i, e ->
                 if (!release.mayLack(i)) throw e
                 lacking[i] = e
             }
@@ -124,7 +127,8 @@ class NzbEnrichmentService(
         // name files, read packet by packet without taking their lengths on trust; only its
         // descriptions are held ([readPar2]). An index over a thousand files or more names none in
         // its first 16 KB, its Main packet's list of them longer (NR-9). A recovery set's smallest
-        // volume stands in for its index when that names nothing ([readStandIns]).
+        // volume stands in for its index when that names nothing ([readStandIns]), where the release
+        // needs names (NR-10).
         var standIns = emptyList<Int>()
         try {
             coroutineScope {
@@ -133,14 +137,13 @@ class NzbEnrichmentService(
                         val first16kb = nzb.files[i].first16kb
                         if (release.isIndex(i)) first16kb?.let(Par2Parser::isPar2) == true else namesFiles(first16kb)
                     }
-                    .map { nzb.files[it] }
-                    .map { file ->
+                    .map { i ->
                         async {
-                            withTimedPermit { readPar2(file) }
+                            withTimedPermit { readPar2(nzb.files[i], heads.remove(i)) }
                         }
                     }.awaitAll()
             }
-            standIns = readStandIns(nzb, release)
+            if (release.needsNames(nzb.files, kept)) standIns = readStandIns(nzb, release, heads)
         } catch (@Suppress("TooGenericExceptionCaught") e: Exception) {
             rethrowCancellation(e)
             classifyEnrichmentFailure(e, phase = "PAR2 download")?.let { return it }
@@ -193,11 +196,13 @@ class NzbEnrichmentService(
 
     /**
      * Fetches the first article of each file of [nzb] at [indices], at most enrichmentConcurrency at a
-     * time. One that lacks it goes to [lacks], which may throw to fail them all.
+     * time, each passed to [fetched] whole, decoded, with its index. One that lacks it goes to
+     * [lacks], which may throw to fail them all.
      */
     private suspend fun fetchFirstArticles(
         nzb: NzbDocument,
         indices: List<Int>,
+        fetched: (Int, ByteArray) -> Unit = { _, _ -> },
         lacks: (Int, ArticleNotFoundException) -> Unit,
     ) {
         coroutineScope {
@@ -205,7 +210,7 @@ class NzbEnrichmentService(
                 async {
                     withTimedPermit {
                         try {
-                            enrichFile(nzb.files[i])
+                            enrichFile(nzb.files[i])?.let { fetched(i, it) }
                         } catch (e: ArticleNotFoundException) {
                             lacks(i, e)
                         }
@@ -257,8 +262,10 @@ class NzbEnrichmentService(
         return null
     }
 
-    private suspend fun enrichFile(file: NzbFile) {
+    /** Fetches [file]'s first article into its yencHeaders and first16kb; the article, decoded. */
+    private suspend fun enrichFile(file: NzbFile): ByteArray? {
         val firstSegment = file.segments.first()
+        var article: ByteArray? = null
         streamingService.withClient(NntpPriority.PREPARE) { client ->
             client.bodyYenc("<${firstSegment.articleId}>").collect { event ->
                 when (event) {
@@ -266,11 +273,21 @@ class NzbEnrichmentService(
                     is YencEvent.Body -> {
                         val data = event.data.toByteArray()
                         file.first16kb = data.copyOf(min(16384, data.size))
+                        article = data
                     }
                 }
             }
         }
         logger.debug("Enriched file: {}", file.yencHeaders?.name)
+        return article
+    }
+
+    /**
+     * Holds [article], fetched as PAR2 file [file]'s first, in [heads] at [i] when it is PAR2's and
+     * the file's first part, which its bytes start (an NZB that lacks part 1 lists a later one first).
+     */
+    private fun hold(heads: MutableMap<Int, ByteArray>, i: Int, file: NzbFile, article: ByteArray) {
+        if (file.yencHeaders?.partBegin.let { it == null || it == 1L } && Par2Parser.isPar2(article)) heads[i] = article
     }
 
     /**
@@ -278,28 +295,33 @@ class NzbEnrichmentService(
      * ([ReleaseFiles.standIns]) that has none, or whose index named nothing (it lacks an article):
      * its smallest volume's, and the next-smallest's when that names nothing, each set's apart
      * (NR-5). Another set's index (a sample's) names only its own set's files. Those that named files.
+     * [heads] holds the first articles fetched with the rest.
      */
-    private suspend fun readStandIns(nzb: NzbDocument, release: ReleaseFiles): List<Int> = coroutineScope {
-        release.standIns
-            .filterKeys { set -> release.indexesOf(set).none { nzb.files[it].par2Data != null } }
-            .values.map { volumes ->
-                async { volumes.take(STAND_INS_PER_SET).firstOrNull { readStandIn(nzb, release, it) } }
-            }.awaitAll().filterNotNull()
-    }
+    private suspend fun readStandIns(nzb: NzbDocument, release: ReleaseFiles, heads: MutableMap<Int, ByteArray>): List<Int> =
+        coroutineScope {
+            release.standIns
+                .filterKeys { set -> release.indexesOf(set).none { nzb.files[it].par2Data != null } }
+                .values.map { volumes ->
+                    async { volumes.take(STAND_INS_PER_SET).firstOrNull { readStandIn(nzb, release, it, heads.remove(it)) } }
+                }.awaitAll().filterNotNull()
+        }
 
     /**
      * Reads the file descriptions of recovery volume [i] into its par2Data, in place of its set's
-     * PAR2 index's, fetching its first article first when it wasn't with the rest; whether it named
-     * files. It is read as [readPar2] reads a PAR2 file: its recovery block not read at all, however
-     * big (NR-7); a read that fails, any way, its first article's fetch included, leaves it naming
-     * nothing.
+     * PAR2 index's, fetching its first article first when it wasn't with the rest ([head], when held
+     * whole); whether it named files. It is read as [readPar2] reads a PAR2 file, from that article:
+     * its recovery block not read at all, however big (NR-7); a read that fails, any way, its first
+     * article's fetch included, leaves it naming nothing.
      */
-    private suspend fun readStandIn(nzb: NzbDocument, release: ReleaseFiles, i: Int): Boolean {
+    private suspend fun readStandIn(nzb: NzbDocument, release: ReleaseFiles, i: Int, head: ByteArray?): Boolean {
         val file = nzb.files[i]
+        var held = head
         if (i !in release.toFetch) {
             enrichmentFiles.increment()
             try {
-                fetchFirstArticles(nzb, listOf(i)) { _, e -> throw e }
+                val heads = mutableMapOf<Int, ByteArray>()
+                fetchFirstArticles(nzb, listOf(i), { _, article -> hold(heads, i, file, article) }) { _, e -> throw e }
+                held = heads[i]
             } catch (@Suppress("TooGenericExceptionCaught") e: Exception) {
                 rethrowCancellation(e)
                 logger.warn("Going on without recovery volume {}, whose first article can't be fetched: {}", release.nameOf(i), e.message)
@@ -307,7 +329,7 @@ class NzbEnrichmentService(
             }
         }
         if (file.yencHeaders == null || file.first16kb?.let(Par2Parser::isPar2) != true) return false
-        withTimedPermit { readPar2(file, standIn = true) }
+        withTimedPermit { readPar2(file, held, standIn = true) }
         return file.par2Data != null
     }
 
@@ -320,20 +342,21 @@ class NzbEnrichmentService(
 
     /**
      * Reads the file descriptions (its FileDesc packets) of the PAR2 file [file] into its par2Data
-     * ([Par2Packets]): from its first 16 KB, then as it streams from where those end, its other
-     * packets skipped, never held. A recovery slice in the way of them, whose length its header
-     * gives, isn't read at all when it is [SKIP_OVER] bytes or more (or runs past the 16 KB): the
-     * next read starts past it, so a recovery volume's block is never downloaded (NR-7). No more
+     * ([Par2Packets]): from its first article, [head], when held whole (it isn't fetched again,
+     * NR-10), else its first 16 KB, then as it streams from where those end, its other packets
+     * skipped, never held. A recovery slice in the way of them, whose length its header gives,
+     * isn't read at all when it is [SKIP_OVER] bytes or more (or runs past what is held): the next
+     * read starts past it, so a recovery volume's block is never downloaded (NR-7). No more
      * than [PAR2_READ_LIMIT] bytes are read, in [MAX_PAR2_READS] reads ([readFrom]), and what fails
      * past where they stop is none of theirs (NR-15). It only names files, and the release opens
      * without it: an index that lacks an article is left without, and so is a recovery volume
      * standing in for one ([standIn]) whose read fails any way.
      */
-    private suspend fun readPar2(file: NzbFile, standIn: Boolean = false) {
+    private suspend fun readPar2(file: NzbFile, head: ByteArray?, standIn: Boolean = false) {
         val size = file.yencHeaders?.size ?: return
         logger.debug("Reading PAR2 file: {}", file.yencHeaders?.name)
         val packets = Par2Packets()
-        var stop = packets.read(ByteReadChannel(file.first16kb ?: ByteArray(0)), 0)
+        var stop = packets.read(ByteReadChannel(head ?: file.first16kb ?: ByteArray(0)), 0)
         var left = PAR2_READ_LIMIT
         var reads = 0
         try {
@@ -402,12 +425,17 @@ class NzbEnrichmentService(
                     }
                 }
             } catch (e: CancellationException) {
-                throw e
+                // Cancelled once the reader stopped, or with the caller; one that isn't the writer's
+                // own is a download's failure, thrown from here as any other.
+                if (!isActive) throw e
+                failure.set(e)
             } catch (@Suppress("TooGenericExceptionCaught") e: Exception) {
                 failure.set(e)
+            } finally {
+                // Closed without a cause, so the reader gets every byte written before it (each
+                // flushed as it is), and is never left waiting.
+                channel.close()
             }
-            // Closed without a cause, so the reader gets every byte written before it.
-            channel.flushAndClose()
         }
         val stop = packets.read(channel, from, SKIP_OVER)
         writer.cancel()
