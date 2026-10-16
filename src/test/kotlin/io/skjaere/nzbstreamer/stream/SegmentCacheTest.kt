@@ -16,6 +16,8 @@ import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.io.TempDir
 import java.nio.file.Files
 import java.nio.file.Path
+import java.nio.file.attribute.FileTime
+import java.time.Instant
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicInteger
@@ -23,7 +25,12 @@ import kotlin.io.path.exists
 import kotlin.io.path.fileSize
 import kotlin.io.path.isRegularFile
 import kotlin.io.path.name
+import kotlin.io.path.createDirectories
 import kotlin.io.path.readBytes
+import kotlin.io.path.readText
+import kotlin.io.path.setLastModifiedTime
+import kotlin.io.path.writeBytes
+import kotlin.io.path.writeText
 import kotlin.streams.asSequence
 import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
@@ -156,6 +163,62 @@ class SegmentCacheTest {
         assertContentEquals(payload, got)
         assertEquals(0, calls.get(), "warm restart should serve from disk without re-fetching")
         assertTrue(tmp.resolve("index.json").exists(), "sidecar present")
+    }
+
+    /**
+     * Last access was System.nanoTime, which counts from boot: after a reboot every new read was
+     * stamped earlier than every access before it, so the entries just read were evicted first. A
+     * reboot here is the index's nanoTime stamps put a day ahead (the last boot had been up a day
+     * longer than this one); a wall-clock stamp is the same across a reboot.
+     */
+    @Test
+    fun `a read after a reboot keeps its entry over older ones`(@TempDir tmp: Path) {
+        runBlocking {
+            val payload = ByteArray(1024) { 0x11 }
+            SegmentCache(cfg(tmp, maxBytes = 3 * 1024)).use { c ->
+                listOf("a@id", "b@id", "c@id").forEach { id -> c.getOrFetch(id) { payload } }
+            }
+            val index = tmp.resolve("index.json")
+            index.writeText(
+                Regex(""""lastAccessNanos"\s*:\s*(-?\d+)""").replace(index.readText()) { m ->
+                    """"lastAccessNanos":${m.groupValues[1].toLong() + 86_400_000_000_000L}"""
+                }
+            )
+
+            val cache = SegmentCache(cfg(tmp, maxBytes = 3 * 1024))
+            assertNotNull(cache.get("a@id"))
+            // Over capacity: the least recently used goes, b.
+            cache.getOrFetch("d@id") { payload }
+
+            assertNotNull(cache.get("a@id"), "a, read since the reboot, was evicted")
+            assertNull(cache.get("b@id"), "b, the least recently used, is still cached")
+        }
+    }
+
+    /** An index written by a version that stamped last access with System.nanoTime, from an earlier boot. */
+    @Test
+    fun `entries of an older index are ordered by their files' times`(@TempDir tmp: Path) {
+        runBlocking {
+            val ids = listOf("a@id", "b@id", "c@id")
+            val paths = SegmentCache(cfg(tmp)).let { c -> ids.map { c.pathOf(it) } }
+            // Written a, b, c, three hours to one hour ago; their nanoTime stamps say c, b, a.
+            val now = Instant.now()
+            paths.forEachIndexed { i, path ->
+                path.parent.createDirectories()
+                path.writeBytes(ByteArray(1024) { 0x22 })
+                path.setLastModifiedTime(FileTime.from(now.minusSeconds(3_600L * (3 - i))))
+            }
+            val entries = ids.mapIndexed { i, id ->
+                """{"articleId":"$id","size":1024,"lastAccessNanos":${3 - i}}"""
+            }
+            tmp.resolve("index.json").writeText("""{"entries":[${entries.joinToString(",")}]}""")
+
+            val cache = SegmentCache(cfg(tmp, maxBytes = 3 * 1024))
+            cache.getOrFetch("d@id") { ByteArray(1024) { 0x33 } }
+
+            assertNull(cache.get("a@id"), "a, written first, is still cached")
+            assertNotNull(cache.get("c@id"), "c, written last, was evicted")
+        }
     }
 
     @Test

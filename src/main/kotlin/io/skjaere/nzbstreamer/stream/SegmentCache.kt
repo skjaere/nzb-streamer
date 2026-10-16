@@ -20,6 +20,7 @@ import java.util.concurrent.atomic.AtomicLong
 import kotlin.io.path.createDirectories
 import kotlin.io.path.deleteIfExists
 import kotlin.io.path.exists
+import kotlin.io.path.getLastModifiedTime
 import kotlin.io.path.readBytes
 import kotlin.io.path.readText
 import kotlin.io.path.writeBytes
@@ -30,8 +31,10 @@ import kotlin.io.path.writeText
  *
  * The sidecar records each entry's size and last-access timestamp, so the cache survives
  * restarts and supports global LRU eviction without scanning every file's stat info on
- * the hot path. Concurrent fetches for the same article-id are deduplicated via a
- * single-flight map keyed by article-id.
+ * the hot path. Last access is wall-clock time in milliseconds, which goes on across a reboot
+ * (System.nanoTime starts again from boot), each stamp later than every one before it.
+ * Concurrent fetches for the same article-id are deduplicated via a single-flight map keyed
+ * by article-id.
  *
  * The cache is best-effort: failures to read/write the disk degrade silently to a
  * passthrough to the [fetch] lambda. Bytes returned to callers are always correct
@@ -40,8 +43,13 @@ import kotlin.io.path.writeText
 class SegmentCache(private val config: SegmentCacheConfig) : AutoCloseable {
     private val logger = LoggerFactory.getLogger(SegmentCache::class.java)
 
+    /**
+     * [lastAccessMillis] is [UNSTAMPED] in an index written by a version that stamped entries with
+     * System.nanoTime (as lastAccessNanos), meaningless after a reboot: such an entry is stamped
+     * with its file's modification time when loaded.
+     */
     @Serializable
-    private data class Entry(val articleId: String, val size: Long, var lastAccessNanos: Long)
+    private data class Entry(val articleId: String, val size: Long, var lastAccessMillis: Long = UNSTAMPED)
 
     @Serializable
     private data class IndexFile(val entries: List<Entry>)
@@ -58,6 +66,9 @@ class SegmentCache(private val config: SegmentCacheConfig) : AutoCloseable {
     private val inFlight = java.util.concurrent.ConcurrentHashMap<String, CompletableDeferred<ByteArray>>()
     private val totalBytes = AtomicLong(0)
     private val pendingWrites = AtomicLong(0)
+    // The last stamp given: the next is the wall clock's time or one past this, whichever is
+    // later, so a clock set back never stamps an access before an earlier one.
+    private val lastStamp = AtomicLong(0)
 
     private val indexPath: Path = config.cacheDir.resolve("index.json")
     private val evictThreshold: Long = (config.maxBytes * config.evictThresholdRatio).toLong()
@@ -80,13 +91,16 @@ class SegmentCache(private val config: SegmentCacheConfig) : AutoCloseable {
         runCatching {
             val parsed = json.decodeFromString(IndexFile.serializer(), indexPath.readText())
             for (e in parsed.entries) {
-                if (filePathFor(e.articleId).exists()) {
+                val path = filePathFor(e.articleId)
+                if (path.exists()) {
+                    if (e.lastAccessMillis == UNSTAMPED) e.lastAccessMillis = path.getLastModifiedTime().toMillis()
                     index[e.articleId] = e
                     totalBytes.addAndGet(e.size)
                 } else {
                     logger.debug("Index references missing file for {}, dropping", e.articleId)
                 }
             }
+            lastStamp.set(index.values.maxOfOrNull { it.lastAccessMillis } ?: 0)
             logger.info("Loaded segment cache index: {} entries, {} bytes", index.size, totalBytes.get())
         }.onFailure {
             logger.warn("Failed to load segment cache index, starting empty", it)
@@ -102,6 +116,9 @@ class SegmentCache(private val config: SegmentCacheConfig) : AutoCloseable {
                 .onFailure { logger.warn("Failed to persist cache index", it) }
         }
     }
+
+    /** Now, by the wall clock, or just after the last stamp if the clock is behind it. */
+    private fun stamp(): Long = lastStamp.updateAndGet { maxOf(it + 1, System.currentTimeMillis()) }
 
     private fun filePathFor(articleId: String): Path {
         val md = MessageDigest.getInstance("SHA-256")
@@ -137,7 +154,7 @@ class SegmentCache(private val config: SegmentCacheConfig) : AutoCloseable {
                 null
             }
         }?.also {
-            indexLock.withLock { index[articleId]?.lastAccessNanos = System.nanoTime() }
+            indexLock.withLock { index[articleId]?.lastAccessMillis = stamp() }
         }
     }
 
@@ -226,7 +243,7 @@ class SegmentCache(private val config: SegmentCacheConfig) : AutoCloseable {
 
             indexLock.withLock {
                 index[articleId]?.let { totalBytes.addAndGet(-it.size) }
-                index[articleId] = Entry(articleId, bytes.size.toLong(), System.nanoTime())
+                index[articleId] = Entry(articleId, bytes.size.toLong(), stamp())
                 totalBytes.addAndGet(bytes.size.toLong())
             }
         } ?: return
@@ -237,7 +254,7 @@ class SegmentCache(private val config: SegmentCacheConfig) : AutoCloseable {
     private suspend fun evict() {
         val toRemove = indexLock.withLock {
             if (totalBytes.get() <= config.maxBytes) return@withLock emptyList()
-            val sorted = index.values.sortedBy { it.lastAccessNanos }
+            val sorted = index.values.sortedBy { it.lastAccessMillis }
             val targets = mutableListOf<Entry>()
             var t = totalBytes.get()
             for (cand in sorted) {
@@ -277,5 +294,6 @@ class SegmentCache(private val config: SegmentCacheConfig) : AutoCloseable {
 
     companion object {
         private const val INDEX_FLUSH_INTERVAL = 64L
+        private const val UNSTAMPED = -1L
     }
 }
