@@ -335,6 +335,8 @@ class NzbStreamer private constructor(
         var verificationConcurrency: Int? = null
         var readAheadSegments: Int? = null
         var segmentCache: SegmentCache? = null
+        /** See [NzbStreamer.fromConfig]'s closeSegmentCache. */
+        var closeSegmentCache: Boolean = true
 
         /** Add an NNTP pool. First pool added is the primary; subsequent pools are fill/fallback. */
         fun nntp(block: NntpBuilder.() -> Unit) {
@@ -352,7 +354,7 @@ class NzbStreamer private constructor(
                 readAheadSegments = readAheadSegments ?: (concurrency * 3)
             )
             val prepareConfig = PrepareConfig(verifySegments = prepareBuilder.verifySegments)
-            return create(poolBuilders.map { it.toConfig() }, streamingConfig, prepareConfig, segmentCache)
+            return create(poolBuilders.map { it.toConfig() }, streamingConfig, prepareConfig, segmentCache, closeSegmentCache)
         }
     }
 
@@ -361,13 +363,20 @@ class NzbStreamer private constructor(
             return Builder().apply(block).build()
         }
 
-        /** A streamer with exactly these configs: every setting in them applies, and [getPoolConfigs] returns [nntpConfigs]. */
+        /**
+         * A streamer with exactly these configs: every setting in them applies, and [getPoolConfigs] returns [nntpConfigs].
+         *
+         * @param closeSegmentCache whether the streamer's [close] closes [segmentCache], saving its
+         *   index: the streamer owns the cache it is given unless this is false, as for a cache the
+         *   caller keeps across the streamers it builds (one instance per cache directory).
+         */
         fun fromConfig(
             nntpConfigs: List<NntpConfig>,
             streamingConfig: StreamingConfig = StreamingConfig(),
             prepareConfig: PrepareConfig = PrepareConfig(),
             segmentCache: SegmentCache? = null,
-        ): NzbStreamer = create(nntpConfigs, streamingConfig, prepareConfig, segmentCache)
+            closeSegmentCache: Boolean = true,
+        ): NzbStreamer = create(nntpConfigs, streamingConfig, prepareConfig, segmentCache, closeSegmentCache)
 
         // The configs go through as they are: copying them field by field (through the builder)
         // dropped the fields nobody remembered to copy.
@@ -376,8 +385,9 @@ class NzbStreamer private constructor(
             streamingConfig: StreamingConfig,
             prepareConfig: PrepareConfig,
             segmentCache: SegmentCache?,
+            closeSegmentCache: Boolean,
         ): NzbStreamer {
-            val streamingService = NntpStreamingService(nntpConfigs, streamingConfig, segmentCache)
+            val streamingService = NntpStreamingService(nntpConfigs, streamingConfig, segmentCache, closeSegmentCache)
             runBlocking { streamingService.connect() }
 
             val metadataService = ArchiveMetadataService(
@@ -395,6 +405,7 @@ class NzbStreamer private constructor(
             streamingConfig: StreamingConfig = StreamingConfig(),
             prepareConfig: PrepareConfig = PrepareConfig(),
             segmentCache: SegmentCache? = null,
-        ): NzbStreamer = fromConfig(listOf(nntpConfig), streamingConfig, prepareConfig, segmentCache)
+            closeSegmentCache: Boolean = true,
+        ): NzbStreamer = fromConfig(listOf(nntpConfig), streamingConfig, prepareConfig, segmentCache, closeSegmentCache)
     }
 }

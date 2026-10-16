@@ -2,15 +2,21 @@ package io.skjaere.nzbstreamer
 
 import io.skjaere.nzbstreamer.config.NntpConfig
 import io.skjaere.nzbstreamer.config.PrepareConfig
+import io.skjaere.nzbstreamer.config.SegmentCacheConfig
 import io.skjaere.nzbstreamer.config.StreamingConfig
 import io.skjaere.nzbstreamer.metadata.PrepareResult
+import io.skjaere.nzbstreamer.stream.SegmentCache
 import io.skjaere.yenc.YencEncoder
 import kotlinx.coroutines.runBlocking
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.Test
+import org.junit.jupiter.api.io.TempDir
+import java.nio.file.Path
 import java.util.concurrent.atomic.AtomicInteger
+import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
 import kotlin.test.assertIs
+import kotlin.test.assertNull
 
 /** [NzbStreamer.fromConfig] builds a streamer with the configs it is given, every setting kept. */
 class NzbStreamerConfigTest {
@@ -90,5 +96,45 @@ class NzbStreamerConfigTest {
             assertIs<PrepareResult.Success>(streamer.prepare(nzb.toByteArray()))
         }
         assertEquals(1, peak.get(), "BODYs at once while preparing")
+    }
+
+    /**
+     * A cache the caller keeps outlives the streamers it lends it to: an app that builds a new
+     * streamer on every settings change keeps one cache (two instances on one directory would
+     * each take the other's files for their own).
+     */
+    @Test
+    fun `a streamer's close leaves a cache it was lent open`(@TempDir tmp: Path) {
+        runBlocking {
+            val cache = SegmentCache(SegmentCacheConfig(tmp, maxBytes = 1_000_000L))
+            cache.getOrFetch("a@id") { ByteArray(64) { 1 } }
+            val server = server()
+
+            NzbStreamer.fromConfig(listOf(config(server)), segmentCache = cache, closeSegmentCache = false).close()
+            NzbStreamer {
+                nntp {
+                    host = "127.0.0.1"
+                    port = server.port
+                    useTls = false
+                }
+                segmentCache = cache
+                closeSegmentCache = false
+            }.close()
+
+            assertContentEquals(ByteArray(64) { 1 }, cache.get("a@id"))
+        }
+    }
+
+    /** By default a streamer closes the cache it is given, saving its index (a server's shutdown relies on it). */
+    @Test
+    fun `a streamer's close closes its cache by default`(@TempDir tmp: Path) {
+        runBlocking {
+            val cache = SegmentCache(SegmentCacheConfig(tmp, maxBytes = 1_000_000L))
+            cache.getOrFetch("a@id") { ByteArray(64) { 1 } }
+
+            NzbStreamer.fromConfig(listOf(config(server())), segmentCache = cache).close()
+
+            assertNull(cache.get("a@id"))
+        }
     }
 }

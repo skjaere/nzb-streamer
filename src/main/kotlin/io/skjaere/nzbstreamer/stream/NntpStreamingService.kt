@@ -72,10 +72,12 @@ private const val STAT_CHUNK_MIN = 32
 private val StatResult.settles: Boolean
     get() = this is StatResult.Found || (this is StatResult.NotFound && code == 430)
 
+/** [close] closes [segmentCache] unless [closeSegmentCache] is false (a cache the caller keeps). */
 class NntpStreamingService(
     initialConfigs: List<NntpConfig>,
     private val streamingConfig: StreamingConfig = StreamingConfig(),
-    private val segmentCache: SegmentCache? = null
+    private val segmentCache: SegmentCache? = null,
+    private val closeSegmentCache: Boolean = true,
 ) : Closeable {
     constructor(config: NntpConfig) : this(listOf(config))
 
@@ -1505,7 +1507,7 @@ class NntpStreamingService(
         poolLock.read {
             pools.forEach { it.pool.close() }
         }
-        segmentCache?.close()
+        if (closeSegmentCache) segmentCache?.close()
         // Close the ktor SelectorManager that all pool sockets share. Must happen after the
         // pools have torn their sockets down so we don't yank the selector out from under
         // an in-flight QUIT round-trip.
