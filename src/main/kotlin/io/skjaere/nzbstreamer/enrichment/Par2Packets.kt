@@ -106,6 +106,11 @@ internal class Par2Packets {
         /** The FileDesc packets [channel] delivers, read as [read] reads them, or null when it delivers none. */
         suspend fun fileDescriptions(channel: ByteReadChannel): ByteArray? = Par2Packets().apply { read(channel, 0) }.descriptions
 
+        /** Whether [bytes], a PAR2 file's first, start with a recovery slice: a recovery volume's, whatever it is named (NR-9). */
+        fun startsWithRecoverySlice(bytes: ByteArray): Boolean =
+            bytes.size >= HEADER && bytes.copyOf(MAGIC.size).contentEquals(MAGIC) &&
+                bytes.copyOfRange(48, HEADER).contentEquals(RECOVERY_SLICE)
+
         private fun ByteArray.toHex(): String = joinToString("") { "%02x".format(it) }
     }
 

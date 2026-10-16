@@ -108,10 +108,11 @@ class NzbEnrichmentService(
         val release = ReleaseFiles(nzb.files)
         // Files that lack their first article, and sets that lack a volume, with the cause.
         val lacking = ConcurrentHashMap<Int, Exception>()
-        // The first articles, whole, of the PAR2 files by name, which their reads start from (NR-10).
+        // The first articles, whole, of the PAR2 files by name, which their reads start from (NR-10):
+        // not those of recovery volumes posted under an index's name, which aren't read (NR-9).
         val heads = ConcurrentHashMap<Int, ByteArray>()
         try {
-            fetchFirstArticles(nzb, release.toFetch, { i, article -> if (release.isIndex(i) || release.isRecovery(i)) hold(heads, i, nzb.files[i], article) }) { i, e ->
+            fetchFirstArticles(nzb, release.toFetch, { i, article -> if (holds(release, i, article)) hold(heads, i, nzb.files[i], article) }) { i, e ->
                 if (!release.mayLack(i)) throw e
                 lacking[i] = e
             }
@@ -129,16 +130,21 @@ class NzbEnrichmentService(
         // counts as an index when it is named as one (and is PAR2), or else when its first 16 KB
         // name files, read packet by packet without taking their lengths on trust; only its
         // descriptions are held ([readPar2]). An index over a thousand files or more names none in
-        // its first 16 KB, its Main packet's list of them longer (NR-9). A recovery set's smallest
-        // volume stands in for its index when that names nothing ([readStandIns]), where the release
-        // needs names (NR-10).
+        // its first 16 KB, its Main packet's list of them longer (NR-9), but a recovery volume posted
+        // under an index's name (<hash>.par2) starts with its recovery slice: it counts as one only
+        // as any other file does. A recovery set's smallest volume stands in for its index when that
+        // names nothing ([readStandIns]), where the release needs names (NR-10).
         var standIns = emptyList<Int>()
         try {
             coroutineScope {
                 kept.filterNot(release::isRecovery)
                     .filter { i ->
                         val first16kb = nzb.files[i].first16kb
-                        if (release.isIndex(i)) first16kb?.let(Par2Parser::isPar2) == true else namesFiles(first16kb)
+                        if (release.isIndex(i) && first16kb?.let(Par2Packets::startsWithRecoverySlice) == false) {
+                            Par2Parser.isPar2(first16kb)
+                        } else {
+                            namesFiles(first16kb)
+                        }
                     }
                     .map { i ->
                         async {
@@ -153,6 +159,8 @@ class NzbEnrichmentService(
             throw e
         }
         val named = (kept + standIns).distinct()
+        // The first articles not read (another set's stand-ins, or all where no names are needed) aren't held on.
+        heads.clear()
 
         // Then the volumes posted under another extension (library issue N52), which the PAR2 index
         // names or their content shows to be: a file that may be one is fetched only when the index
@@ -284,6 +292,14 @@ class NzbEnrichmentService(
         logger.debug("Enriched file: {}", file.yencHeaders?.name)
         return article
     }
+
+    /**
+     * Whether to hold [article], fetched as file [i]'s first, for its PAR2 read: a recovery volume's,
+     * and an index's by its name, but for one that starts with a recovery slice, a recovery volume
+     * posted under an index's name, which is read only when its first 16 KB name files (NR-9).
+     */
+    private fun holds(release: ReleaseFiles, i: Int, article: ByteArray): Boolean =
+        release.isRecovery(i) || release.isIndex(i) && !Par2Packets.startsWithRecoverySlice(article)
 
     /**
      * Holds [article], fetched as PAR2 file [file]'s first, in [heads] at [i] when it is PAR2's and

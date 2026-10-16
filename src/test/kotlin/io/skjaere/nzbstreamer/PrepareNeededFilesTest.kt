@@ -1147,6 +1147,30 @@ class PrepareNeededFilesTest {
     }
 
     /**
+     * Recovery volumes posted under names that keep only their extension ('<hash>.par2') are named
+     * like indexes, but start with their recovery slices: as before, they are read only when their
+     * first 16 KB name files, so their blocks aren't fetched past their first article, while the
+     * index beside them names the volumes (NR-9).
+     */
+    @Test
+    fun `recovery volumes posted under an index's name are read no further than their first article`() {
+        val payload = bytes("movie", 200_000)
+        val named = volumes("Movie.2020", "Movie.2020.mkv", payload, ContainerType.RAR4)
+        named.indices.reversed().forEach { v -> post(OBFUSCATED[v], named[v].second) }
+        post("0b1c2d3e.par2", buildPar2File(named))
+        val recovery = listOf(64, 128).map { kb -> post("${OBFUSCATED[kb / 64 + 3]}.par2", buildPar2File(named, recoveryBlock = kb * 1024)) }
+        assertTrue(recovery.all { it.size > 2 }, "a recovery block fits in an article")
+
+        withStreamer { streamer, server ->
+            val result = streamer.prepare(nzb())
+            val prepared = assertIs<PrepareResult.Success>(result, "prepare: $result")
+            assertEquals(named.map { it.first }, prepared.metadata.response.volumes)
+            assertContentEquals(payload, streamer.streamed(prepared))
+            assertEquals(emptyList(), recovery.flatMap { it.drop(1) }.filter { it in server.bodiesRead }, "recovery volume articles fetched past their first")
+        }
+    }
+
+    /**
      * A release of files posted under their names, with no archive, needs no names from the PAR2
      * data: no recovery volume is read in place of its index when that lacks its first article
      * (NR-10).
