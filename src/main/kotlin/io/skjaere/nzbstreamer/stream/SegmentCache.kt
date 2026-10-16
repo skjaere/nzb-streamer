@@ -135,8 +135,10 @@ class SegmentCache(private val config: SegmentCacheConfig) : AutoCloseable {
      * when the index is of this version, as this version writes files whole. Older versions wrote
      * them in place, where a kill could cut one short, so with an older index, one that can't be
      * read or none, it is deleted; the index is then saved at once, in this version. An entry
-     * whose file is gone is dropped, and temporary files (writes or saves a kill cut short) are
-     * deleted. A failure leaves the cache empty.
+     * whose file is gone is dropped, and one whose file isn't the size it gives (cut short, or
+     * written over) is dropped and its file deleted, so the usage loaded is the bytes on disk.
+     * Temporary files (writes or saves a kill cut short) are deleted. A failure leaves the cache
+     * empty.
      */
     private fun load() {
         runCatching {
@@ -148,6 +150,7 @@ class SegmentCache(private val config: SegmentCacheConfig) : AutoCloseable {
                 val modified = attributes.lastModifiedTime().toMillis()
                 val known = listed.entries[name]
                 val entry = when {
+                    known != null && known.size != attributes.size() -> null
                     known != null -> if (known.lastAccessMillis == UNSTAMPED) known.copy(lastAccessMillis = modified) else known
                     listed.current && attributes.size() > 0 -> Entry(name, attributes.size(), modified).also { takenIn++ }
                     else -> null
@@ -164,7 +167,7 @@ class SegmentCache(private val config: SegmentCacheConfig) : AutoCloseable {
             val dropped = listed.entries.keys.count { it !in index }
             logger.info(
                 "Loaded segment cache index: {} entries, {} bytes ({} files taken in, {} deleted, " +
-                    "{} entries without a file dropped)",
+                    "{} entries dropped)",
                 index.size, totalBytes.get(), takenIn, deleted, dropped,
             )
             val inStep = listed.current && takenIn == 0 && deleted == 0 && dropped == 0
@@ -454,6 +457,7 @@ class SegmentCache(private val config: SegmentCacheConfig) : AutoCloseable {
         evict()
     }
 
+    /** The cache's usage now. Takes no lock, so it is cheap anywhere (the main thread included). */
     fun stats(): Stats = Stats(
         entryCount = indexSizeUnlocked(),
         totalBytes = totalBytes.get(),

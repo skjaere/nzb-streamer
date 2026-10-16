@@ -261,6 +261,28 @@ class SegmentCacheTest {
         }
     }
 
+    /**
+     * The usage a load reports is the bytes on disk: a listed file whose size isn't the index's
+     * (cut short, or written over) is dropped, not counted at the index's size and served short.
+     */
+    @Test
+    fun `a load counts the bytes on disk, not the index's sizes`(@TempDir tmp: Path) {
+        runBlocking {
+            SegmentCache(cfg(tmp)).use { c ->
+                listOf("whole@id", "short@id", "long@id").forEach { id -> c.getOrFetch(id) { ByteArray(1024) { 0x21 } } }
+            }
+            SegmentCache(cfg(tmp)).let { c ->
+                c.pathOf("short@id").writeBytes(ByteArray(100))
+                c.pathOf("long@id").writeBytes(ByteArray(2048))
+            }
+
+            val cache = SegmentCache(cfg(tmp))
+            assertMatchesDisk(cache, tmp)
+            assertEquals(SegmentCache.Stats(1, 1024, 1_000_000L), cache.stats())
+            assertNotNull(cache.get("whole@id"))
+        }
+    }
+
     /** A kill in the middle of a write leaves the write's temporary file, which is nobody's. */
     @Test
     fun `a write cut short by a kill leaves no file behind`(@TempDir tmp: Path) {
