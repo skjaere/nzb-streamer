@@ -17,7 +17,12 @@ data class NntpConfig(
      * doesn't list; the certificate must still be trusted.
      */
     val verifyHostname: Boolean = true
-)
+) {
+    /** Every value but the password, so a config logged, or put in an exception's message, never carries it. */
+    override fun toString() =
+        "NntpConfig(host=$host, port=$port, username=$username, useTls=$useTls, maxConnections=$maxConnections, " +
+            "priority=$priority, verifyHostname=$verifyHostname)"
+}
 
 data class StreamingConfig(
     val concurrency: Int = 4,

@@ -15,6 +15,7 @@ import java.nio.file.Path
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertIs
 import kotlin.test.assertNull
 
@@ -136,5 +137,19 @@ class NzbStreamerConfigTest {
 
             assertNull(cache.get("a@id"))
         }
+    }
+
+    /**
+     * A data class's toString prints every value: a config logged, or put in an exception's message,
+     * carried the provider's password with it.
+     */
+    @Test
+    fun `an NNTP config's toString leaves out the password`() {
+        val config = NntpConfig("news.example.com", 563, "alice", "correct horse, battery", useTls = true, maxConnections = 4, priority = 1)
+        assertEquals(
+            "NntpConfig(host=news.example.com, port=563, username=alice, useTls=true, maxConnections=4, priority=1, verifyHostname=true)",
+            config.toString(),
+        )
+        assertFalse("horse" in "$config")
     }
 }
