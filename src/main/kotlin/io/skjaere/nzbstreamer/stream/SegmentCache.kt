@@ -119,9 +119,9 @@ class SegmentCache(private val config: SegmentCacheConfig) : AutoCloseable {
     private val indexTempPath: Path = config.cacheDir.resolve("index.json$TEMP_SUFFIX")
     private val evictThreshold: Long get() = (maxBytes.get() * config.evictThresholdRatio).toLong()
 
-    // Whether the index is saved: not after a load that failed before it deleted the files an older
-    // index, or none, doesn't vouch for. One of this version saved then would vouch for them, and the
-    // next load take them in, a write a kill cut short among them; left as it is, it deletes them.
+    // Whether the index is saved: not after a load that failed and left on disk files an older index,
+    // or none, doesn't vouch for. One of this version saved then would vouch for them, and the next
+    // load take them in, a write a kill cut short among them; left as it is, it deletes them.
     private val savesIndex: Boolean
 
     init {
@@ -145,8 +145,10 @@ class SegmentCache(private val config: SegmentCacheConfig) : AutoCloseable {
      * read or none, it is deleted; the index is then saved at once, in this version. An entry
      * whose file is gone is dropped, and one whose file isn't the size it gives (cut short, or
      * written over) is dropped and its file deleted, so the usage loaded is the bytes on disk.
-     * Temporary files (writes or saves a kill cut short) are deleted. A failure leaves the cache
-     * empty, and the files on disk to the next load. Whether the index may be saved ([savesIndex]).
+     * Temporary files (writes or saves a kill cut short) are deleted. A failure (an I/O error)
+     * leaves the cache empty and deletes its files, each it can, as nothing would count them; with
+     * none left, the index is saved at once, in this version. Whether the index may be saved
+     * ([savesIndex]).
      */
     private fun load(): Boolean {
         var read: Listed? = null
@@ -183,10 +185,16 @@ class SegmentCache(private val config: SegmentCacheConfig) : AutoCloseable {
             if (inStep || writeIndex(snapshot())) savedChanges = changes
             true
         }.getOrElse {
-            logger.warn("Failed to load segment cache index, starting empty", it)
             index.clear()
             totalBytes.set(0)
-            read?.current == true
+            // Left on disk, they would be counted nowhere: never evicted, nor deleted by a clear.
+            val emptied = deleteSegmentFiles()
+            logger.warn(
+                "Failed to load segment cache index, starting empty ({})",
+                if (emptied) "its files deleted" else "some of its files left on disk", it,
+            )
+            if (emptied && writeIndex(snapshot())) savedChanges = changes
+            emptied || read?.current == true
         }
     }
 
@@ -213,8 +221,7 @@ class SegmentCache(private val config: SegmentCacheConfig) : AutoCloseable {
      * the app running), is left out.
      */
     private fun scanSegmentFiles(): Map<String, BasicFileAttributes> =
-        config.cacheDir.listDirectoryEntries()
-            .filter { it.isDirectory() && SHARD_NAME.matches(it.name) }
+        shards()
             .flatMap { shard -> unlessGone { shard.listDirectoryEntries() }.orEmpty() }
             .mapNotNull { path ->
                 when {
@@ -222,12 +229,30 @@ class SegmentCache(private val config: SegmentCacheConfig) : AutoCloseable {
                         path.deleteIfExists()
                         null
                     }
-                    SEGMENT_NAME.matches(path.name) && path.name.startsWith(path.parent.name) ->
-                        unlessGone { path.readAttributes<BasicFileAttributes>() }?.let { path.name to it }
+                    isSegmentFile(path) -> unlessGone { path.readAttributes<BasicFileAttributes>() }?.let { path.name to it }
                     else -> null
                 }
             }
             .toMap()
+
+    /** Deletes the segment files under the cache directory, temporary ones too, each it can: whether none is left. */
+    private fun deleteSegmentFiles(): Boolean = runCatching {
+        shards().map { shard ->
+            runCatching {
+                unlessGone { shard.listDirectoryEntries() }.orEmpty()
+                    .filter { it.name.endsWith(TEMP_SUFFIX) || isSegmentFile(it) }
+                    .map { runCatching { it.deleteIfExists() }.isSuccess }
+                    .all { it }
+            }.getOrDefault(false)
+        }.all { it }
+    }.getOrDefault(false)
+
+    /** The shard directories under the cache directory (none if it was deleted meanwhile). */
+    private fun shards(): List<Path> =
+        unlessGone { config.cacheDir.listDirectoryEntries() }.orEmpty().filter { it.isDirectory() && SHARD_NAME.matches(it.name) }
+
+    /** Whether [path] is named as a segment's file, in its shard. */
+    private fun isSegmentFile(path: Path): Boolean = SEGMENT_NAME.matches(path.name) && path.name.startsWith(path.parent.name)
 
     /** What [read] reads, or null if it was deleted since it was listed. */
     private inline fun <T> unlessGone(read: () -> T): T? = try {

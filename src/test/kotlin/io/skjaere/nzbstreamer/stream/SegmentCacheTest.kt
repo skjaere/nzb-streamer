@@ -365,9 +365,69 @@ class SegmentCacheTest {
     }
 
     /**
-     * A load that fails (here a shard directory it may not list) leaves on disk the files an older
-     * index doesn't vouch for. An index of this version saved after it vouched for them: the next load
-     * took them in, a write a kill cut short among them, as whole segments.
+     * A load that fails (here on a shard directory it may not list) started empty and left the files
+     * on disk as they were: counted nowhere, never evicted, and left behind by a clear. It deletes
+     * them (a cache fetches them again), each it can.
+     */
+    @Test
+    fun `a failed load leaves no file on disk uncounted`(@TempDir tmp: Path) {
+        runBlocking {
+            val ids = listOf("a@id", "b@id", "c@id")
+            val shards = SegmentCache(cfg(tmp)).use { c ->
+                ids.forEach { id -> c.getOrFetch(id) { payloadOf(id) } }
+                (ids + "new@id").map { c.pathOf(it).parent.name }
+            }
+            val locked = tmp.resolve((0..255).map { "%02x".format(it) }.first { it !in shards }).createDirectories().toFile()
+            assertTrue(locked.setReadable(false))
+            try {
+                SegmentCache(cfg(tmp)).use { failed ->
+                    assertEquals(0, failed.stats().entryCount, "the load didn't fail")
+                    assertEquals(emptyList(), ids.filter { failed.pathOf(it).exists() }, "left on disk, counted nowhere")
+                    failed.getOrFetch("new@id") { payloadOf("new@id") }
+                    assertEquals(1, failed.stats().entryCount)
+                }
+            } finally {
+                locked.setReadable(true)
+            }
+
+            val cache = SegmentCache(cfg(tmp))
+            assertMatchesDisk(cache, tmp)
+            assertContentEquals(payloadOf("new@id"), cache.get("new@id"), "the segment written after the failed load")
+        }
+    }
+
+    /**
+     * A load that fails (here on a link that loops, with a segment's name) and then deletes every
+     * file saves an empty index of this version at once: what is written after it is vouched for,
+     * though the index before was an older one.
+     */
+    @Test
+    fun `after a failed load that deleted every file the segments written since are kept`(@TempDir tmp: Path) {
+        runBlocking {
+            val (listed, looped) = SegmentCache(cfg(tmp)).let { c -> c.pathOf("listed@id") to c.pathOf("looped@id") }
+            listed.parent.createDirectories()
+            listed.writeBytes(ByteArray(1024) { 0x66 })
+            tmp.resolve("index.json").writeText("""{"entries":[{"articleId":"listed@id","size":1024,"lastAccessNanos":7}]}""")
+            looped.parent.createDirectories()
+            Files.createSymbolicLink(looped, looped)
+
+            SegmentCache(cfg(tmp)).use { failed ->
+                assertEquals(0, failed.stats().entryCount, "the load didn't fail")
+                assertEquals(emptyList(), segmentFiles(tmp), "left on disk, counted nowhere")
+                assertFalse(Files.isSymbolicLink(looped), "the link was left on disk")
+                failed.getOrFetch("new@id") { payloadOf("new@id") }
+            }
+
+            val cache = SegmentCache(cfg(tmp))
+            assertMatchesDisk(cache, tmp)
+            assertContentEquals(payloadOf("new@id"), cache.get("new@id"), "the segment written after the failed load")
+        }
+    }
+
+    /**
+     * A load that fails (here deleting a file an older index doesn't list, in a shard directory it may
+     * not write) deletes what it can, but not that file. An index of this version saved after it would
+     * vouch for it: the next load took it in, a write a kill cut short perhaps, as a whole segment.
      */
     @Test
     fun `after a failed load the files an older index doesn't list are still not taken in`(@TempDir tmp: Path) {
@@ -376,26 +436,28 @@ class SegmentCacheTest {
             val (paths, shards) = SegmentCache(cfg(tmp)).let { c ->
                 ids.map { c.pathOf(it) } to (ids + "new@id").map { c.pathOf(it).parent.name }
             }
+            assertEquals(3, shards.toSet().size, "segments that share a shard: $shards")
             paths.forEach { path ->
                 path.parent.createDirectories()
                 path.writeBytes(ByteArray(1024) { 0x66 })
             }
             tmp.resolve("index.json").writeText("""{"entries":[{"articleId":"listed@id","size":1024,"lastAccessNanos":7}]}""")
-            val locked = tmp.resolve((0..255).map { "%02x".format(it) }.first { it !in shards }).createDirectories().toFile()
-            assertTrue(locked.setReadable(false))
+            val cut = paths[1]
+            val readOnly = cut.parent.toFile()
+            assertTrue(readOnly.setWritable(false))
             try {
                 SegmentCache(cfg(tmp)).use { failed ->
                     assertEquals(0, failed.stats().entryCount, "the load didn't fail")
                     failed.getOrFetch("new@id") { ByteArray(512) { 0x67 } }
                 }
             } finally {
-                locked.setReadable(true)
+                readOnly.setWritable(true)
             }
+            assertTrue(cut.exists(), "the file the older index doesn't list was deleted after all")
 
             val cache = SegmentCache(cfg(tmp))
             assertMatchesDisk(cache, tmp)
             assertNull(cache.get("cut@id"), "a file the older index didn't list was taken in")
-            assertNotNull(cache.get("listed@id"))
         }
     }
 
