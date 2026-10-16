@@ -22,6 +22,7 @@ import org.junit.jupiter.api.io.TempDir
 import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.attribute.FileTime
+import java.time.Duration
 import java.time.Instant
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
@@ -177,31 +178,49 @@ class SegmentCacheTest {
 
     /**
      * Last access was System.nanoTime, which counts from boot: after a reboot every new read was
-     * stamped earlier than every access before it, so the entries just read were evicted first. A
-     * reboot here is the index's nanoTime stamps put a day ahead (the last boot had been up a day
-     * longer than this one); a wall-clock stamp is the same across a reboot.
+     * stamped earlier than every access before it, so the entries just read were evicted first. The
+     * boot before here stamped by a clock a day ahead of this one's (one that counts from boot is
+     * behind after any reboot; a wall clock without a battery starts behind until it has the network's
+     * time): it wrote a, b and c, saved, and wrote one more file before it was killed, which the load
+     * takes in by its modification time. A read since the reboot ranks above all of them.
      */
     @Test
     fun `a read after a reboot keeps its entry over older ones`(@TempDir tmp: Path) {
         runBlocking {
             val payload = ByteArray(1024) { 0x11 }
-            SegmentCache(cfg(tmp, maxBytes = 3 * 1024)).use { c ->
+            val day = Duration.ofDays(1)
+            val unlisted = SegmentCache(cfg(tmp, maxBytes = 4 * 1024)).use { c ->
                 listOf("a@id", "b@id", "c@id").forEach { id -> c.getOrFetch(id) { payload } }
+                c.pathOf("unlisted@id")
             }
+            unlisted.parent.createDirectories()
+            unlisted.writeBytes(payload)
+            // A minute after c, by that boot's clock.
+            unlisted.setLastModifiedTime(FileTime.from(Instant.now().plus(day).plusSeconds(60)))
             val index = tmp.resolve("index.json")
+            var ahead = 0
             index.writeText(
-                Regex(""""lastAccessNanos"\s*:\s*(-?\d+)""").replace(index.readText()) { m ->
-                    """"lastAccessNanos":${m.groupValues[1].toLong() + 86_400_000_000_000L}"""
+                Regex(""""lastAccessMillis"\s*:\s*(\d+)""").replace(index.readText()) { m ->
+                    ahead++
+                    """"lastAccessMillis":${m.groupValues[1].toLong() + day.toMillis()}"""
                 }
             )
+            assertEquals(3, ahead, "no stamps put ahead in ${index.readText()}")
 
-            val cache = SegmentCache(cfg(tmp, maxBytes = 3 * 1024))
+            val cache = SegmentCache(cfg(tmp, maxBytes = 4 * 1024))
+            assertEquals(4, cache.stats().entryCount, "the unlisted file wasn't taken in")
             assertNotNull(cache.get("a@id"))
-            // Over capacity: the least recently used goes, b.
+            // Over capacity at each write: the least recently used goes. Which went shows on disk (a get would stamp it).
+            fun cached(id: String) = cache.pathOf(id).exists()
             cache.getOrFetch("d@id") { payload }
-
-            assertNotNull(cache.get("a@id"), "a, read since the reboot, was evicted")
-            assertNull(cache.get("b@id"), "b, the least recently used, is still cached")
+            assertTrue(cached("a@id"), "a, read since the reboot, was evicted")
+            assertFalse(cached("b@id"), "b, the least recently used, is still cached")
+            cache.getOrFetch("e@id") { payload }
+            assertFalse(cached("c@id"), "c is still cached")
+            assertTrue(cached("unlisted@id"), "the file written after c was evicted before c")
+            cache.getOrFetch("f@id") { payload }
+            assertFalse(cached("unlisted@id"), "the file written before the reboot is still cached")
+            assertTrue(cached("a@id"), "a, read since the reboot, was evicted")
         }
     }
 
