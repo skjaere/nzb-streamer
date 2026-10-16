@@ -13,16 +13,24 @@ import io.skjaere.nzbstreamer.queue.SegmentQueueService
 import io.skjaere.nzbstreamer.stream.NntpPriority
 import io.skjaere.nzbstreamer.stream.NntpStreamingService
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.channels.consumeEach
+import kotlinx.coroutines.channels.produce
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.flow.toList
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.supervisorScope
 import kotlinx.coroutines.sync.Semaphore
 import io.skjaere.compressionutils.Par2Parser
 import org.slf4j.LoggerFactory
 import java.io.IOException
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicReference
 import kotlin.math.min
 
 class NzbEnrichmentService(
@@ -294,9 +302,10 @@ class NzbEnrichmentService(
      * packets skipped, never held. A recovery slice in the way of them, whose length its header
      * gives, isn't read at all when it is [SKIP_OVER] bytes or more (or runs past the 16 KB): the
      * next read starts past it, so a recovery volume's block is never downloaded (NR-7). No more
-     * than [PAR2_READ_LIMIT] bytes are read, in [MAX_PAR2_READS] reads. It only names files, and the
-     * release opens without it: an index that lacks an article is left without, and so is a
-     * recovery volume standing in for one ([standIn]) whose read fails any way.
+     * than [PAR2_READ_LIMIT] bytes are read, in [MAX_PAR2_READS] reads ([readFrom]), and what fails
+     * past where they stop is none of theirs (NR-15). It only names files, and the release opens
+     * without it: an index that lacks an article is left without, and so is a recovery volume
+     * standing in for one ([standIn]) whose read fails any way.
      */
     private suspend fun readPar2(file: NzbFile, standIn: Boolean = false) {
         val size = file.yencHeaders?.size ?: return
@@ -314,12 +323,8 @@ class NzbEnrichmentService(
                 }
                 // Past the end (a slice that claims more than the file holds, its end wrapped round included).
                 if (at !in 0 until size) break
-                val queue = SegmentQueueService.createRangeQueue(NzbDocument(listOf(file)), at, minOf(size - at, left))
                 val before = packets.bytesRead
-                // Few segments ahead: one that names its files before its blocks is left there.
-                streamingService.streamSegments(queue, concurrency = 2, readAheadSegments = 2, name = "par2:${file.yencHeaders?.name}") { channel ->
-                    stop = packets.read(channel, at, SKIP_OVER)
-                }
+                stop = readFrom(file, at, minOf(size - at, left), packets)
                 left -= packets.bytesRead - before
                 reads++
             }
@@ -336,6 +341,56 @@ class NzbEnrichmentService(
         }
         file.par2Data = packets.descriptions
         logger.debug("Read PAR2 file: {} ({} bytes of file descriptions)", file.yencHeaders?.name, file.par2Data?.size)
+    }
+
+    /**
+     * Has [packets] read the bytes of [file] from [from], [limit] of them, their articles fetched
+     * one ahead of it ([NntpStreamingService.fetchSegment], through the segment cache and provider
+     * fallback); where it stopped. An article that fails ends the bytes there, all of them up to it
+     * delivered, and is thrown only when [packets] read on to that end ([Par2Packets.Stop.End]): one
+     * that stopped before, by its own rule, never wanted what failed past it, whenever it failed
+     * (NR-15). A stream ([NntpStreamingService.streamSegments]) drops what its reader hasn't taken
+     * yet when a failure closes it, so a read-ahead article's failure could lose descriptions read
+     * whole, or not, by the timing.
+     */
+    private suspend fun readFrom(file: NzbFile, from: Long, limit: Long, packets: Par2Packets): Par2Packets.Stop = coroutineScope {
+        val items = SegmentQueueService.createRangeQueue(NzbDocument(listOf(file)), from, limit).toList()
+        val channel = ByteChannel()
+        val failure = AtomicReference<Exception?>()
+        val writer = launch {
+            try {
+                // A download that fails fails neither the next nor the writer until it is its turn.
+                supervisorScope {
+                    @OptIn(ExperimentalCoroutinesApi::class)
+                    produce(capacity = Channel.RENDEZVOUS) {
+                        items.forEach { item ->
+                            send(item to this@supervisorScope.async {
+                                item.gap?.let { throw it.toException() }
+                                streamingService.fetchSegment(item.segment.articleId)
+                            })
+                        }
+                    }.consumeEach { (item, download) ->
+                        val data = download.await()
+                        val start = minOf(item.readStart, data.size.toLong()).toInt()
+                        val end = minOf(item.readEnd, data.size.toLong()).toInt()
+                        if (end > start) {
+                            channel.writeFully(data, start, end)
+                            channel.flush()
+                        }
+                    }
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (@Suppress("TooGenericExceptionCaught") e: Exception) {
+                failure.set(e)
+            }
+            // Closed without a cause, so the reader gets every byte written before it.
+            channel.flushAndClose()
+        }
+        val stop = packets.read(channel, from, SKIP_OVER)
+        writer.cancel()
+        if (stop is Par2Packets.Stop.End) failure.get()?.let { throw it }
+        stop
     }
 }
 

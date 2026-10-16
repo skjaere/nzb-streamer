@@ -31,6 +31,8 @@ class PrepareNeededFilesTest {
     private val missing = mutableSetOf<String>()
     // Articles whose answer the connection drops in (after 100 bytes), every time one is asked for.
     private val dropped = mutableSetOf<String>()
+    // Articles whose answer waits until another, by id, has been asked for (and a moment more).
+    private val answerAfter = mutableMapOf<String, String>()
     private val servers = mutableListOf<FakeNntpServer>()
 
     @AfterEach
@@ -85,8 +87,16 @@ class PrepareNeededFilesTest {
         """<nzb xmlns="http://www.newzbin.com/DTD/2003/nzb">${files.joinToString("")}</nzb>""").toByteArray()
 
     private fun <T> withStreamer(block: suspend (NzbStreamer, FakeNntpServer) -> T): T {
-        val server = FakeNntpServer(
-            body = { id -> articles[id].takeUnless { id in missing } },
+        lateinit var server: FakeNntpServer
+        server = FakeNntpServer(
+            body = { id ->
+                answerAfter[id]?.let { other ->
+                    val until = System.nanoTime() + 5_000_000_000L
+                    while (other !in server.bodiesRead && System.nanoTime() < until) Thread.sleep(10)
+                    Thread.sleep(200)
+                }
+                articles[id].takeUnless { id in missing }
+            },
             dropAfter = { id -> 100.takeIf { id in dropped } },
         ).also { servers += it }
         return NzbStreamer.fromConfig(NntpConfig("127.0.0.1", server.port, "", "", useTls = false, maxConnections = 4))
@@ -800,6 +810,32 @@ class PrepareNeededFilesTest {
     }
 
     /**
+     * A recovery volume read until its file descriptions are whole is read no further, and what
+     * fails past them changes nothing, whenever it fails: here its block's first article, which no
+     * provider has, is answered before the one its descriptions end in (NR-15).
+     */
+    @Test
+    fun `a recovery volume's descriptions are kept whatever fails past them`() {
+        val payload = bytes("movie", 200_000)
+        val named = volumes("Movie.2020", "Movie.2020.mkv", payload)
+        named.indices.reversed().forEach { v -> post(OBFUSCATED[v], named[v].second) }
+        val par2 = buildPar2File(named, recoveryBlock = 64 * 1024, descriptionsFirst = true)
+        val ids = post("0b1c2d3e.vol00+01.par2", par2, partSize = 1024)
+        // The article the header of the slice after the descriptions ends in, and the next, the block's.
+        val slice = par2.indexOfBytes("PAR 2.0\u0000RecvSlic".toByteArray(Charsets.ISO_8859_1)) - 48
+        val last = (slice + 63) / 1024
+        assertTrue(last in 1 until ids.size - 1, "the descriptions end in article ${last + 1} of ${ids.size}")
+        missing += ids[last + 1]
+        answerAfter[ids[last]] = ids[last + 1]
+
+        withStreamer { streamer, _ ->
+            val prepared = assertIs<PrepareResult.Success>(streamer.prepare(nzb()), "prepare")
+            assertEquals(named.map { it.first }, prepared.metadata.response.volumes)
+            assertContentEquals(payload, streamer.streamed(prepared))
+        }
+    }
+
+    /**
      * A recovery volume posted under a name that tells nothing is fetched (it may be a volume) and,
      * naming its files first, passes for an index: it too is read no further than its file
      * descriptions (N53).
@@ -837,6 +873,10 @@ class PrepareNeededFilesTest {
             assertContentEquals(payload, streamer.streamed(prepared))
         }
     }
+
+    /** Where [bytes] first appear in these, or -1. */
+    private fun ByteArray.indexOfBytes(bytes: ByteArray): Int =
+        (0..size - bytes.size).firstOrNull { at -> bytes.indices.all { this[at + it] == bytes[it] } } ?: -1
 
     private companion object {
         /** Names that look like an obfuscating poster's, one per volume. */
