@@ -1,7 +1,9 @@
 package io.skjaere.nzbstreamer.stream
 
 import io.skjaere.nzbstreamer.config.SegmentCacheConfig
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.awaitAll
@@ -9,6 +11,7 @@ import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.joinAll
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
@@ -20,6 +23,7 @@ import java.nio.file.attribute.FileTime
 import java.time.Instant
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.io.path.exists
 import kotlin.io.path.fileSize
@@ -31,6 +35,7 @@ import kotlin.io.path.readText
 import kotlin.io.path.setLastModifiedTime
 import kotlin.io.path.writeBytes
 import kotlin.io.path.writeText
+import kotlin.random.Random
 import kotlin.streams.asSequence
 import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
@@ -323,6 +328,87 @@ class SegmentCacheTest {
             cache.getOrFetch("d@id") { payload }
             assertNotNull(cache.get("a@id"), "a, the last read, was evicted")
             assertNull(cache.get("b@id"), "b, the least recently used, is still cached")
+        }
+    }
+
+    private fun payloadOf(id: String) = ByteArray(256) { (id.hashCode() + it).toByte() }
+
+    /** A clear while a segment is being fetched: the cache is empty, then holds that segment once it lands. */
+    @Test
+    fun `clear empties the cache and keeps a write that lands after it`(@TempDir tmp: Path) {
+        runBlocking {
+            val cache = SegmentCache(cfg(tmp))
+            val old = (1..20).map { "old-$it@id" }
+            old.forEach { id -> cache.getOrFetch(id) { payloadOf(id) } }
+            val fetched = CompletableDeferred<Unit>()
+            val writer = async(start = CoroutineStart.UNDISPATCHED) {
+                cache.getOrFetch("new@id") { fetched.await(); payloadOf("new@id") }
+            }
+
+            cache.clear()
+            assertEquals(SegmentCache.Stats(0, 0, 1_000_000L), cache.stats())
+            assertEquals(emptyList(), segmentFiles(tmp))
+            assertNull(cache.get("old-1@id"))
+
+            fetched.complete(Unit)
+            assertContentEquals(payloadOf("new@id"), writer.await())
+            assertEquals(1, cache.stats().entryCount)
+            assertMatchesDisk(cache, tmp)
+            val fetches = AtomicInteger()
+            assertContentEquals(payloadOf("old-2@id"), cache.getOrFetch("old-2@id") { fetches.incrementAndGet(); payloadOf("old-2@id") })
+            assertEquals(1, fetches.get(), "a cleared segment wasn't fetched again")
+        }
+    }
+
+    /**
+     * Clears while readers read segments at random, fetching those that miss, until the clear is
+     * done: each read gets its segment's bytes, and the index is then as the disk is. (A file a
+     * clear deletes after a write put it back, still listed, is served by no read.)
+     */
+    @Test
+    fun `clear keeps reads and writes in flight right`(@TempDir tmp: Path) {
+        runBlocking {
+            val cache = SegmentCache(cfg(tmp))
+            val ids = (1..300).map { "seg-$it@id" }
+            repeat(20) { round ->
+                val cleared = AtomicBoolean(false)
+                coroutineScope {
+                    val readers = (1..8).map { n ->
+                        launch(Dispatchers.IO) {
+                            val random = Random(round * 8 + n)
+                            while (!cleared.get()) {
+                                val id = ids.random(random)
+                                assertContentEquals(payloadOf(id), cache.getOrFetch(id) { payloadOf(id) }, id)
+                            }
+                        }
+                    }
+                    delay(50)
+                    cache.clear()
+                    cleared.set(true)
+                    readers.joinAll()
+                }
+                assertMatchesDisk(cache, tmp)
+            }
+        }
+    }
+
+    @Test
+    fun `resize evicts down to the new limit at once and lets the cache grow back`(@TempDir tmp: Path) {
+        runBlocking {
+            val cache = SegmentCache(cfg(tmp, maxBytes = 4 * 1024))
+            val payload = ByteArray(1024) { 0x13 }
+            listOf("a@id", "b@id", "c@id", "d@id").forEach { id -> cache.getOrFetch(id) { payload } }
+            assertNotNull(cache.get("a@id"))
+
+            cache.resize(2 * 1024)
+            assertEquals(SegmentCache.Stats(2, 2 * 1024, 2 * 1024), cache.stats())
+            assertMatchesDisk(cache, tmp)
+            assertNotNull(cache.get("a@id"), "a, the last read, was evicted")
+            assertNotNull(cache.get("d@id"), "d, the last written, was evicted")
+
+            cache.resize(8 * 1024)
+            listOf("e@id", "f@id", "g@id").forEach { id -> cache.getOrFetch(id) { payload } }
+            assertEquals(SegmentCache.Stats(5, 5 * 1024, 8 * 1024), cache.stats())
         }
     }
 

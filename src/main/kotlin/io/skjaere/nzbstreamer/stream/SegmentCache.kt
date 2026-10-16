@@ -18,6 +18,7 @@ import kotlinx.serialization.json.intOrNull
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import org.slf4j.LoggerFactory
+import java.io.IOException
 import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.StandardCopyOption
@@ -53,6 +54,8 @@ import kotlin.io.path.writeText
  * written whole (to a temporary file, then renamed), so a write a kill cuts short is never
  * taken for a segment. Loading walks the cache directory: construct the cache off the main
  * thread. One instance per directory: two would each take the other's files for their own.
+ * A file is renamed into place and deleted under the index lock, so the index lists a file
+ * exactly when it is on disk, a [clear] or a [resize] with reads and writes in flight included.
  *
  * The cache is best-effort: failures to read/write the disk degrade silently to a
  * passthrough to the [fetch] lambda. Bytes returned to callers are always correct
@@ -95,6 +98,7 @@ class SegmentCache(private val config: SegmentCacheConfig) : AutoCloseable {
     // stream-startup stalls when Plex fired its parallel range probes.
     private val inFlight = java.util.concurrent.ConcurrentHashMap<String, CompletableDeferred<ByteArray>>()
     private val totalBytes = AtomicLong(0)
+    private val maxBytes = AtomicLong(config.maxBytes)
     private val pendingWrites = AtomicLong(0)
     // The last stamp given: the next is the wall clock's time or one past this, whichever is
     // later, so a clock set back never stamps an access before an earlier one.
@@ -102,7 +106,7 @@ class SegmentCache(private val config: SegmentCacheConfig) : AutoCloseable {
 
     private val indexPath: Path = config.cacheDir.resolve("index.json")
     private val indexTempPath: Path = config.cacheDir.resolve("index.json$TEMP_SUFFIX")
-    private val evictThreshold: Long = (config.maxBytes * config.evictThresholdRatio).toLong()
+    private val evictThreshold: Long get() = (maxBytes.get() * config.evictThresholdRatio).toLong()
 
     init {
         require(config.maxBytes > 0) { "maxBytes must be > 0" }
@@ -113,7 +117,7 @@ class SegmentCache(private val config: SegmentCacheConfig) : AutoCloseable {
         // index gauge reads .size unsynchronized — fine for a metric.
         val registry = Metrics.globalRegistry
         registry.gauge("nzb.segments.cache.bytes", totalBytes)
-        registry.gauge("nzb.segments.cache.max.bytes", AtomicLong(config.maxBytes))
+        registry.gauge("nzb.segments.cache.max.bytes", maxBytes)
         registry.gauge("nzb.segments.cache.entries", index) { it.size.toDouble() }
     }
 
@@ -236,40 +240,38 @@ class SegmentCache(private val config: SegmentCacheConfig) : AutoCloseable {
     suspend fun get(articleId: String): ByteArray? {
         val name = nameFor(articleId)
         val entry = indexLock.withLock { index[name] } ?: return null
-        return readEntry(articleId, name, entry)
+        return readEntry(articleId, entry)
     }
 
-    private suspend fun readEntry(articleId: String, name: String, entry: Entry): ByteArray? {
-        val path = pathFor(name)
-        return withContext(Dispatchers.IO) {
-            runCatching {
-                val bytes = path.readBytes()
-                if (bytes.size.toLong() != entry.size) {
-                    logger.warn(
-                        "Cache size mismatch for {}: expected {} got {}, dropping",
-                        articleId, entry.size, bytes.size
-                    )
-                    invalidate(name)
-                    null
-                } else {
-                    bytes
-                }
-            }.getOrElse { e ->
-                logger.warn("Failed to read cached segment {}: {}", articleId, e.message)
-                invalidate(name)
+    private suspend fun readEntry(articleId: String, entry: Entry): ByteArray? = withContext(Dispatchers.IO) {
+        val bytes = runCatching { pathFor(entry.name).readBytes() }
+            .onFailure { logger.warn("Failed to read cached segment {}: {}", articleId, it.message) }
+            .getOrNull()
+        when {
+            bytes == null -> null
+            bytes.size.toLong() != entry.size -> {
+                logger.warn("Cache size mismatch for {}: expected {} got {}, dropping", articleId, entry.size, bytes.size)
                 null
             }
-        }?.also {
-            indexLock.withLock { index[name]?.lastAccessMillis = stamp() }
+            else -> bytes
+        }.also { read ->
+            indexLock.withLock {
+                // A clear may have dropped it since, and a write put the segment back: not this one's.
+                if (index[entry.name] !== entry) return@withLock
+                if (read != null) entry.lastAccessMillis = stamp() else removeLocked(entry)
+            }
         }
     }
 
-    private suspend fun invalidate(name: String) {
-        indexLock.withLock {
-            val removed = index.remove(name)
-            if (removed != null) totalBytes.addAndGet(-removed.size)
-        }
-        runCatching { pathFor(name).deleteIfExists() }
+    /**
+     * Drops [entry] and deletes its file. Under [indexLock]: files are renamed into place under it
+     * too, so one put back by a write can't be deleted between its rename and its index update.
+     */
+    private fun removeLocked(entry: Entry) {
+        index.remove(entry.name)
+        totalBytes.addAndGet(-entry.size)
+        runCatching { pathFor(entry.name).deleteIfExists() }
+            .onFailure { logger.warn("Failed to delete cache file {}: {}", entry.name, it.message) }
     }
 
     /**
@@ -334,72 +336,98 @@ class SegmentCache(private val config: SegmentCacheConfig) : AutoCloseable {
         val name = nameFor(articleId)
         val path = pathFor(name)
         // A file written is one the index must know, or it is never evicted: no cancellation
-        // between the write and the index update.
-        val newTotal = withContext(NonCancellable) {
-            val ok = withContext(Dispatchers.IO) {
-                runCatching {
-                    writeWhole(path, bytes)
-                    true
-                }.getOrElse {
-                    logger.warn("Failed to write cache file {}: {}", path, it.message)
-                    false
+        // between the write and the index update, and the rename and the update under the lock.
+        val newTotal = withContext(NonCancellable + Dispatchers.IO) {
+            val temp = runCatching { writeTemp(path, bytes) }
+                .onFailure { logger.warn("Failed to write cache file {}: {}", path, it.message) }
+                .getOrNull() ?: return@withContext null
+            try {
+                indexLock.withLock {
+                    temp.moveTo(path, StandardCopyOption.ATOMIC_MOVE)
+                    index[name]?.let { totalBytes.addAndGet(-it.size) }
+                    index[name] = Entry(name, bytes.size.toLong(), stamp())
+                    totalBytes.addAndGet(bytes.size.toLong())
                 }
-            }
-            if (!ok) return@withContext null
-
-            indexLock.withLock {
-                index[name]?.let { totalBytes.addAndGet(-it.size) }
-                index[name] = Entry(name, bytes.size.toLong(), stamp())
-                totalBytes.addAndGet(bytes.size.toLong())
+            } catch (e: IOException) {
+                logger.warn("Failed to write cache file {}: {}", path, e.message)
+                runCatching { temp.deleteIfExists() }
+                null
             }
         } ?: return
         if (newTotal > evictThreshold) evict()
         if (pendingWrites.incrementAndGet() % INDEX_FLUSH_INTERVAL == 0L) save()
     }
 
-    /** Writes [bytes] to [path] whole or not at all: to a temporary file beside it, then renamed to it. */
-    private fun writeWhole(path: Path, bytes: ByteArray) {
+    /**
+     * Writes [bytes] to a temporary file beside [path], to be renamed to it: a write a kill cuts
+     * short is never taken for a segment.
+     */
+    private fun writeTemp(path: Path, bytes: ByteArray): Path {
         path.parent.createDirectories()
         val temp = Files.createTempFile(path.parent, path.name, TEMP_SUFFIX)
         try {
             temp.writeBytes(bytes)
-            temp.moveTo(path, StandardCopyOption.ATOMIC_MOVE)
-        } finally {
-            temp.deleteIfExists()
+        } catch (e: IOException) {
+            runCatching { temp.deleteIfExists() }
+            throw e
         }
+        return temp
     }
 
+    /**
+     * Evicts the least recently used entries until the cache is within its limit, [DELETE_BATCH]
+     * at a time under the lock, so a large eviction (the limit lowered) doesn't hold it long.
+     */
     private suspend fun evict() {
-        val toRemove = indexLock.withLock {
-            if (totalBytes.get() <= config.maxBytes) return@withLock emptyList()
-            val sorted = index.values.sortedBy { it.lastAccessMillis }
-            val targets = mutableListOf<Entry>()
-            var t = totalBytes.get()
-            for (cand in sorted) {
-                if (t <= config.maxBytes) break
-                targets += cand
-                t -= cand.size
-            }
-            for (cand in targets) {
-                index.remove(cand.name)
-                totalBytes.addAndGet(-cand.size)
-            }
-            targets
+        val candidates = indexLock.withLock {
+            if (totalBytes.get() <= maxBytes.get()) emptyList() else index.values.sortedBy { it.lastAccessMillis }
         }
-        if (toRemove.isEmpty()) return
-        // Out of the index already: delete them even if cancelled, or they stay on disk for good.
-        withContext(NonCancellable + Dispatchers.IO) {
-            for (cand in toRemove) {
-                runCatching { pathFor(cand.name).deleteIfExists() }
+        var evicted = 0
+        withContext(Dispatchers.IO) {
+            for (batch in candidates.chunked(DELETE_BATCH)) {
+                val within = indexLock.withLock {
+                    for (entry in batch) {
+                        if (totalBytes.get() <= maxBytes.get()) break
+                        // One a clear dropped, or a write replaced, since the candidates were picked isn't evicted.
+                        if (index[entry.name] !== entry) continue
+                        removeLocked(entry)
+                        evicted++
+                    }
+                    totalBytes.get() <= maxBytes.get()
+                }
+                if (within) break
             }
         }
-        logger.debug("Evicted {} segments, totalBytes now {}", toRemove.size, totalBytes.get())
+        if (evicted > 0) logger.debug("Evicted {} segments, totalBytes now {}", evicted, totalBytes.get())
+    }
+
+    /**
+     * Empties the cache: drops every entry and deletes its file, then saves the index. Reads and
+     * writes in flight go on: a read whose file is gone misses (getOrFetch fetches it again), and
+     * a write that lands during or after the clear is kept.
+     */
+    suspend fun clear() {
+        val entries = indexLock.withLock { index.values.toList() }
+        withContext(Dispatchers.IO) {
+            for (batch in entries.chunked(DELETE_BATCH)) {
+                indexLock.withLock { batch.filter { index[it.name] === it }.forEach(::removeLocked) }
+            }
+        }
+        logger.info("Cleared the segment cache: {} segments", entries.size)
+        save()
+    }
+
+    /** Sets the limit to [maxBytes]; a cache over it evicts its least recently used entries at once. */
+    suspend fun resize(maxBytes: Long) {
+        require(maxBytes > 0) { "maxBytes must be > 0" }
+        this.maxBytes.set(maxBytes)
+        evict()
     }
 
     fun stats(): Stats = Stats(
         entryCount = indexSizeUnlocked(),
         totalBytes = totalBytes.get(),
-        maxBytes = config.maxBytes,
+        maxBytes = maxBytes.get(),
     )
 
     private fun indexSizeUnlocked(): Int = index.size
@@ -416,6 +444,8 @@ class SegmentCache(private val config: SegmentCacheConfig) : AutoCloseable {
         // An older index's entry, stamped with its file's modification time once that is read.
         private const val UNSTAMPED = -1L
         private const val TEMP_SUFFIX = ".tmp"
+        // Files deleted under one hold of the index lock, by an eviction or a clear.
+        private const val DELETE_BATCH = 64
         private val SHARD_NAME = Regex("[0-9a-f]{2}")
         private val SEGMENT_NAME = Regex("[0-9a-f]{64}")
     }
