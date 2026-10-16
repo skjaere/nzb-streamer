@@ -151,13 +151,17 @@ class NzbStreamer private constructor(
         // For RAW (non-archive) NZBs the streamable filename is what users will see on
         // their mount, so it's worth picking the most-trustworthy source instead of the
         // on-wire yenc header name. The par2 index is built once per NZB (par2 bytes
-        // can be on any file in the doc, normally only one slot has them).
+        // can be on any file in the doc, normally only one slot has them). prepare keeps the
+        // PAR2 files out of the doc, though: the name their data gives a file is the one it
+        // lists the file under in the response's volumes, where that isn't its yEnc name
+        // (library issue N54).
         val par2Index = FilenameResolver.indexPar2ByHash16k(
             metadata.orderedArchiveNzb.files.firstOrNull { it.par2Data != null }?.par2Data
         )
         return metadata.orderedArchiveNzb.files.mapIndexedNotNull { index, file ->
             val headers = file.yencHeaders ?: return@mapIndexedNotNull null
             val par2Filename = par2Index[FilenameResolver.hash16kHex(file.first16kb)]
+                ?: metadata.response.volumes.getOrNull(index)?.takeIf { it != headers.name }
             val best = FilenameResolver.bestFilename(
                 yencName = headers.name,
                 subject = file.subject,
