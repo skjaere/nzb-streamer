@@ -81,6 +81,9 @@ internal object VolumeNames {
         return if (FIRST_VOLUME.containsMatchIn(name)) 0 else null
     }
 
+    /** Whether [name] is a split 7z volume's (.7z.001, .7z.002, ...): one past the first has no signature. */
+    fun isSplit7z(name: String): Boolean = SPLIT_7Z.containsMatchIn(name)
+
     /** Whether [first16kb] start with an archive's signature (RAR4, RAR5, 7z). */
     fun isArchive(first16kb: ByteArray?): Boolean =
         first16kb != null && ArchiveTypeDetector.detect(first16kb).type != ArchiveTypeDetector.ArchiveType.UNKNOWN

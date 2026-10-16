@@ -717,6 +717,45 @@ class PrepareNeededFilesTest {
         }
     }
 
+    /**
+     * A volume the PAR2 index names into a set, posted under a name that tells nothing or obfuscated
+     * by itself beside the set's named volumes, is one of the set's: its volumes don't skip it, by
+     * their RAR5 headers or otherwise, and the release opens in the order the index gives (NR-13).
+     */
+    @ParameterizedTest
+    @CsvSource("RAR5, x7f3k9q2", "RAR5, a8f7d6e5.rar", "RAR4, x7f3k9q2", "RAR4, a8f7d6e5.rar")
+    fun `a volume the PAR2 index names beside its set's named ones opens with them`(type: ContainerType, postedAs: String) {
+        val payload = bytes("movie", 200_000)
+        val named = volumes("Movie.2020", "Movie.2020.mkv", payload, type)
+        named.forEachIndexed { v, (name, data) -> post(if (v == 1) postedAs else name, data) }
+        post("Movie.2020.par2", buildPar2File(named))
+
+        withStreamer { streamer, _ ->
+            val result = streamer.prepare(nzb())
+            val prepared = assertIs<PrepareResult.Success>(result, "prepare: $result")
+            assertEquals(named.map { it.first }, prepared.metadata.response.volumes)
+            assertContentEquals(payload, streamer.streamed(prepared))
+        }
+    }
+
+    /**
+     * A RAR volume starts with its archive's signature: without PAR2 data, a file named like the
+     * volume a set's names skip that isn't an archive doesn't stand in for it (NR-13). A 7z volume
+     * past the first has none, so its name alone counts.
+     */
+    @Test
+    fun `a file named like a missing RAR volume that isn't one doesn't hide the gap`() {
+        val named = volumes("Movie.2020", "Movie.2020.mkv", bytes("movie", 200_000), ContainerType.RAR4)
+        assertEquals(4, named.size)
+        named.forEachIndexed { v, (name, data) -> if (v == 2) post("$name.bin", bytes("not a volume", data.size)) else post(name, data) }
+
+        withStreamer { streamer, _ ->
+            val result = streamer.prepare(nzb())
+            val missingArticles = assertIs<PrepareResult.MissingArticles>(result, "prepare: $result")
+            assertTrue("volume 3" in missingArticles.message, missingArticles.message)
+        }
+    }
+
     /** As one that lacks a first article, another episode's set whose volumes skip one is left out (NR-13). */
     @ParameterizedTest
     @ValueSource(strings = ["RAR4", "RAR5"])

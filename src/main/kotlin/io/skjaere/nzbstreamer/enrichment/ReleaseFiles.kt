@@ -306,13 +306,15 @@ internal class ReleaseFiles(private val files: List<NzbFile>) {
 
         /**
          * The sets the release opens, by their names (not obfuscated ones), whose volumes skip one,
-         * each by its first file with the cause (NR-13): by the places their RAR5 headers give
-         * ([Rar5Parser.volumeNumber]) when each of their volumes' does, else, when no PAR2 data names
-         * one of them, by the places their names give ([VolumeNames.number]), a file of [present]
-         * whose name places it in the set counting as the volume it names (a 7z volume past the
-         * first has no signature to show it is one). A set whose places skip one or don't start at its
-         * first lacks one; a missing last volume isn't seen this way. [found] are the volumes found
-         * among the others, by the name that places them.
+         * each by its first file with the cause (NR-13). A set's volumes are its files, the volumes
+         * of [found] (found among the others, by the name that places them) in it, and the files of
+         * [kept] the PAR2 data names into it, posted under names that tell nothing or obfuscated by
+         * themselves, as the archive is ordered. Their places are those their RAR5 headers give
+         * ([Rar5Parser.volumeNumber]) when each of them does, else, when no PAR2 data names one of
+         * them, those their names give ([VolumeNames.number]), a file of [present] whose name places
+         * it in the set counting as the volume it names when it is an archive by its content, or a
+         * 7z volume (one past the first has no signature to show it is one). A set whose places skip
+         * one or don't start at its first lacks one; a missing last volume isn't seen this way.
          */
         private fun skipping(
             hashes: Map<Int, String>,
@@ -322,14 +324,20 @@ internal class ReleaseFiles(private val files: List<NzbFile>) {
             .filter { set -> set.all { it in kept } && !isObfuscatedSet(names[set.first()]!!) }
             .mapNotNull { set ->
                 val stems = stemsOf(set)
-                val volumes = set.associateWith { names[it]!! } + found.filterValues { stemOf(it) in stems }
+                val namedInto = kept.filterNot { it in set }.mapNotNull { i ->
+                    par2Name(i, hashes)?.takeIf { VolumeNames.isVolume(it) && stemOf(it) in stems }?.let { i to it }
+                }
+                val volumes = set.associateWith { names[it]!! } + namedInto + found.filterValues { stemOf(it) in stems }
                 val headers = volumes.keys.map { files[it].first16kb?.let(Rar5Parser::volumeNumber) }
                 val places = if (headers.all { it != null }) headers.filterNotNull() else {
                     val described = volumes.keys.any { par2Name(it, hashes) != null } ||
                         descriptions.any { stemOf(it.filename) in stems }
                     if (described) return@mapNotNull null
-                    val claimed = present.mapNotNull { VolumeNames.of(files[it].yencHeaders?.name ?: names[it]!!) }
-                        .filter { stemOf(it) in stems }
+                    val claimed = present.mapNotNull { i ->
+                        VolumeNames.of(files[i].yencHeaders?.name ?: names[i]!!)?.takeIf {
+                            stemOf(it) in stems && (VolumeNames.isArchive(files[i].first16kb) || VolumeNames.isSplit7z(it))
+                        }
+                    }
                     (volumes.values + claimed).map { VolumeNames.number(it) ?: return@mapNotNull null }
                 }
                 val absent = (0..places.max()).firstOrNull { it !in places } ?: return@mapNotNull null
