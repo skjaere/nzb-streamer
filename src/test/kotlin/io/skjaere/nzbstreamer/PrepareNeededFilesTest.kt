@@ -171,6 +171,32 @@ class PrepareNeededFilesTest {
         }
     }
 
+    /** Each episode's RAR4 set (.rar, .r00, ...) is opened from its own volumes, none from another's (NR-2). */
+    @Test
+    fun `a RAR4 season pack lists every episode and streams each whole`() {
+        val episodes = (1..3).associate { e -> "Show.S01E0$e" to bytes("episode $e", 150_000) }
+        episodes.forEach { (base, data) -> volumes(base, "$base.mkv", data, ContainerType.RAR4).forEach { (name, volume) -> post(name, volume) } }
+
+        withStreamer { streamer, _ ->
+            val prepared = assertIs<PrepareResult.Success>(streamer.prepare(nzb()), "prepare")
+            assertEquals(episodes.keys.map { "$it.mkv" }, streamer.resolveStreamableFiles(prepared.metadata).map { it.path })
+            episodes.forEach { (base, data) -> assertContentEquals(data, streamer.streamed(prepared, "$base.mkv"), base) }
+        }
+    }
+
+    /** A subtitle archive posted after the film's RAR4 set is no volume of it (NR-2). */
+    @Test
+    fun `a RAR4 film with a subtitle archive posted after it streams whole`() {
+        val payload = bytes("movie", 200_000)
+        volumes("Movie.2020", "Movie.2020.mkv", payload, ContainerType.RAR4).forEach { (name, data) -> post(name, data) }
+        post("Movie.2020.subs.rar", ArchiveGenerator.generate(bytes("subs", 5_000), 1, ContainerType.RAR4, "Movie.2020.srt").single().data)
+
+        withStreamer { streamer, _ ->
+            val prepared = assertIs<PrepareResult.Success>(streamer.prepare(nzb()), "prepare")
+            assertContentEquals(payload, streamer.streamed(prepared, "Movie.2020.mkv"))
+        }
+    }
+
     /**
      * Volumes obfuscated one by one ("a8f7d6e5.rar", "b91c2d3e.rar", ...) don't group into a set,
      * yet are one archive: none stands in for another (library issue N36).
