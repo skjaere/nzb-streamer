@@ -44,15 +44,18 @@ class PrepareNeededFilesTest {
         servers.forEach { it.close() }
     }
 
-    /** Posts [data] as [name], in articles of [partSize], and returns their ids (in brackets). */
-    private fun post(name: String, data: ByteArray, partSize: Int = 32 * 1024): List<String> {
+    /**
+     * Posts [data] as [name], in articles of [partSize], and returns their ids (in brackets). Its
+     * NZB subject names it [subject]: an indexer may rewrite subjects, the yEnc names left as posted.
+     */
+    private fun post(name: String, data: ByteArray, partSize: Int = 32 * 1024, subject: String = name): List<String> {
         val parts = YencEncoder.encodeMultiPart(data, name, partSize)
         val ids = parts.indices.map { "<$name-${it + 1}@test>" }
         ids.zip(parts) { id, part -> articles[id] = part.data }
         val segments = ids.withIndex().joinToString("") { (i, id) ->
             """<segment bytes="${parts[i].data.size}" number="${i + 1}">${id.removeSurrounding("<", ">")}</segment>"""
         }
-        files += """<file poster="t" date="0" subject="&quot;$name&quot; yEnc (1/${parts.size})">""" +
+        files += """<file poster="t" date="0" subject="&quot;$subject&quot; yEnc (1/${parts.size})">""" +
             """<groups><group>alt.binaries.test</group></groups><segments>$segments</segments></file>"""
         return ids
     }
@@ -357,6 +360,81 @@ class PrepareNeededFilesTest {
             val prepared = assertIs<PrepareResult.Success>(streamer.prepare(nzb()), "prepare")
             assertEquals(named.map { it.first }, prepared.metadata.response.volumes)
             assertContentEquals(payload, streamer.streamed(prepared))
+        }
+    }
+
+    /**
+     * The volumes are ordered by the names their yEnc headers give, which an indexer that rewrites
+     * subjects (either way) leaves as posted: without a PAR2 index, a volume posted under another
+     * extension joins the set those names make, by its own yEnc name, whatever the subjects say (NR-14).
+     */
+    @ParameterizedTest
+    @CsvSource("RAR5, Movie.2020, abc123", "RAR4, Movie.2020, abc123", "RAR5, abc123, Movie.2020", "RAR4, abc123, Movie.2020")
+    fun `a volume posted under another extension joins its set by its yEnc name when subjects are rewritten`(
+        type: ContainerType,
+        subjects: String,
+        posted: String,
+    ) {
+        val payload = bytes("movie", 200_000)
+        val named = volumes(posted, "Movie.2020.mkv", payload, type)
+        named.forEachIndexed { v, (name, data) ->
+            val subject = subjects + name.removePrefix(posted)
+            if (v == 1) post("$name.bin", data, subject = "$subject.bin") else post(name, data, subject = subject)
+        }
+
+        withStreamer { streamer, _ ->
+            val prepared = assertIs<PrepareResult.Success>(streamer.prepare(nzb()), "prepare")
+            assertEquals(named.map { it.first }, prepared.metadata.response.volumes)
+            assertContentEquals(payload, streamer.streamed(prepared))
+        }
+    }
+
+    /**
+     * Beside volumes obfuscated one by one, with no PAR2 data, a volume posted under another
+     * extension whose name places it in a set of its own may be one of theirs, under a name of its
+     * own as theirs are: nothing tells where it goes, so the release fails rather than open
+     * without it (NR-14).
+     */
+    @ParameterizedTest
+    @CsvSource("RAR5, x7f3k9q2.part2.avi", "RAR4, x7f3k9q2.r00.bin")
+    fun `a volume under a name of its own beside volumes obfuscated one by one fails a release without PAR2 data`(
+        type: ContainerType,
+        postedAs: String,
+    ) {
+        val named = volumes("Movie.2020", "Movie.2020.mkv", bytes("movie", 200_000), type)
+        named.forEachIndexed { v, (_, data) -> post(if (v == 1) postedAs else "${OBFUSCATED[v]}.rar", data) }
+
+        withStreamer { streamer, _ ->
+            val result = streamer.prepare(nzb())
+            val failure = assertIs<PrepareResult.Failure>(result, "prepare: $result")
+            assertEquals(postedAs, assertIs<UnplacedArchiveVolumeException>(failure.cause).volume)
+        }
+    }
+
+    /**
+     * A season pack leaves out an episode whose set lacks a volume, the volume found posted under
+     * another extension with it, also when that one was found by its yEnc name, which the
+     * subjects don't give (NR-14).
+     */
+    @Test
+    fun `a season pack leaves out an episode that lacks a volume, with one found by its yEnc name`() {
+        val episodes = (1..3).associate { e -> "Show.S01E0$e" to bytes("episode $e", 200_000) }
+        episodes.forEach { (base, data) ->
+            val posted = if (base == "Show.S01E02") "abc123" else base
+            volumes(posted, "$base.mkv", data).forEachIndexed { v, (name, volume) ->
+                val subject = base + name.removePrefix(posted)
+                when {
+                    posted == base -> post(name, volume)
+                    v == 1 -> post("$name.bin", volume, subject = "$subject.bin")
+                    v != 2 -> post(name, volume, subject = subject)
+                }
+            }
+        }
+
+        withStreamer { streamer, _ ->
+            val prepared = assertIs<PrepareResult.Success>(streamer.prepare(nzb()), "prepare")
+            assertEquals(listOf("Show.S01E01.mkv", "Show.S01E03.mkv"), streamer.resolveStreamableFiles(prepared.metadata).map { it.path })
+            assertContentEquals(episodes.getValue("Show.S01E03"), streamer.streamed(prepared, "Show.S01E03.mkv"))
         }
     }
 
