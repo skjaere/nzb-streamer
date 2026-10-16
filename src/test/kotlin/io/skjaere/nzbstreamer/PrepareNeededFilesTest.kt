@@ -539,6 +539,43 @@ class PrepareNeededFilesTest {
     }
 
     /**
+     * Without PAR2 data to name its volumes, a set ordered by its names (or by its RAR5 headers)
+     * whose volumes skip one, or don't start at its first, lacks one the NZB doesn't hold: the
+     * release doesn't open without it (NR-13). A missing last volume can't be seen this way.
+     */
+    @ParameterizedTest
+    @CsvSource("RAR4, 2", "RAR4, 0", "SEVENZIP, 1", "SEVENZIP, 0", "RAR5, 1", "RAR5, 0")
+    fun `a set whose volumes skip one fails a release without PAR2 data`(type: ContainerType, absent: Int) {
+        val named = volumes("Movie.2020", "Movie.2020.mkv", bytes("movie", 200_000), type)
+        assertEquals(4, named.size)
+        named.forEachIndexed { v, (name, data) -> if (v != absent) post(name, data) }
+        post("Movie.2020.nfo", bytes("nfo", 1_000))
+
+        withStreamer { streamer, _ ->
+            val result = assertIs<PrepareResult.MissingArticles>(streamer.prepare(nzb()), "prepare")
+            assertTrue("volume ${absent + 1}" in result.message, result.message)
+        }
+    }
+
+    /** As one that lacks a first article, another episode's set whose volumes skip one is left out (NR-13). */
+    @ParameterizedTest
+    @ValueSource(strings = ["RAR4", "RAR5"])
+    fun `a season pack leaves out an episode whose volumes skip one`(type: ContainerType) {
+        val episodes = (1..3).associate { e -> "Show.S01E0$e" to bytes("episode $e", 150_000) }
+        episodes.forEach { (base, data) ->
+            val named = volumes(base, "$base.mkv", data, type)
+            assertEquals(3, named.size)
+            named.forEachIndexed { v, (name, volume) -> if (base != "Show.S01E02" || v != 1) post(name, volume) }
+        }
+
+        withStreamer { streamer, _ ->
+            val prepared = assertIs<PrepareResult.Success>(streamer.prepare(nzb()), "prepare")
+            assertEquals(listOf("Show.S01E01.mkv", "Show.S01E03.mkv"), streamer.resolveStreamableFiles(prepared.metadata).map { it.path })
+            assertContentEquals(episodes.getValue("Show.S01E03"), streamer.streamed(prepared, "Show.S01E03.mkv"))
+        }
+    }
+
+    /**
      * A recovery volume's file descriptions often follow its recovery block, past its first 16 KB:
      * it is read as it streams, its block skipped, until they are (library issue N53).
      */

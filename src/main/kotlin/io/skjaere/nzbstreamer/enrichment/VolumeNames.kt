@@ -14,6 +14,10 @@ import io.skjaere.nzbstreamer.nzb.NzbFile
  */
 internal object VolumeNames {
     private val PART_NUMBER = Regex("""(?i)\.part\d+$""")
+    private val MODERN_RAR = Regex("""(?i)\.part(\d+)\.rar$""")
+    private val OLD_RAR = Regex("""(?i)\.([rs])(\d{2,3})$""")
+    private val FIRST_VOLUME = Regex("""(?i)\.(rar|7z)$""")
+    private val SPLIT_7Z = Regex("""(?i)\.7z\.(\d{3})$""")
 
     /**
      * The file descriptions in the PAR2 data of [files], every PAR2 file's (a season pack can have
@@ -59,6 +63,22 @@ internal object VolumeNames {
             PART_NUMBER.containsMatchIn(stem) -> "$stem.rar"
             else -> null
         }
+    }
+
+    /**
+     * The place volume [name] gives itself in its set: 0 for the first (.part1.rar, .rar, .7z.001,
+     * .7z), 1 for the next (.part2.rar, .r00, .7z.002), and so on, .s00 after .r99. Null for a
+     * name that isn't a volume's.
+     */
+    fun number(name: String): Int? {
+        MODERN_RAR.find(name)?.let { return it.groupValues[1].toInt() - 1 }
+        SPLIT_7Z.find(name)?.let { return it.groupValues[1].toInt() - 1 }
+        OLD_RAR.find(name)?.let { match ->
+            val (letter, digits) = match.destructured
+            val perLetter = if (digits.length == 2) 100 else 1000
+            return (letter.lowercase()[0] - 'r') * perLetter + digits.toInt() + 1
+        }
+        return if (FIRST_VOLUME.containsMatchIn(name)) 0 else null
     }
 
     /** Whether [first16kb] start with an archive's signature (RAR4, RAR5, 7z). */

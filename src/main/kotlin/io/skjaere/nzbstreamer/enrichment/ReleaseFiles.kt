@@ -1,6 +1,7 @@
 package io.skjaere.nzbstreamer.enrichment
 
 import io.skjaere.compressionutils.ArchiveService
+import io.skjaere.compressionutils.Rar5Parser
 import io.skjaere.nntp.ArticleNotFoundException
 import io.skjaere.nzbstreamer.nzb.FilenameResolver
 import io.skjaere.nzbstreamer.nzb.NzbFile
@@ -28,7 +29,8 @@ import io.skjaere.nzbstreamer.nzb.printable
  * A volume posted under another extension than its archive's isn't one by its name (library issue
  * N52): once those files are fetched, [Volumes] finds it among the videos and other files beside
  * the archives ([mayHideVolume]), by the PAR2 data or by its content. A volume the PAR2 index names
- * that the release doesn't hold leaves its set out where an episode's may be, and fails it elsewhere.
+ * that the release doesn't hold leaves its set out where an episode's may be, and fails it elsewhere,
+ * and so does one a set's names or RAR5 headers show it lacks (NR-13).
  */
 internal class ReleaseFiles(files: List<NzbFile>) {
     private enum class Role { ARCHIVE, VIDEO, PAR2, RECOVERY, SIDE, OTHER, UNKNOWN }
@@ -159,6 +161,8 @@ internal class ReleaseFiles(files: List<NzbFile>) {
          * lacks its first article; [Found.Unplaced] when nothing tells where a volume goes. One its
          * content shows to be a volume whose name places it in a set the release doesn't open is
          * another archive's (an extra's), none of the release's: it is left as before N52 (NR-14).
+         * A set whose volumes skip one ([skipping]) lacks it as one that lacks a volume the PAR2 data
+         * names does (NR-13).
          */
         fun found(unknown: Map<Int, ArticleNotFoundException>): Found {
             if (byContent) unknown.minByOrNull { it.key }?.let { return Found.Missing(it.value) }
@@ -187,8 +191,46 @@ internal class ReleaseFiles(files: List<NzbFile>) {
                 if (set == null || !setsApart) return Found.Missing(cause)
                 incomplete.putIfAbsent(set.first(), cause)
             }
+            for ((first, cause) in skipping(hashes, found, toCheck.filterNot { it in unknown })) {
+                if (!setsApart) return Found.Missing(cause)
+                incomplete.putIfAbsent(first, cause)
+            }
             return Found.Volumes(found, incomplete)
         }
+
+        /**
+         * The sets the release opens, by their names (not obfuscated ones), whose volumes skip one,
+         * each by its first file with the cause (NR-13): by the places their RAR5 headers give
+         * ([Rar5Parser.volumeNumber]) when each of their volumes' does, else, when no PAR2 data names
+         * one of them, by the places their names give ([VolumeNames.number]), a file of [present]
+         * whose name places it in the set counting as the volume it names (a 7z volume past the
+         * first has no signature to show it is one). A set whose places skip one or don't start at its
+         * first lacks one; a missing last volume isn't seen this way. [found] are the volumes found
+         * among the others, by the name that places them.
+         */
+        private fun skipping(
+            hashes: Map<Int, String>,
+            found: Map<Int, String>,
+            present: List<Int>,
+        ): Map<Int, ArticleNotFoundException> = sets
+            .filter { set -> set.all { it in kept } && !isObfuscatedSet(names[set.first()]!!) }
+            .mapNotNull { set ->
+                val stem = stemOf(names[set.first()]!!)
+                val volumes = set.associateWith { names[it]!! } + found.filterValues { stemOf(it) == stem }
+                val headers = volumes.keys.map { files[it].first16kb?.let(Rar5Parser::volumeNumber) }
+                val places = if (headers.all { it != null }) headers.filterNotNull() else {
+                    val described = volumes.keys.any { par2Name(it, hashes) != null } ||
+                        descriptions.any { stemOf(it.filename) == stem }
+                    if (described) return@mapNotNull null
+                    val claimed = present.mapNotNull { VolumeNames.of(files[it].yencHeaders?.name ?: names[it]!!) }
+                        .filter { stemOf(it) == stem }
+                    (volumes.values + claimed).map { VolumeNames.number(it) ?: return@mapNotNull null }
+                }
+                val absent = (0..places.max()).firstOrNull { it !in places } ?: return@mapNotNull null
+                set.first() to ArticleNotFoundException(
+                    "Archive volume ${absent + 1} of the set of '${nameOf(set.first())}' isn't in the NZB",
+                )
+            }.toMap()
 
         // The MD5 of the first 16 KB of each file fetched so far.
         private fun hashes(): Map<Int, String> =
