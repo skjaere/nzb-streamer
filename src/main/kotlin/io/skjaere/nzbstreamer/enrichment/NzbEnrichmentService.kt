@@ -120,14 +120,20 @@ class NzbEnrichmentService(
         // After enrichment, read the base PAR2 file's file descriptions (it names the files).
         // Skip .volXXX+YYY.par2 recovery volume files — they contain recovery blocks
         // and can be very large (tens of MB each), causing OOM if loaded into memory: a file
-        // counts as an index when its first 16 KB name files, read packet by packet without
-        // taking their lengths on trust, and only its descriptions are held ([readPar2]). A
-        // recovery set's smallest volume stands in for its index when that names nothing ([readStandIns]).
+        // counts as an index when it is named as one (and is PAR2), or else when its first 16 KB
+        // name files, read packet by packet without taking their lengths on trust; only its
+        // descriptions are held ([readPar2]). An index over a thousand files or more names none in
+        // its first 16 KB, its Main packet's list of them longer (NR-9). A recovery set's smallest
+        // volume stands in for its index when that names nothing ([readStandIns]).
         var standIns = emptyList<Int>()
         try {
             coroutineScope {
-                kept.filterNot(release::isRecovery).map { nzb.files[it] }
-                    .filter { file -> namesFiles(file.first16kb) }
+                kept.filterNot(release::isRecovery)
+                    .filter { i ->
+                        val first16kb = nzb.files[i].first16kb
+                        if (release.isIndex(i)) first16kb?.let(Par2Parser::isPar2) == true else namesFiles(first16kb)
+                    }
+                    .map { nzb.files[it] }
                     .map { file ->
                         async {
                             withTimedPermit { readPar2(file) }

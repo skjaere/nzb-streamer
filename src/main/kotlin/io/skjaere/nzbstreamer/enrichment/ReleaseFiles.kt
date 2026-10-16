@@ -137,6 +137,9 @@ internal class ReleaseFiles(files: List<NzbFile>) {
     /** Whether file [i] is a PAR2 recovery volume by its name. */
     fun isRecovery(i: Int): Boolean = roles[i] == Role.RECOVERY
 
+    /** Whether file [i] is a PAR2 index by its name (a .par2 file that isn't a recovery volume). */
+    fun isIndex(i: Int): Boolean = roles[i] == Role.PAR2
+
     /** The name a file is known by before it is fetched (its subject's), escaped for log lines. */
     fun nameOf(i: Int): String = names[i]?.printable() ?: "file ${i + 1}"
 

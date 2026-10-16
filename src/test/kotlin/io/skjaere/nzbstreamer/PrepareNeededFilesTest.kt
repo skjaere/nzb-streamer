@@ -867,6 +867,31 @@ class PrepareNeededFilesTest {
     }
 
     /**
+     * A PAR2 index over more than about a thousand files starts with a Main packet that lists them
+     * all, past its first 16 KB: it is read all the same, as far as prepare reads a PAR2 file, and
+     * names the volumes without a recovery volume read in its place (NR-9).
+     */
+    @ParameterizedTest
+    @ValueSource(booleans = [false, true])
+    fun `a PAR2 index whose file descriptions start past its first 16 KB names the volumes`(withRecoveryVolume: Boolean) {
+        val payload = bytes("movie", 200_000)
+        val named = volumes("Movie.2020", "Movie.2020.mkv", payload, ContainerType.RAR4)
+        named.indices.reversed().forEach { v -> post(OBFUSCATED[v], named[v].second) }
+        val described = named + (1..1_100).map { n -> "Movie.2020.Photos/Photo%04d.jpg".format(n) to bytes("photo $n", 64) }
+        val index = buildPar2File(described)
+        assertTrue(index.indexOfBytes("PAR 2.0\u0000FileDesc".toByteArray(Charsets.ISO_8859_1)) > 16 * 1024, "the index names files in its first 16 KB")
+        post("0b1c2d3e.par2", index)
+        val recovery = if (withRecoveryVolume) post("0b1c2d3e.vol00+01.par2", buildPar2File(described, recoveryBlock = 16 * 1024)) else emptyList()
+
+        withStreamer { streamer, server ->
+            val prepared = assertIs<PrepareResult.Success>(streamer.prepare(nzb()), "prepare")
+            assertEquals(named.map { it.first }, prepared.metadata.response.volumes)
+            assertContentEquals(payload, streamer.streamed(prepared))
+            assertEquals(emptyList(), recovery.filter { it in server.bodiesRead }, "the recovery volume was fetched")
+        }
+    }
+
+    /**
      * A recovery volume posted under a name that tells nothing is fetched (it may be a volume) and,
      * naming its files first, passes for an index: it too is read no further than its file
      * descriptions (N53).
