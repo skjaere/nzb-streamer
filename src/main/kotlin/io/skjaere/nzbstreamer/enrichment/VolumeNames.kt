@@ -17,16 +17,23 @@ internal object VolumeNames {
 
     /**
      * The file descriptions in the PAR2 data of [files], every PAR2 file's (a season pack can have
-     * an index per episode); none from data that doesn't parse.
+     * an index per episode), each by the name its path ends in; none from data that doesn't parse.
+     * An index made over a folder names its files with their path in it
+     * (Show.S01/Show.S01E02.part3.rar), which no name they were posted under has (NR-11).
      */
     fun descriptions(files: List<NzbFile>): List<Par2Parser.Par2FileDescription> =
         files.mapNotNull { it.par2Data }.flatMap { data ->
             try {
-                Par2Parser.parse(data).files.filter { it.filename.isNotBlank() }
+                Par2Parser.parse(data).files
+                    .map { it.copy(filename = baseName(it.filename)) }
+                    .filter { it.filename.isNotBlank() }
             } catch (@Suppress("TooGenericExceptionCaught") _: Exception) {
                 emptyList()
             }
         }
+
+    /** [path] without the folders it is in, by either separator. */
+    private fun baseName(path: String): String = path.substringAfterLast('/').substringAfterLast('\\')
 
     /**
      * The names [descriptions] give files, each by its first 16 KB and its length: none to files

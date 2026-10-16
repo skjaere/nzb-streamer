@@ -203,7 +203,10 @@ internal class ReleaseFiles(files: List<NzbFile>) {
             (kept.mapNotNull { par2Name(it, hashes) ?: names[it] } + found.values)
                 .filter(VolumeNames::isVolume).map(::stemOf).toSet()
 
-        /** The volumes the PAR2 data names of the sets [opened] that no file holds, by name or by first 16 KB and length. */
+        /**
+         * The volumes the PAR2 data names of the sets [opened] that no file holds, by name or by
+         * first 16 KB and length.
+         */
         private fun unheld(opened: Set<String>, hashes: Map<Int, String>): List<String> {
             val named = names.mapNotNull { it?.lowercase() }.toSet()
             val fetched = hashes.mapNotNull { (i, hash) -> files[i].yencHeaders?.let { hash to it.size } }.toSet()

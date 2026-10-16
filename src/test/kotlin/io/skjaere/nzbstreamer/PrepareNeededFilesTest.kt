@@ -379,14 +379,19 @@ class PrepareNeededFilesTest {
         }
     }
 
-    /** Each episode has its PAR2 index: the second's names the volume of its set posted under another extension (N52). */
-    @Test
-    fun `a season pack opens an episode whose volume is posted under another extension`() {
+    /**
+     * Each episode has its PAR2 index: the second's names the volume of its set posted under another
+     * extension (N52). An index made over the season's folder names each file with its path in it,
+     * matched by the name it ends in (NR-11).
+     */
+    @ParameterizedTest
+    @ValueSource(strings = ["", "Show.S01/", "Show.S01\\"])
+    fun `a season pack opens an episode whose volume is posted under another extension`(folder: String) {
         val episodes = (1..3).associate { e -> "Show.S01E0$e" to bytes("episode $e", 150_000) }
         episodes.forEach { (base, data) ->
             val named = volumes(base, "$base.mkv", data)
             named.forEach { (name, volume) -> post(if (name == "Show.S01E02.part2.rar") "Show.S01E02.part2.bin" else name, volume) }
-            post("$base.par2", buildPar2File(named))
+            post("$base.par2", buildPar2File(named.map { (name, volume) -> "$folder$name" to volume }))
         }
 
         withStreamer { streamer, _ ->
@@ -395,14 +400,18 @@ class PrepareNeededFilesTest {
         }
     }
 
-    /** As another episode's set that lacks a first article, one that lacks a volume its PAR2 index names is left out (N52). */
-    @Test
-    fun `a season pack leaves out an episode that lacks a volume its PAR2 index names`() {
+    /**
+     * As another episode's set that lacks a first article, one that lacks a volume its PAR2 index
+     * names is left out (N52), also where the index names it with its path in the season's folder (NR-11).
+     */
+    @ParameterizedTest
+    @ValueSource(strings = ["", "Show.S01/", "Show.S01\\"])
+    fun `a season pack leaves out an episode that lacks a volume its PAR2 index names`(folder: String) {
         val episodes = (1..3).associate { e -> "Show.S01E0$e" to bytes("episode $e", 150_000) }
         episodes.forEach { (base, data) ->
             val named = volumes(base, "$base.mkv", data)
             named.forEach { (name, volume) -> if (name != "Show.S01E02.part2.rar") post(name, volume) }
-            post("$base.par2", buildPar2File(named))
+            post("$base.par2", buildPar2File(named.map { (name, volume) -> "$folder$name" to volume }))
         }
 
         withStreamer { streamer, _ ->
