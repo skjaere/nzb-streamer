@@ -416,6 +416,33 @@ class SegmentCacheTest {
         }
     }
 
+    /**
+     * Android deletes files from an app's cache directory when storage runs low, the app running: the
+     * index went on listing them and counting their bytes, so the usage was more than the disk held
+     * (and an eviction of them freed nothing). A reconcile drops the entries whose files are gone or
+     * aren't the size listed.
+     */
+    @Test
+    fun `reconcile drops the entries whose files went from under it`(@TempDir tmp: Path) {
+        runBlocking {
+            val cache = SegmentCache(cfg(tmp))
+            val ids = (1..10).map { "purged-$it@id" }
+            ids.forEach { id -> cache.getOrFetch(id) { payloadOf(id) } }
+            // The system deletes the oldest four; another is written over.
+            ids.take(4).forEach { Files.delete(cache.pathOf(it)) }
+            cache.pathOf(ids[4]).writeBytes(ByteArray(10))
+
+            cache.reconcile()
+            assertMatchesDisk(cache, tmp)
+            assertEquals(SegmentCache.Stats(5, 5 * 256L, 1_000_000L), cache.stats())
+            ids.drop(5).forEach { id -> assertContentEquals(payloadOf(id), cache.get(id), id) }
+            val fetches = AtomicInteger()
+            assertContentEquals(payloadOf(ids[0]), cache.getOrFetch(ids[0]) { fetches.incrementAndGet(); payloadOf(ids[0]) })
+            assertEquals(1, fetches.get(), "a purged segment wasn't fetched again")
+            assertMatchesDisk(cache, tmp)
+        }
+    }
+
     @Test
     fun `resize evicts down to the new limit at once and lets the cache grow back`(@TempDir tmp: Path) {
         runBlocking {

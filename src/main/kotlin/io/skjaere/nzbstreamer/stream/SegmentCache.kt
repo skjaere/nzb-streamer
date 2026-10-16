@@ -28,6 +28,7 @@ import kotlin.concurrent.withLock
 import kotlin.io.path.createDirectories
 import kotlin.io.path.deleteIfExists
 import kotlin.io.path.exists
+import kotlin.io.path.fileSize
 import kotlin.io.path.isDirectory
 import kotlin.io.path.listDirectoryEntries
 import kotlin.io.path.moveTo
@@ -55,7 +56,8 @@ import kotlin.io.path.writeText
  * taken for a segment. Loading walks the cache directory: construct the cache off the main
  * thread. One instance per directory: two would each take the other's files for their own.
  * A file is renamed into place and deleted under the index lock, so the index lists a file
- * exactly when it is on disk, a [clear] or a [resize] with reads and writes in flight included.
+ * exactly when it is on disk, a [clear] or a [resize] with reads and writes in flight included,
+ * until something else deletes it ([reconcile]).
  *
  * The cache is best-effort: failures to read/write the disk degrade silently to a
  * passthrough to the [fetch] lambda. Bytes returned to callers are always correct
@@ -449,6 +451,26 @@ class SegmentCache(private val config: SegmentCacheConfig) : AutoCloseable {
         logger.info("Cleared the segment cache: {} segments", entries.size)
         save()
     }
+
+    /**
+     * Drops each entry whose file is gone or isn't the size listed (deleting the file), so the usage
+     * is the bytes on disk: files can go from under a running cache, as when Android deletes an app's
+     * cache files to free storage. Stats every listed file: off the main thread, before the usage
+     * decides something (how much room the cache may take, say).
+     */
+    suspend fun reconcile() {
+        val listed = indexLock.withLock { if (closed) emptyList() else index.values.toList() }
+        val dropped = withContext(Dispatchers.IO) {
+            // A write that put a segment back since is a new entry: isListed leaves it.
+            listed.filterNot(::onDisk).chunked(DELETE_BATCH).sumOf { batch ->
+                indexLock.withLock { batch.filter(::isListed).onEach(::removeLocked).size }
+            }
+        }
+        if (dropped > 0) logger.info("Dropped {} segment cache entries whose files were gone: {} bytes cached", dropped, totalBytes.get())
+    }
+
+    /** Whether [entry]'s file is on disk, the size it lists. */
+    private fun onDisk(entry: Entry): Boolean = runCatching { pathFor(entry.name).fileSize() == entry.size }.getOrDefault(false)
 
     /** Sets the limit to [maxBytes]; a cache over it evicts its least recently used entries at once. */
     suspend fun resize(maxBytes: Long) {
