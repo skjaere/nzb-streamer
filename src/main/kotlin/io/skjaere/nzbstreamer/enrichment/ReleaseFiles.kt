@@ -16,9 +16,10 @@ import kotlin.math.abs
  * A release with archive volumes is opened from them alone (prepare lists nothing else): prepare
  * fetches those, the PAR2 index (which names obfuscated volumes) and any file whose name tells
  * nothing. A release without them is streamed file by file: prepare fetches its content (videos,
- * other files, unnamed ones) and the PAR2 index. PAR2 recovery volumes are not fetched, but for the
- * smallest when the release has no index, or the one it has names nothing (each carries the index's
- * names), nor are NFOs, SFVs and the like, and samples, unless they are all the release has.
+ * other files, unnamed ones) and the PAR2 index. PAR2 recovery volumes are not fetched, but for a
+ * recovery set's smallest when it has no index, or the one it has names nothing (each carries its
+ * index's names, [standIns]), nor are NFOs, SFVs and the like, and samples, unless they are all the
+ * release has.
  *
  * A file prepare doesn't need to open the release may lack its first article: it is left out. So
  * may another episode's: a video (or other content beside videos) while one of its size is there,
@@ -46,13 +47,19 @@ internal class ReleaseFiles(files: List<NzbFile>) {
     private val sideIsContent = roles.none { it in CONTENT }
 
     /**
-     * The smallest recovery volume, which names the files in place of a PAR2 index (each carries the
-     * index's file descriptions): fetched with the rest when the release has no index, and after
-     * them when the one it has names nothing (it lacks an article).
+     * The recovery volumes that name the files in place of a PAR2 index (each carries its index's
+     * file descriptions), by recovery set: the name its volumes share but for .volNN+MM.par2, in
+     * lower case, and those volumes, smallest first (NR-5). A sample's set names only the sample:
+     * it is none beside another. The smallest of them is fetched with the rest when the release has
+     * no index, and a set's are read after them when it has none or the one it has names nothing
+     * (it lacks an article).
      */
-    val recoveryStandIn: Int? = roles.indices.filter { roles[it] == Role.RECOVERY }.minByOrNull { sizes[it] }
+    val standIns: Map<String, List<Int>> = roles.indices.filter { roles[it] == Role.RECOVERY }
+        .groupBy { names[it]!!.replace(RECOVERY_VOLUME, "").lowercase() }
+        .let { sets -> sets.filterKeys { !SAMPLE.containsMatchIn(it) }.ifEmpty { sets } }
+        .mapValues { (_, volumes) -> volumes.sortedBy { sizes[it] } }
 
-    private val indexStandIn = recoveryStandIn.takeIf { Role.PAR2 !in roles }
+    private val indexStandIn = standIns.values.map { it.first() }.minByOrNull { sizes[it] }.takeIf { Role.PAR2 !in roles }
 
     /** Archive volumes by set: the volumes of one archive share a name but for their suffix. */
     private val sets = roles.indices.filter { roles[it] == Role.ARCHIVE }.groupBy { stemOf(names[it]!!) }.values
@@ -122,6 +129,13 @@ internal class ReleaseFiles(files: List<NzbFile>) {
         val stems = broken.map { stemOf(names[it.first()]!!) }.toSet()
         return lacking + broken.flatten() + found.filterValues { stemOf(it) in stems }.keys
     }
+
+    /** The PAR2 indexes, by name, of recovery set [set] ([standIns]). */
+    fun indexesOf(set: String): List<Int> =
+        roles.indices.filter { roles[it] == Role.PAR2 && names[it]!!.replace(INDEX, "").lowercase() == set }
+
+    /** Whether file [i] is a PAR2 recovery volume by its name. */
+    fun isRecovery(i: Int): Boolean = roles[i] == Role.RECOVERY
 
     /** The name a file is known by before it is fetched (its subject's), escaped for log lines. */
     fun nameOf(i: Int): String = names[i]?.printable() ?: "file ${i + 1}"
@@ -327,6 +341,7 @@ internal class ReleaseFiles(files: List<NzbFile>) {
         val CONTENT = setOf(Role.ARCHIVE, Role.VIDEO, Role.OTHER, Role.UNKNOWN)
         val SAMPLED = setOf(Role.ARCHIVE, Role.VIDEO)
         val RECOVERY_VOLUME = Regex("""(?i)\.vol\d+[+-]\d+\.par2$""")
+        val INDEX = Regex("""(?i)\.par2$""")
         val VOLUME_SUFFIX = Regex("""(?i)(\.part\d+\.rar|\.rar|\.[rs]\d{2,3}|\.7z(\.\d{3})?)$""")
         val MODERN_RAR = Regex("""(?i)\.part(\d+)\.rar$""")
         val SPLIT_7Z = Regex("""(?i)\.7z\.(\d{3})$""")

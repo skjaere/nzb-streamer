@@ -836,6 +836,37 @@ class PrepareNeededFilesTest {
     }
 
     /**
+     * A recovery volume stands in for the PAR2 index of its own set: the smallest of those named
+     * like it, the next-smallest when that names nothing, for a set whose index names nothing or
+     * that has none. Another set's index (a sample's), which names only its own files, doesn't stand
+     * in for it, nor does another set's smaller recovery volume (NR-5).
+     */
+    @ParameterizedTest
+    @ValueSource(strings = ["its index lacking beside a sample's", "no index beside a sample's", "no index, its smallest volume lacking"])
+    fun `a recovery volume of the set's own names its volumes`(shape: String) {
+        val payload = bytes("movie", 200_000)
+        val named = volumes("Movie.2020", "Movie.2020.mkv", payload, ContainerType.RAR4)
+        named.indices.reversed().forEach { v -> post(OBFUSCATED[v], named[v].second) }
+        if (shape.startsWith("its index lacking")) missing += post("Movie.2020.par2", buildPar2File(named)).first()
+        if (shape.endsWith("beside a sample's")) {
+            val sample = listOf("Movie.2020-sample.mkv" to bytes("sample", 20_000))
+            if (shape.startsWith("its index lacking")) post("Movie.2020-sample.par2", buildPar2File(sample))
+            post("Movie.2020-sample.vol00+01.par2", buildPar2File(sample, recoveryBlock = 4 * 1024))
+        }
+        val smallest = post("Movie.2020.vol00+01.par2", buildPar2File(named, recoveryBlock = 16 * 1024))
+        if (shape.endsWith("smallest volume lacking")) {
+            missing += smallest.first()
+            post("Movie.2020.vol01+02.par2", buildPar2File(named, recoveryBlock = 32 * 1024))
+        }
+
+        withStreamer { streamer, _ ->
+            val prepared = assertIs<PrepareResult.Success>(streamer.prepare(nzb()), "prepare")
+            assertEquals(named.map { it.first }, prepared.metadata.response.volumes)
+            assertContentEquals(payload, streamer.streamed(prepared))
+        }
+    }
+
+    /**
      * A recovery volume posted under a name that tells nothing is fetched (it may be a volume) and,
      * naming its files first, passes for an index: it too is read no further than its file
      * descriptions (N53).
