@@ -14,9 +14,11 @@ import io.skjaere.nzbstreamer.enrichment.EnrichmentResult
 import io.skjaere.nzbstreamer.enrichment.NzbEnrichmentService
 import io.skjaere.nzbstreamer.enrichment.VerificationResult
 import io.skjaere.nzbstreamer.enrichment.VerificationService
+import io.skjaere.nzbstreamer.enrichment.VolumeNames
 import io.skjaere.nzbstreamer.enrichment.firstCauseOfType
 import io.skjaere.nzbstreamer.enrichment.rethrowCancellation
 import io.skjaere.nzbstreamer.nzb.NzbDocument
+import io.skjaere.nzbstreamer.nzb.NzbFile
 import io.skjaere.nzbstreamer.seekable.SegmentRandomAccessStream
 import io.skjaere.nzbstreamer.stream.NntpStreamingService
 import org.slf4j.LoggerFactory
@@ -164,6 +166,8 @@ class ArchiveMetadataService(
 
     private fun resolveVolumes(nzb: NzbDocument): ResolvedVolumes {
         val par2Data = nzb.files.firstOrNull { it.par2Data != null }?.par2Data
+        // Every PAR2 file's names, not only the first's: a season pack can have an index per episode.
+        val par2Names = VolumeNames.descriptions(nzb.files).associate { it.hash16kHex() to it.filename }
 
         val archiveFiles = nzb.files.filter { file ->
             val first16kb = file.first16kb
@@ -172,13 +176,13 @@ class ArchiveMetadataService(
 
         val volumes = archiveFiles.map { file ->
             VolumeMetaData(
-                filename = file.yencHeaders!!.name,
+                filename = volumeName(file, par2Names),
                 size = file.yencHeaders!!.size,
                 first16kb = file.first16kb
             )
         }
 
-        val obfuscated = volumes.any { !ArchiveService.fileHasKnownExtension(it.filename) }
+        val obfuscated = archiveFiles.any { !ArchiveService.fileHasKnownExtension(it.yencHeaders!!.name) }
         val orderedVolumes = ArchiveService.resolveVolumes(volumes, par2Data)
 
         val orderedArchiveFiles = orderedVolumes.map { vol ->
@@ -193,6 +197,21 @@ class ArchiveMetadataService(
             obfuscated = obfuscated,
             par2Data = par2Data
         )
+    }
+
+    /**
+     * The name [file] is ordered by among the volumes: its yEnc name when that is a volume's, else
+     * the name the PAR2 data ([par2Names], by the MD5 of the first 16 KB) gives it, else, for an
+     * archive by its content posted under another extension, its name without that extension when
+     * that places it ([VolumeNames.of], library issue N52).
+     */
+    private fun volumeName(file: NzbFile, par2Names: Map<String, String>): String {
+        val name = file.yencHeaders!!.name
+        val first16kb = file.first16kb
+        if (VolumeNames.isVolume(name) || first16kb == null) return name
+        return par2Names[VolumeNames.md5Hex(first16kb)]
+            ?: VolumeNames.of(name)?.takeIf { VolumeNames.isArchive(first16kb) }
+            ?: name
     }
 
     private suspend fun listArchiveEntries(resolved: ResolvedVolumes): ListArchiveEntriesResult {

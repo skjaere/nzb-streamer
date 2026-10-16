@@ -1,6 +1,7 @@
 package io.skjaere.nzbstreamer.enrichment
 
 import io.skjaere.compressionutils.ArchiveService
+import io.skjaere.nntp.ArticleNotFoundException
 import io.skjaere.nzbstreamer.nzb.FilenameResolver
 import io.skjaere.nzbstreamer.nzb.NzbFile
 import io.skjaere.nzbstreamer.nzb.ObfuscationHeuristic
@@ -23,6 +24,11 @@ import io.skjaere.nzbstreamer.nzb.printable
  * volume and named like a release, while another set of its size is whole. Of its size: at least
  * half as big, so a subtitle or a trailer doesn't stand in for the movie. Any other file that lacks
  * it fails the release.
+ *
+ * A volume posted under another extension than its archive's isn't one by its name (library issue
+ * N52): once those files are fetched, [Volumes] finds it among the videos and other files beside
+ * the archives ([mayHideVolume]), by the PAR2 data or by its content. A volume the PAR2 index names
+ * that the release doesn't hold leaves its set out where an episode's may be, and fails it elsewhere.
  */
 internal class ReleaseFiles(files: List<NzbFile>) {
     private enum class Role { ARCHIVE, VIDEO, PAR2, RECOVERY, SIDE, OTHER, UNKNOWN }
@@ -41,8 +47,7 @@ internal class ReleaseFiles(files: List<NzbFile>) {
         .takeIf { Role.PAR2 !in roles }
 
     /** Archive volumes by set: the volumes of one archive share a name but for their suffix. */
-    private val sets = roles.indices.filter { roles[it] == Role.ARCHIVE }
-        .groupBy { names[it]!!.replace(VOLUME_SUFFIX, "").lowercase() }.values
+    private val sets = roles.indices.filter { roles[it] == Role.ARCHIVE }.groupBy { stemOf(names[it]!!) }.values
 
     // Several sets, each from its first volume and named like a release: one per episode, which
     // open on their own. Names that don't group like that, or that look obfuscated (a8f7d6e5.rar,
@@ -53,6 +58,15 @@ internal class ReleaseFiles(files: List<NzbFile>) {
 
     /** Indices of the files whose first article prepare fetches, in order. */
     val toFetch: List<Int> = roles.indices.filter { fetched(roles[it]) || it == indexStandIn }
+
+    /**
+     * Indices of the files [toFetch] leaves that may yet be archive volumes posted under another
+     * extension: the videos and other files beside archives, but for samples. Not NFOs and the
+     * like, nor PAR2 files.
+     */
+    val mayHideVolume: List<Int> = if (!hasArchives) emptyList() else roles.indices.filter { i ->
+        (roles[i] == Role.VIDEO || roles[i] == Role.OTHER) && !isSample(names[i]!!)
+    }
 
     private fun fetched(role: Role) = when (role) {
         Role.ARCHIVE, Role.PAR2, Role.UNKNOWN -> true
@@ -90,11 +104,113 @@ internal class ReleaseFiles(files: List<NzbFile>) {
 
     private fun ofItsSize(standIn: Long, size: Long) = standIn * 2 >= size
 
-    /** The files to leave out when [lacking] lack their first article: those, and the rest of their archive sets. */
-    fun leftOut(lacking: Set<Int>): Set<Int> = lacking + sets.filter { set -> set.any { it in lacking } }.flatten()
+    /**
+     * The files to leave out when [lacking] lack their first article: those, the rest of their
+     * archive sets, and those of [found] (volumes [Volumes] found, by the name that places them) in
+     * those sets.
+     */
+    fun leftOut(lacking: Set<Int>, found: Map<Int, String> = emptyMap()): Set<Int> {
+        val broken = sets.filter { set -> set.any { it in lacking } }
+        val stems = broken.map { stemOf(names[it.first()]!!) }.toSet()
+        return lacking + broken.flatten() + found.filterValues { stemOf(it) in stems }.keys
+    }
 
     /** The name a file is known by before it is fetched (its subject's), escaped for log lines. */
     fun nameOf(i: Int): String = names[i]?.printable() ?: "file ${i + 1}"
+
+    /**
+     * The archive volumes the names don't show, once the files of [kept] (those of [toFetch] not
+     * left out) are fetched, their PAR2 data with them. The PAR2 data names each file by the MD5 of
+     * its first 16 KB. When it names a volume of a set the release opens that no file holds (by
+     * that name or those 16 KB), or doesn't name a volume the release has (there is no index, or
+     * not that set's), [toCheck] lists the files of [mayHideVolume] to fetch: one the PAR2 data
+     * names a volume is one, and, where it doesn't name them all, one that starts with an archive's
+     * signature is too.
+     */
+    inner class Volumes(private val files: List<NzbFile>, private val kept: List<Int>) {
+        private val descriptions = VolumeNames.descriptions(kept.map { files[it] })
+        private val byHash = descriptions.associate { it.hash16kHex() to it.filename }
+        private val byName = descriptions.associate { it.filename.lowercase() to it.filename }
+        private val hashed = hashes()
+
+        // A volume kept that the PAR2 data doesn't name: the content tells which of the others is one.
+        private val byContent = kept.any { i ->
+            par2Name(i, hashed)?.let(VolumeNames::isVolume) != true &&
+                (roles[i] == Role.ARCHIVE || roles[i] == Role.UNKNOWN && VolumeNames.isArchive(files[i].first16kb))
+        }
+
+        // The volumes the PAR2 data names that no file holds, before any of [toCheck] is fetched.
+        private val unheld = unheld(opened(hashed, emptyMap()), hashed)
+
+        /** Indices of the files whose first article to fetch to find the volumes the names don't show. */
+        val toCheck: List<Int> = if (byContent || unheld.isNotEmpty()) mayHideVolume else emptyList()
+
+        /**
+         * Once [toCheck] are fetched, those [unknown] (lacking their first article) left: the volumes
+         * among them, each by the name that places it in its archive (the PAR2 data's, or its own but
+         * for the extension it was posted under), and the sets that lack a volume the PAR2 data
+         * names, by one of their files with the cause. [Found.Missing] when the release can't open
+         * whole: a set that lacks a volume isn't an episode's, or a file whose content was to tell
+         * lacks its first article; [Found.Unplaced] when nothing tells where a volume goes.
+         */
+        fun found(unknown: Map<Int, ArticleNotFoundException>): Found {
+            if (byContent) unknown.minByOrNull { it.key }?.let { return Found.Missing(it.value) }
+            val hashes = hashes()
+            val held = kept.mapNotNull { par2Name(it, hashes) ?: names[it] }.map { it.lowercase() }.toMutableSet()
+            val found = mutableMapOf<Int, String>()
+            for (i in toCheck.filterNot { it in unknown }) {
+                val named = hashes[i]?.let(byHash::get)
+                val volume = when {
+                    named != null -> named.takeIf { it in unheld }
+                    byContent && VolumeNames.isArchive(files[i].first16kb) ->
+                        VolumeNames.of(files[i].yencHeaders?.name ?: names[i]!!) ?: return Found.Unplaced(nameOf(i))
+                    else -> null
+                }
+                if (volume != null && held.add(volume.lowercase())) found[i] = volume
+            }
+            val incomplete = mutableMapOf<Int, ArticleNotFoundException>()
+            for (volume in unheld(opened(hashes, found), hashes)) {
+                val cause = ArticleNotFoundException(
+                    "Archive volume '${volume.printable()}', which the PAR2 index names, isn't in the NZB " +
+                        "or lacks its first article",
+                )
+                val set = sets.firstOrNull { stemOf(names[it.first()]!!) == stemOf(volume) }
+                if (set == null || !setsApart) return Found.Missing(cause)
+                incomplete.putIfAbsent(set.first(), cause)
+            }
+            return Found.Volumes(found, incomplete)
+        }
+
+        // The MD5 of the first 16 KB of each file fetched so far.
+        private fun hashes(): Map<Int, String> =
+            files.indices.mapNotNull { i -> files[i].first16kb?.let { i to VolumeNames.md5Hex(it) } }.toMap()
+
+        /** The name the PAR2 data gives file [i]: by its first 16 KB once fetched ([hashes]), else by its own. */
+        private fun par2Name(i: Int, hashes: Map<Int, String>): String? =
+            hashes[i]?.let(byHash::get) ?: names[i]?.lowercase()?.let(byName::get)
+
+        /** The sets whose volumes the release opens: those of [kept], and of [found]. */
+        private fun opened(hashes: Map<Int, String>, found: Map<Int, String>): Set<String> =
+            (kept.mapNotNull { par2Name(it, hashes) ?: names[it] } + found.values)
+                .filter(VolumeNames::isVolume).map(::stemOf).toSet()
+
+        /** The volumes the PAR2 data names of the sets [opened] that no file holds, by name or by first 16 KB. */
+        private fun unheld(opened: Set<String>, hashes: Map<Int, String>): List<String> {
+            val named = names.mapNotNull { it?.lowercase() }.toSet()
+            val fetched = hashes.values.toSet()
+            return descriptions.filter { d ->
+                VolumeNames.isVolume(d.filename) && stemOf(d.filename) in opened &&
+                    d.filename.lowercase() !in named && d.hash16kHex() !in fetched
+            }.map { it.filename }.distinct()
+        }
+    }
+
+    /** What [Volumes.found] finds. */
+    sealed interface Found {
+        data class Volumes(val volumes: Map<Int, String>, val incomplete: Map<Int, ArticleNotFoundException>) : Found
+        data class Missing(val cause: ArticleNotFoundException) : Found
+        data class Unplaced(val name: String) : Found
+    }
 
     private companion object {
         val CONTENT = setOf(Role.ARCHIVE, Role.VIDEO, Role.OTHER, Role.UNKNOWN)
@@ -124,15 +240,19 @@ internal class ReleaseFiles(files: List<NzbFile>) {
         fun isObfuscatedSet(name: String): Boolean =
             ObfuscationHeuristic.isProbablyObfuscated(name.replace(VOLUME_SUFFIX, ".rar"))
 
+        /** The set volume [name] belongs to: its name but for the volume suffix, in lower case. */
+        fun stemOf(name: String): String = name.replace(VOLUME_SUFFIX, "").lowercase()
+
+        /** Whether [name] is a sample's ("Movie-sample.mkv", "Movie.2020-sample.part1.rar"), by its stem. */
+        fun isSample(name: String): Boolean = SAMPLE.containsMatchIn(stem(name))
+
         /**
          * Each file's role. A sample counts as one only beside a file of its kind that isn't one: a
          * release whose only video (or archive) is named like a sample is that.
          */
         private fun rolesOf(names: List<String?>): List<Role> {
             val roles = names.map(::roleOf)
-            val samples = names.indices.filter { i ->
-                roles[i] in SAMPLED && names[i]?.let(::stem)?.let(SAMPLE::containsMatchIn) == true
-            }
+            val samples = names.indices.filter { i -> roles[i] in SAMPLED && names[i]?.let(::isSample) == true }
             return roles.mapIndexed { i, role ->
                 val others = roles.indices.any { j -> roles[j] == role && j !in samples }
                 if (i in samples && others) Role.SIDE else role

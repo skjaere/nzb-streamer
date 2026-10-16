@@ -70,29 +70,23 @@ class NzbEnrichmentService(
     /**
      * Fetches the first article of each file of [nzb] that prepare needs to open the release (see
      * [ReleaseFiles]: its archive volumes, or its content when it has none, and the PAR2 index or,
-     * without one, a recovery volume), then downloads the PAR2 index. The enriched NZB holds those
-     * files, but for any left out: a file the release opens without (a PAR2 file, another episode's
-     * video or archive set) that lacks its first article, which is logged. A file it needs that
-     * lacks it is MissingArticles.
+     * without one, a recovery volume), then downloads the PAR2 index, then fetches any file that may
+     * be a volume posted under another extension and tells by the PAR2 index or its content whether
+     * it is one ([ReleaseFiles.Volumes]). The enriched NZB holds those files, the volumes found among
+     * the last too, but for any left out: a file the release opens without (a PAR2 file, another
+     * episode's video or archive set) that lacks its first article, or another episode's set that
+     * lacks a volume its PAR2 index names, which is logged. A file it needs that lacks it, or a
+     * volume its PAR2 index names that it doesn't hold, is MissingArticles; a volume posted under a
+     * name that doesn't place it, with no PAR2 index to, is Failure.
      */
     suspend fun enrich(nzb: NzbDocument): EnrichmentResult {
         val sample = Timer.start(registry)
         val release = ReleaseFiles(nzb.files)
         val lacking = ConcurrentHashMap<Int, ArticleNotFoundException>()
         try {
-            coroutineScope {
-                release.toFetch.map { i ->
-                    async {
-                        withTimedPermit {
-                            try {
-                                enrichFile(nzb.files[i])
-                            } catch (e: ArticleNotFoundException) {
-                                if (!release.mayLack(i)) throw e
-                                lacking[i] = e
-                            }
-                        }
-                    }
-                }.awaitAll()
+            fetchFirstArticles(nzb, release.toFetch) { i, e ->
+                if (!release.mayLack(i)) throw e
+                lacking[i] = e
             }
             release.needed(lacking.keys)?.let { throw lacking.getValue(it) }
         } catch (@Suppress("TooGenericExceptionCaught") e: Exception) {
@@ -100,16 +94,7 @@ class NzbEnrichmentService(
             classifyEnrichmentFailure(e, phase = "enrichment")?.let { return it }
             throw e
         }
-
-        val leftOut = release.leftOut(lacking.keys)
-        if (leftOut.isNotEmpty()) {
-            logger.warn(
-                "Leaving out {} file(s) the release opens without, as they or their archive set lack a first article: {}",
-                leftOut.size, leftOut.sorted().joinToString { release.nameOf(it) },
-            )
-        }
-        val files = release.toFetch.filterNot { it in leftOut }.map { nzb.files[it] }
-        logger.debug("Enriched {} of {} files", files.size, nzb.files.size)
+        val kept = release.leftOut(lacking.keys).let { leftOut -> release.toFetch.filterNot { it in leftOut } }
 
         // After enrichment, download the base PAR2 file (contains recovery set metadata).
         // Skip .volXXX+YYY.par2 recovery volume files — they contain recovery blocks
@@ -118,7 +103,7 @@ class NzbEnrichmentService(
         // name files: its blocks are that small.
         try {
             coroutineScope {
-                files
+                kept.map { nzb.files[it] }
                     .filter { file ->
                         val first16kb = file.first16kb ?: return@filter false
                         Par2Parser.isPar2(first16kb) && Par2Parser.hasFileDescriptions(first16kb)
@@ -135,9 +120,70 @@ class NzbEnrichmentService(
             throw e
         }
 
+        // Then the volumes posted under another extension (library issue N52), which the PAR2 index
+        // names or their content shows to be: a file that may be one is fetched only when the index
+        // names a volume no file holds, or doesn't name every volume the release has.
+        val volumes = release.Volumes(nzb.files, kept)
+        val found = try {
+            val unknown = ConcurrentHashMap<Int, ArticleNotFoundException>()
+            fetchFirstArticles(nzb, volumes.toCheck) { i, e -> unknown[i] = e }
+            val result = when (val outcome = volumes.found(unknown)) {
+                is ReleaseFiles.Found.Missing -> throw outcome.cause
+                is ReleaseFiles.Found.Unplaced -> {
+                    val message = "Archive volume '${outcome.name}' was posted under a name that doesn't give its " +
+                        "place in its archive, and no PAR2 index names it"
+                    logger.warn(message)
+                    return EnrichmentResult.Failure(message, IllegalStateException(message))
+                }
+                is ReleaseFiles.Found.Volumes -> outcome
+            }
+            lacking += result.incomplete
+            release.needed(lacking.keys)?.let { throw lacking.getValue(it) }
+            result.volumes
+        } catch (@Suppress("TooGenericExceptionCaught") e: Exception) {
+            rethrowCancellation(e)
+            classifyEnrichmentFailure(e, phase = "volume check")?.let { return it }
+            throw e
+        }
+
+        val leftOut = release.leftOut(lacking.keys, found)
+        if (leftOut.isNotEmpty()) {
+            logger.warn(
+                "Leaving out {} file(s) the release opens without, as they or their archive set lack a first article " +
+                    "or a volume: {}",
+                leftOut.size, leftOut.sorted().joinToString { release.nameOf(it) },
+            )
+        }
+        val files = (release.toFetch + found.keys).sorted().filterNot { it in leftOut }.map { nzb.files[it] }
+        logger.debug("Enriched {} of {} files", files.size, nzb.files.size)
+
         sample.stop(enrichmentTimer)
-        enrichmentFiles.increment(release.toFetch.size.toDouble())
+        enrichmentFiles.increment((release.toFetch.size + volumes.toCheck.size).toDouble())
         return EnrichmentResult.Success(NzbDocument(files, nzb.password))
+    }
+
+    /**
+     * Fetches the first article of each file of [nzb] at [indices], at most enrichmentConcurrency at a
+     * time. One that lacks it goes to [lacks], which may throw to fail them all.
+     */
+    private suspend fun fetchFirstArticles(
+        nzb: NzbDocument,
+        indices: List<Int>,
+        lacks: (Int, ArticleNotFoundException) -> Unit,
+    ) {
+        coroutineScope {
+            indices.map { i ->
+                async {
+                    withTimedPermit {
+                        try {
+                            enrichFile(nzb.files[i])
+                        } catch (e: ArticleNotFoundException) {
+                            lacks(i, e)
+                        }
+                    }
+                }
+            }.awaitAll()
+        }
     }
 
     /**
