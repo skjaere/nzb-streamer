@@ -273,12 +273,22 @@ class NzbEnrichmentService(
         return null
     }
 
-    /** Fetches [file]'s first article into its yencHeaders and first16kb; the article, decoded. */
+    /**
+     * Fetches [file]'s first article into its yencHeaders and first16kb; the article, decoded. It
+     * goes through the segment cache, its headers kept beside it, so a release prepared again (a
+     * replay, a resume) fetches it no more, and streaming finds it there.
+     */
     private suspend fun enrichFile(file: NzbFile): ByteArray? {
-        val firstSegment = file.segments.first()
+        val articleId = file.segments.first().articleId
+        streamingService.cachedArticle(articleId)?.let { (headers, article) ->
+            file.yencHeaders = headers
+            file.first16kb = article.copyOf(min(16384, article.size))
+            logger.debug("Enriched file from the segment cache: {}", headers.name)
+            return article
+        }
         var article: ByteArray? = null
         streamingService.withClient(NntpPriority.PREPARE) { client ->
-            client.bodyYenc("<${firstSegment.articleId}>").collect { event ->
+            client.bodyYenc("<$articleId>").collect { event ->
                 when (event) {
                     is YencEvent.Headers -> file.yencHeaders = event.yencHeaders
                     is YencEvent.Body -> {
@@ -289,6 +299,8 @@ class NzbEnrichmentService(
                 }
             }
         }
+        val headers = file.yencHeaders
+        article?.let { if (headers != null) streamingService.cacheArticle(articleId, headers, it) }
         logger.debug("Enriched file: {}", file.yencHeaders?.name)
         return article
     }

@@ -21,6 +21,7 @@ import io.skjaere.nntp.NntpClientPool
 import io.skjaere.nntp.NntpException
 import io.skjaere.nntp.StatResult
 import io.skjaere.nntp.YencEvent
+import io.skjaere.nntp.YencHeaders
 import io.skjaere.nzbstreamer.config.NntpConfig
 import io.skjaere.nzbstreamer.config.StreamingConfig
 import io.skjaere.nzbstreamer.nzb.printable
@@ -28,6 +29,8 @@ import io.skjaere.nzbstreamer.queue.SegmentQueueItem
 import java.io.IOException
 import java.time.Duration
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.serialization.Serializable
+import kotlinx.serialization.json.Json
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
@@ -71,6 +74,29 @@ private const val STAT_CHUNK_MIN = 32
 /** A STAT answer that settles an article on a pool: a 223, or a 430. Any other is the pool failing. */
 private val StatResult.settles: Boolean
     get() = this is StatResult.Found || (this is StatResult.NotFound && code == 430)
+
+/** An article's yEnc headers as the segment cache keeps them, beside its bytes ([NntpStreamingService.cacheArticle]). */
+@Serializable
+private data class CachedYencHeaders(
+    val line: Int,
+    val size: Long,
+    val name: String,
+    val part: Int? = null,
+    val total: Int? = null,
+    val partBegin: Long? = null,
+    val partEnd: Long? = null,
+) {
+    constructor(headers: YencHeaders) :
+        this(headers.line, headers.size, headers.name, headers.part, headers.total, headers.partBegin, headers.partEnd)
+
+    fun toYencHeaders() = YencHeaders(line, size, name, part, total, partBegin, partEnd)
+}
+
+/**
+ * The segment cache's key for [articleId]'s yEnc headers: no article's own, as an article id never
+ * holds a NUL (an NZB is XML, which can't).
+ */
+private fun headersKey(articleId: String) = "$articleId\u0000yenc-headers"
 
 /** [close] closes [segmentCache] unless [closeSegmentCache] is false (a cache the caller keeps). */
 class NntpStreamingService(
@@ -1264,6 +1290,29 @@ class NntpStreamingService(
      *   fetch timeout), even if the others said 430: the one that timed out may have it.
      */
     suspend fun fetchSegment(articleId: String): ByteArray = downloadSegment(articleId)
+
+    /**
+     * An article's yEnc headers and decoded bytes from the segment cache, put there by
+     * [cacheArticle]; null without a cache, or if either isn't in it.
+     */
+    suspend fun cachedArticle(articleId: String): Pair<YencHeaders, ByteArray>? {
+        val cache = segmentCache ?: return null
+        val headers = cache.get(headersKey(articleId))
+            ?.let { bytes -> runCatching { Json.decodeFromString<CachedYencHeaders>(bytes.decodeToString()) }.getOrNull() }
+            ?: return null
+        return cache.get(articleId)?.let { headers.toYencHeaders() to it }
+    }
+
+    /**
+     * Puts an article fetched with its yEnc headers (prepare reads a file's name and size from its
+     * first article's) in the segment cache, if there is one: its bytes as streaming's are, and its
+     * headers beside them, so a release prepared again (a replay, a resume) fetches it no more.
+     */
+    suspend fun cacheArticle(articleId: String, headers: YencHeaders, article: ByteArray) {
+        val cache = segmentCache ?: return
+        cache.getOrFetch(articleId) { article }
+        cache.getOrFetch(headersKey(articleId)) { Json.encodeToString(CachedYencHeaders(headers)).encodeToByteArray() }
+    }
 
     private suspend fun downloadSegment(articleId: String): ByteArray {
         if (segmentCache != null) {
