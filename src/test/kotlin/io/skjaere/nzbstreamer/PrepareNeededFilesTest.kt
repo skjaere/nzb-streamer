@@ -456,6 +456,27 @@ class PrepareNeededFilesTest {
     }
 
     /**
+     * Volumes obfuscated one by one under names that keep their extension (a8f7d6e5.rar, each a
+     * first volume's name) are placed by the names the PAR2 index gives them, in whatever order the
+     * NZB lists them, and so is one found posted under another extension (NR-1).
+     */
+    @ParameterizedTest
+    @CsvSource("true, false", "true, true", "false, true")
+    fun `volumes obfuscated one by one under their extension open in the order the PAR2 index gives`(reversed: Boolean, hidden: Boolean) {
+        val payload = bytes("movie", 200_000)
+        val named = volumes("Movie.2020", "Movie.2020.mkv", payload)
+        val order = if (reversed) named.indices.reversed() else named.indices
+        order.forEach { v -> post(if (hidden && v == 1) "x7f3k9q2.avi" else "${OBFUSCATED[v]}.rar", named[v].second) }
+        post("0b1c2d3e.par2", buildPar2File(named))
+
+        withStreamer { streamer, _ ->
+            val prepared = assertIs<PrepareResult.Success>(streamer.prepare(nzb()), "prepare")
+            assertEquals(named.map { it.first }, prepared.metadata.response.volumes)
+            assertContentEquals(payload, streamer.streamed(prepared))
+        }
+    }
+
+    /**
      * A recovery volume's file descriptions often follow its recovery block, past its first 16 KB:
      * it is read as it streams, its block skipped, until they are (library issue N53).
      */

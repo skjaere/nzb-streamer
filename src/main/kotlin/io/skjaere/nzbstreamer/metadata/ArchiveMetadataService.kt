@@ -201,18 +201,22 @@ class ArchiveMetadataService(
     }
 
     /**
-     * The name [file] is ordered by among the volumes: its yEnc name when that is a volume's, else
-     * the name the PAR2 data ([par2Names], by the first 16 KB and the length) gives it, else, for an
-     * archive by its content posted under another extension, its name without that extension when
-     * that places it ([VolumeNames.of], library issue N52).
+     * The name [file] is ordered by among the volumes: the name the PAR2 data ([par2Names], by the
+     * first 16 KB and the length) gives it, when that is a volume's or its yEnc name isn't one; else
+     * its yEnc name when that is a volume's, else, for an archive by its content posted under
+     * another extension, its name without that extension when that places it ([VolumeNames.of],
+     * library issue N52). A volume obfuscated by itself keeps its extension (a8f7d6e5.rar, a first
+     * volume's name, as each of its set's is), so only the PAR2 data places it (NR-1).
      */
     private fun volumeName(file: NzbFile, par2Names: Par2FileNames): String {
         val name = file.yencHeaders!!.name
-        val first16kb = file.first16kb
-        if (VolumeNames.isVolume(name) || first16kb == null) return name
-        return par2Names.nameOf(first16kb, file.yencHeaders!!.size)
-            ?: VolumeNames.of(name)?.takeIf { VolumeNames.isArchive(first16kb) }
-            ?: name
+        val first16kb = file.first16kb ?: return name
+        val described = par2Names.nameOf(first16kb, file.yencHeaders!!.size)
+        return when {
+            described != null && (VolumeNames.isVolume(described) || !VolumeNames.isVolume(name)) -> described
+            VolumeNames.isVolume(name) -> name
+            else -> VolumeNames.of(name)?.takeIf { VolumeNames.isArchive(first16kb) } ?: name
+        }
     }
 
     private suspend fun listArchiveEntries(resolved: ResolvedVolumes): ListArchiveEntriesResult {
