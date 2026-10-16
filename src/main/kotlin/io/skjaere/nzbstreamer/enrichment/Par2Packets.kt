@@ -28,8 +28,8 @@ internal class Par2Packets {
     var bytesRead = 0L
         private set
 
-    // The descriptions read cover every file the Main packet lists.
-    private val complete: Boolean get() = kept.size() > 0 && listed?.let(described::containsAll) == true
+    /** Whether the descriptions read so far cover every file the Main packet lists: none more is needed. */
+    val complete: Boolean get() = kept.size() > 0 && listed?.let(described::containsAll) == true
 
     /** Where a [read] stopped. */
     sealed interface Stop {

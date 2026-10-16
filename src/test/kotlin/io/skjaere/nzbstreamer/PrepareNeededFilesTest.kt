@@ -964,7 +964,8 @@ class PrepareNeededFilesTest {
 
     /**
      * The recovery volume standing in for the PAR2 index is read from past its block, so an article
-     * of the block that no provider has doesn't keep it from naming the volumes (NR-7).
+     * of the block that no provider has, or whose answer the connection drops in, doesn't keep it
+     * from naming the volumes, nor fails prepare (NR-7).
      */
     @Test
     fun `a recovery volume's block isn't fetched, so an article of it no provider has doesn't lose its names`() {
@@ -973,6 +974,7 @@ class PrepareNeededFilesTest {
         named.indices.reversed().forEach { v -> post(OBFUSCATED[v], named[v].second) }
         val ids = post("0b1c2d3e.vol00+01.par2", buildPar2File(named, recoveryBlock = 1024 * 1024))
         missing += ids[5]
+        dropped += ids[6]
 
         withStreamer { streamer, server ->
             val prepared = assertIs<PrepareResult.Success>(streamer.prepare(nzb()), "prepare")
@@ -983,16 +985,16 @@ class PrepareNeededFilesTest {
     }
 
     /**
-     * A recovery volume read in place of the PAR2 index only names files: one whose read fails any
-     * way (here the connection drops in an article of it every time, the one with its descriptions,
-     * or its first when it is fetched because the index lacks its own) names nothing, and the
-     * release opens as it would without it, here in the order its RAR5 headers give (NR-7).
+     * A recovery volume read in place of the PAR2 index is read as the index is: one that lacks an
+     * article names nothing (and the next-smallest is read), but one whose read fails any other way
+     * (here the connection drops every time in the article with its descriptions, or in its first,
+     * fetched because the index lacks its own) fails prepare, which may be tried again, rather than
+     * open the volumes its names were to order in the order the NZB lists them (NR-7).
      */
     @ParameterizedTest
     @ValueSource(booleans = [false, true])
-    fun `a recovery volume whose read fails names nothing and fails nothing`(indexLacking: Boolean) {
-        val payload = bytes("movie", 200_000)
-        val named = volumes("Movie.2020", "Movie.2020.mkv", payload)
+    fun `a recovery volume whose read fails but for a missing article fails prepare`(indexLacking: Boolean) {
+        val named = volumes("Movie.2020", "Movie.2020.mkv", bytes("movie", 200_000), ContainerType.RAR4)
         named.indices.reversed().forEach { v -> post(OBFUSCATED[v], named[v].second) }
         if (indexLacking) missing += post("0b1c2d3e.par2", buildPar2File(named)).first()
         val ids = post("0b1c2d3e.vol00+01.par2", buildPar2File(named, recoveryBlock = 64 * 1024))
@@ -1001,8 +1003,64 @@ class PrepareNeededFilesTest {
 
         withStreamer { streamer, server ->
             val result = streamer.prepare(nzb())
-            assertContentEquals(payload, streamer.streamed(assertIs<PrepareResult.Success>(result, "prepare: $result")))
+            assertIs<PrepareResult.Failure>(result, "prepare: $result")
             assertTrue(failing in server.bodiesRead, "the recovery volume wasn't read")
+        }
+    }
+
+    /**
+     * A PAR2 file whose yEnc headers give it more bytes than its articles hold is read to where they
+     * end, and no further: a read that gets nothing past where it starts isn't made again (NR-7).
+     */
+    @Test
+    fun `a PAR2 index that holds fewer bytes than its size claims isn't read again and again`() {
+        val payload = bytes("movie", 200_000)
+        val named = volumes("Movie.2020", "Movie.2020.mkv", payload, ContainerType.RAR4)
+        named.indices.reversed().forEach { v -> post(OBFUSCATED[v], named[v].second) }
+        val index = buildPar2File(named)
+        val partSize = 256
+        val claimed = (index.size + partSize - 1) / partSize * partSize
+        assertTrue(claimed > index.size, "the index fills its last part")
+        val ids = post("0b1c2d3e.par2", index, partSize = partSize)
+        ids.forEach { id ->
+            articles[id] = String(articles.getValue(id), Charsets.ISO_8859_1)
+                .replaceFirst(" size=${index.size} name=", " size=$claimed name=").toByteArray(Charsets.ISO_8859_1)
+        }
+
+        withStreamer { streamer, server ->
+            val result = streamer.prepare(nzb())
+            val prepared = assertIs<PrepareResult.Success>(result, "prepare: $result")
+            assertEquals(named.map { it.first }, prepared.metadata.response.volumes)
+            assertContentEquals(payload, streamer.streamed(prepared))
+            val reads = server.bodiesRead.count { it == ids.last() }
+            assertTrue(reads <= 2, "the index's last article was fetched $reads times")
+        }
+    }
+
+    /**
+     * An index's file descriptions that cover every file its Main packet lists are kept whatever
+     * fails past them: here an article of its slices' checksums, which follow them, that no provider
+     * has, or whose answer the connection drops in (NR-7, as NR-15 for a recovery volume).
+     */
+    @ParameterizedTest
+    @ValueSource(booleans = [false, true])
+    fun `a PAR2 index's complete descriptions are kept whatever fails past them`(drops: Boolean) {
+        val payload = bytes("movie", 200_000)
+        val named = volumes("Movie.2020", "Movie.2020.mkv", payload, ContainerType.RAR4)
+        named.indices.reversed().forEach { v -> post(OBFUSCATED[v], named[v].second) }
+        val index = buildPar2File(named)
+        val partSize = 256
+        val checksums = index.indexOfBytes("PAR 2.0\u0000IFSC".toByteArray(Charsets.ISO_8859_1)) - 48
+        val past = checksums / partSize + 1
+        val ids = post("0b1c2d3e.par2", index, partSize = partSize)
+        assertTrue(past in 1 until ids.size, "the descriptions end in article $past of ${ids.size}")
+        if (drops) dropped += ids[past] else missing += ids[past]
+
+        withStreamer { streamer, _ ->
+            val result = streamer.prepare(nzb())
+            val prepared = assertIs<PrepareResult.Success>(result, "prepare: $result")
+            assertEquals(named.map { it.first }, prepared.metadata.response.volumes)
+            assertContentEquals(payload, streamer.streamed(prepared))
         }
     }
 
