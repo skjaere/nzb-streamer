@@ -4,10 +4,14 @@ import io.micrometer.core.instrument.Metrics
 import io.skjaere.nzbstreamer.config.SegmentCacheConfig
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.awaitCancellation
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
@@ -363,7 +367,8 @@ class SegmentCache(private val config: SegmentCacheConfig) : AutoCloseable {
      * rarely, one redundant NNTP fetch, both correctness-preserving.
      *
      * A leader's failure is its followers' too, but not its cancellation: a follower whose
-     * leader is cancelled fetches for itself (or follows the next leader).
+     * leader is cancelled fetches for itself (or follows the next leader), at once, not once the
+     * leader's fetch returns ([lead]).
      */
     suspend fun getOrFetch(articleId: String, fetch: suspend () -> ByteArray): ByteArray {
         get(articleId)?.let { return it }
@@ -379,24 +384,42 @@ class SegmentCache(private val config: SegmentCacheConfig) : AutoCloseable {
         }
 
         return try {
-            // Leader-side recheck: a previous leader may have finished and removed
-            // itself between our fast-path `get` and our `putIfAbsent`. Outside any
-            // lock — other articles' fetches are unaffected by this disk read.
-            val fromDisk = get(articleId)
-            val bytes = if (fromDisk != null) {
-                fromDisk
-            } else {
-                val fetched = fetch()
-                store(articleId, fetched)
-                fetched
+            lead(ourDeferred) {
+                // Leader-side recheck: a previous leader may have finished and removed
+                // itself between our fast-path `get` and our `putIfAbsent`. Outside any
+                // lock — other articles' fetches are unaffected by this disk read.
+                get(articleId) ?: fetch().also { store(articleId, it) }
             }
-            ourDeferred.complete(bytes)
-            bytes
         } catch (t: Throwable) {
             ourDeferred.completeExceptionally(t)
             throw t
         } finally {
             inFlight.remove(articleId, ourDeferred)
+        }
+    }
+
+    /**
+     * Runs [fetch] for the followers waiting on [deferred], completing it with what [fetch] returns
+     * or throws, and cancelling it as soon as the caller is cancelled: a fetch cancelled can take
+     * seconds to return (an NNTP pool drains the connection it cancelled first, for up to 3 s in
+     * ktor-nntp-client), and a follower, a stream a player's seek opened say, would wait as long.
+     */
+    private suspend fun lead(deferred: CompletableDeferred<ByteArray>, fetch: suspend () -> ByteArray): ByteArray = coroutineScope {
+        // Cancelled with the caller; once [deferred] is complete, its cancel does nothing.
+        val onCancel = launch(start = CoroutineStart.UNDISPATCHED) {
+            try {
+                awaitCancellation()
+            } finally {
+                deferred.cancel()
+            }
+        }
+        try {
+            fetch().also { deferred.complete(it) }
+        } catch (t: Throwable) {
+            deferred.completeExceptionally(t)
+            throw t
+        } finally {
+            onCancel.cancel()
         }
     }
 

@@ -5,6 +5,7 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.async
 import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.awaitAll
@@ -15,10 +16,13 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.joinAll
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.yield
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.io.TempDir
+import java.io.IOException
 import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.attribute.FileTime
@@ -118,6 +122,76 @@ class SegmentCacheTest {
             .getOrElse { fail("the follower failed with its leader's cancellation: $it") }
         assertContentEquals(payload, got)
         assertEquals(1, followerFetches.get())
+    }
+
+    /**
+     * A leader's fetch, cancelled, can take seconds to return: a fetch from an NNTP pool returns once
+     * the pool has drained the connection it cancelled (ktor-nntp-client gives that up to 3 s). Its
+     * followers are let go at once, the one that asked before the cancellation and the one after (the
+     * stream a player's seek opens, say), and fetch for themselves, not once the leader's fetch returns.
+     */
+    @Test
+    fun `followers are let go as soon as their leader is cancelled, not once its fetch returns`(@TempDir tmp: Path) {
+        runBlocking<Unit> {
+            val cache = SegmentCache(cfg(tmp))
+            val payload = ByteArray(1024) { it.toByte() }
+            val unwound = CompletableDeferred<Unit>()
+            // Undispatched, each runs until it waits: the leader in its fetch, the followers on the leader.
+            val leader = launch(start = CoroutineStart.UNDISPATCHED) {
+                cache.getOrFetch("s@id") {
+                    try {
+                        awaitCancellation()
+                    } finally {
+                        withContext(NonCancellable) { unwound.await() }
+                    }
+                }
+            }
+            val fetches = AtomicInteger()
+            val fetch: suspend () -> ByteArray = {
+                fetches.incrementAndGet()
+                payload
+            }
+            val before = async(start = CoroutineStart.UNDISPATCHED) { cache.getOrFetch("s@id", fetch) }
+            leader.cancel()
+            val after = async(start = CoroutineStart.UNDISPATCHED) { cache.getOrFetch("s@id", fetch) }
+            try {
+                val got = withTimeoutOrNull(1_000) { listOf(before, after).awaitAll() }
+                assertNotNull(got, "the followers still waited 1 s after their leader was cancelled, for its fetch to return")
+                got.forEach { assertContentEquals(payload, it) }
+                assertEquals(1, fetches.get(), "fetched again once, for both")
+            } finally {
+                unwound.complete(Unit)
+            }
+            leader.join()
+            assertContentEquals(payload, cache.get("s@id"))
+        }
+    }
+
+    /** A leader's failure (an article no provider has) is its followers' too: none fetches it again. */
+    @Test
+    fun `a leader's failure is its followers' too`(@TempDir tmp: Path) {
+        runBlocking<Unit> {
+            val cache = SegmentCache(cfg(tmp))
+            val answered = CompletableDeferred<Unit>()
+            val leader = async(start = CoroutineStart.UNDISPATCHED) {
+                runCatching {
+                    cache.getOrFetch("m@id") {
+                        answered.await()
+                        throw IOException("430 no such article")
+                    }
+                }
+            }
+            val followerFetches = AtomicInteger()
+            val follower = async(start = CoroutineStart.UNDISPATCHED) {
+                runCatching { cache.getOrFetch("m@id") { followerFetches.incrementAndGet(); ByteArray(1) } }
+            }
+            answered.complete(Unit)
+
+            assertEquals("430 no such article", leader.await().exceptionOrNull()?.message)
+            assertEquals("430 no such article", follower.await().exceptionOrNull()?.message)
+            assertEquals(0, followerFetches.get())
+            assertNull(cache.get("m@id"))
+        }
     }
 
     /**
