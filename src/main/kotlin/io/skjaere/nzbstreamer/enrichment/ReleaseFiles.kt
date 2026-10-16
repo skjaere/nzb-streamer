@@ -204,7 +204,7 @@ internal class ReleaseFiles(files: List<NzbFile>) {
          */
         fun found(unknown: Map<Int, ArticleNotFoundException>): Found {
             val hashes = hashes()
-            val incomplete = mutableMapOf<Int, ArticleNotFoundException>()
+            val incomplete = mutableMapOf<Int, Exception>()
             if (byContent) {
                 val setSizes = volumeSizes(hashes)
                 for ((i, cause) in unknown.toSortedMap().filterKeys { mayBeVolume(it, setSizes) }) {
@@ -230,10 +230,15 @@ internal class ReleaseFiles(files: List<NzbFile>) {
                 if (volume != null && held.add(volume.lowercase())) found[i] = volume
             }
             for (volume in unheld(opened(hashes, found), hashes)) {
-                val cause = ArticleNotFoundException(
-                    "Archive volume '${volume.printable()}', which the PAR2 index names, isn't in the NZB " +
-                        "or lacks its first article",
-                )
+                // With no file that may be it lacking its first article, no provider can supply it (NR-18).
+                val cause = if (unknown.isEmpty()) {
+                    ArchiveVolumeNotInNzbException("Archive volume '${volume.printable()}', which the PAR2 index names, isn't in the NZB")
+                } else {
+                    ArticleNotFoundException(
+                        "Archive volume '${volume.printable()}', which the PAR2 index names, isn't in the NZB " +
+                            "or lacks its first article",
+                    )
+                }
                 val set = sets.firstOrNull { stemOf(names[it.first()]!!) == stemOf(volume) }
                 if (set == null || !setsApart) return Found.Missing(cause)
                 incomplete.putIfAbsent(set.first(), cause)
@@ -296,7 +301,7 @@ internal class ReleaseFiles(files: List<NzbFile>) {
             hashes: Map<Int, String>,
             found: Map<Int, String>,
             present: List<Int>,
-        ): Map<Int, ArticleNotFoundException> = sets
+        ): Map<Int, ArchiveVolumeNotInNzbException> = sets
             .filter { set -> set.all { it in kept } && !isObfuscatedSet(names[set.first()]!!) }
             .mapNotNull { set ->
                 val stem = stemOf(names[set.first()]!!)
@@ -311,7 +316,7 @@ internal class ReleaseFiles(files: List<NzbFile>) {
                     (volumes.values + claimed).map { VolumeNames.number(it) ?: return@mapNotNull null }
                 }
                 val absent = (0..places.max()).firstOrNull { it !in places } ?: return@mapNotNull null
-                set.first() to ArticleNotFoundException(
+                set.first() to ArchiveVolumeNotInNzbException(
                     "Archive volume ${absent + 1} of the set of '${nameOf(set.first())}' isn't in the NZB",
                 )
             }.toMap()
@@ -349,8 +354,13 @@ internal class ReleaseFiles(files: List<NzbFile>) {
 
     /** What [Volumes.found] finds. */
     sealed interface Found {
-        data class Volumes(val volumes: Map<Int, String>, val incomplete: Map<Int, ArticleNotFoundException>) : Found
-        data class Missing(val cause: ArticleNotFoundException) : Found
+        data class Volumes(val volumes: Map<Int, String>, val incomplete: Map<Int, Exception>) : Found
+
+        /**
+         * The release can't open whole: [cause] is an [ArticleNotFoundException], or an
+         * [ArchiveVolumeNotInNzbException] where no provider can supply what it lacks (NR-18).
+         */
+        data class Missing(val cause: Exception) : Found
         data class Unplaced(val name: String) : Found
     }
 

@@ -4,6 +4,9 @@ import io.ktor.utils.io.toByteArray
 import io.skjaere.compressionutils.generation.ArchiveGenerator
 import io.skjaere.compressionutils.generation.ContainerType
 import io.skjaere.nzbstreamer.config.NntpConfig
+import io.skjaere.nzbstreamer.enrichment.ArchiveVolumeNotInNzbException
+import io.skjaere.nzbstreamer.enrichment.UnplacedArchiveVolumeException
+import io.skjaere.nzbstreamer.enrichment.firstCauseOfType
 import io.skjaere.nzbstreamer.metadata.PrepareResult
 import io.skjaere.yenc.YencEncoder
 import kotlinx.coroutines.runBlocking
@@ -356,7 +359,10 @@ class PrepareNeededFilesTest {
         }
     }
 
-    /** Without a PAR2 index nothing tells where such a volume goes: the release isn't opened in a guessed order (N52). */
+    /**
+     * Without a PAR2 index nothing tells where such a volume goes: the release isn't opened in a
+     * guessed order (N52). It is broken as posted, which its cause's type says (NR-18).
+     */
     @Test
     fun `a volume posted under a name that doesn't give its place fails a release without a PAR2 index`() {
         volumes("Movie.2020", "Movie.2020.mkv", bytes("movie", 200_000))
@@ -365,6 +371,7 @@ class PrepareNeededFilesTest {
         withStreamer { streamer, _ ->
             val result = assertIs<PrepareResult.Failure>(streamer.prepare(nzb()), "prepare")
             assertTrue("x7f3k9q2.avi" in result.message, result.message)
+            assertEquals("x7f3k9q2.avi", assertIs<UnplacedArchiveVolumeException>(result.cause).volume)
         }
     }
 
@@ -385,7 +392,8 @@ class PrepareNeededFilesTest {
 
     /**
      * A volume the PAR2 index names that the release doesn't hold, or holds under a name prepare
-     * doesn't fetch (an NFO's): the archive can't open whole (N52).
+     * doesn't fetch (an NFO's): the archive can't open whole (N52). No provider can supply it, which
+     * its cause's type says (NR-18).
      */
     @ParameterizedTest
     @ValueSource(strings = ["", "Movie.2020.part2.nfo"])
@@ -399,10 +407,12 @@ class PrepareNeededFilesTest {
         withStreamer { streamer, server ->
             val result = assertIs<PrepareResult.MissingArticles>(streamer.prepare(nzb()), "prepare")
             assertTrue("Movie.2020.part2.rar" in result.message, result.message)
+            assertIs<ArchiveVolumeNotInNzbException>(result.cause)
             assertTrue(server.bodiesRead.none { "nfo" in it }, "an NFO was fetched")
         }
     }
 
+    /** A provider may have its first article: it isn't a volume the NZB doesn't hold (NR-18). */
     @ParameterizedTest
     @ValueSource(booleans = [true, false])
     fun `a volume posted under another extension that lacks its first article fails the release`(withIndex: Boolean) {
@@ -411,7 +421,8 @@ class PrepareNeededFilesTest {
         if (withIndex) post("Movie.2020.par2", buildPar2File(named))
 
         withStreamer { streamer, _ ->
-            assertIs<PrepareResult.MissingArticles>(streamer.prepare(nzb()), "prepare")
+            val result = assertIs<PrepareResult.MissingArticles>(streamer.prepare(nzb()), "prepare")
+            assertEquals(null, result.cause.firstCauseOfType<ArchiveVolumeNotInNzbException>(), "${result.cause}")
         }
     }
 
@@ -608,7 +619,8 @@ class PrepareNeededFilesTest {
     /**
      * Without PAR2 data to name its volumes, a set ordered by its names (or by its RAR5 headers)
      * whose volumes skip one, or don't start at its first, lacks one the NZB doesn't hold: the
-     * release doesn't open without it (NR-13). A missing last volume can't be seen this way.
+     * release doesn't open without it (NR-13). A missing last volume can't be seen this way. The
+     * cause's type says no provider can supply it (NR-18).
      */
     @ParameterizedTest
     @CsvSource("RAR4, 2", "RAR4, 0", "SEVENZIP, 1", "SEVENZIP, 0", "RAR5, 1", "RAR5, 0")
@@ -621,6 +633,7 @@ class PrepareNeededFilesTest {
         withStreamer { streamer, _ ->
             val result = assertIs<PrepareResult.MissingArticles>(streamer.prepare(nzb()), "prepare")
             assertTrue("volume ${absent + 1}" in result.message, result.message)
+            assertIs<ArchiveVolumeNotInNzbException>(result.cause)
         }
     }
 

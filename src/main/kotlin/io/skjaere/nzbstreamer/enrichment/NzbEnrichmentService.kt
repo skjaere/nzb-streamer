@@ -98,13 +98,16 @@ class NzbEnrichmentService(
      * the last too, but for any left out: a file the release opens without (a PAR2 file, another
      * episode's video or archive set) that lacks its first article, or another episode's set that
      * lacks a volume its PAR2 index names, which is logged. A file it needs that lacks it, or a
-     * volume its PAR2 index names that it doesn't hold, is MissingArticles; a volume posted under a
-     * name that doesn't place it, with no PAR2 index to, is Failure.
+     * volume its PAR2 index names that it doesn't hold, is MissingArticles, the latter's cause an
+     * [ArchiveVolumeNotInNzbException] where no provider can supply it; a volume posted under a name
+     * that doesn't place it, with no PAR2 index to, is Failure, its cause an
+     * [UnplacedArchiveVolumeException] (NR-18).
      */
     suspend fun enrich(nzb: NzbDocument): EnrichmentResult {
         val sample = Timer.start(registry)
         val release = ReleaseFiles(nzb.files)
-        val lacking = ConcurrentHashMap<Int, ArticleNotFoundException>()
+        // Files that lack their first article, and sets that lack a volume, with the cause.
+        val lacking = ConcurrentHashMap<Int, Exception>()
         // The first articles, whole, of the PAR2 files by name, which their reads start from (NR-10).
         val heads = ConcurrentHashMap<Int, ByteArray>()
         try {
@@ -164,7 +167,7 @@ class NzbEnrichmentService(
                     val message = "Archive volume '${outcome.name}' was posted under a name that doesn't give its " +
                         "place in its archive, and no PAR2 index names it"
                     logger.warn(message)
-                    return EnrichmentResult.Failure(message, IllegalStateException(message))
+                    return EnrichmentResult.Failure(message, UnplacedArchiveVolumeException(outcome.name, message))
                 }
                 is ReleaseFiles.Found.Volumes -> outcome
             }
