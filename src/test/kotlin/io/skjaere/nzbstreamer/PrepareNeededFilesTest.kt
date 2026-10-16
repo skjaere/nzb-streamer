@@ -429,6 +429,117 @@ class PrepareNeededFilesTest {
         }
     }
 
+    /**
+     * A recovery volume's file descriptions often follow its recovery block, past its first 16 KB:
+     * it is read as it streams, its block skipped, until they are (library issue N53).
+     */
+    @Test
+    fun `a recovery volume whose file descriptions follow its recovery block names obfuscated volumes`() {
+        val payload = bytes("movie", 200_000)
+        val named = volumes("Movie.2020", "Movie.2020.mkv", payload)
+        named.indices.reversed().forEach { v -> post(OBFUSCATED[v], named[v].second) }
+        post("0b1c2d3e.vol00+01.par2", buildPar2File(named, recoveryBlock = 64 * 1024))
+
+        withStreamer { streamer, _ ->
+            val prepared = assertIs<PrepareResult.Success>(streamer.prepare(nzb()), "prepare")
+            assertEquals(named.map { it.first }, prepared.metadata.response.volumes)
+            assertContentEquals(payload, streamer.streamed(prepared))
+        }
+    }
+
+    /** A PAR2 index that lacks an article names nothing: the smallest recovery volume does in its place (N53). */
+    @ParameterizedTest
+    @ValueSource(ints = [0, 1])
+    fun `a recovery volume names obfuscated volumes when the PAR2 index lacks an article`(lacking: Int) {
+        val payload = bytes("movie", 200_000)
+        val named = volumes("Movie.2020", "Movie.2020.mkv", payload)
+        named.indices.reversed().forEach { v -> post(OBFUSCATED[v], named[v].second) }
+        missing += post("0b1c2d3e.par2", buildPar2File(named), partSize = 256)[lacking]
+        post("0b1c2d3e.vol01+02.par2", buildPar2File(named, recoveryBlock = 8 * 1024))
+        post("0b1c2d3e.vol00+01.par2", buildPar2File(named, recoveryBlock = 4 * 1024))
+
+        withStreamer { streamer, server ->
+            val prepared = assertIs<PrepareResult.Success>(streamer.prepare(nzb()), "prepare")
+            assertEquals(named.map { it.first }, prepared.metadata.response.volumes)
+            assertContentEquals(payload, streamer.streamed(prepared))
+            assertTrue(firstArticle("0b1c2d3e.vol01+02.par2") !in server.bodiesRead, "the larger recovery volume was fetched")
+        }
+    }
+
+    /**
+     * A recovery volume that names its files before its recovery block is read no further than
+     * them: its block, which can be tens of MB, is neither held nor downloaded (N53).
+     */
+    @Test
+    fun `a recovery volume is read no further than its file descriptions`() {
+        val payload = bytes("movie", 200_000)
+        val named = volumes("Movie.2020", "Movie.2020.mkv", payload)
+        named.indices.reversed().forEach { v -> post(OBFUSCATED[v], named[v].second) }
+        val ids = post("0b1c2d3e.vol00+01.par2", buildPar2File(named, recoveryBlock = 1024 * 1024, descriptionsFirst = true))
+
+        withStreamer { streamer, server ->
+            val prepared = assertIs<PrepareResult.Success>(streamer.prepare(nzb()), "prepare")
+            assertEquals(named.map { it.first }, prepared.metadata.response.volumes)
+            val read = ids.count { it in server.bodiesRead }
+            assertTrue(read <= 4, "$read of the recovery volume's ${ids.size} articles were downloaded")
+        }
+    }
+
+    /**
+     * Guard for N53: a recovery volume whose block, ahead of its file descriptions, is bigger than
+     * prepare reads of it is left after its first article.
+     */
+    @Test
+    fun `a recovery volume too big to read to its file descriptions is left after its first article`() {
+        val named = volumes("Movie.2020", "Movie.2020.mkv", bytes("movie", 200_000))
+        named.indices.forEach { v -> post(OBFUSCATED[v], named[v].second) }
+        val ids = post("0b1c2d3e.vol00+01.par2", buildPar2File(named, recoveryBlock = 17 * 1024 * 1024), partSize = 512 * 1024)
+
+        withStreamer { streamer, server ->
+            assertIs<PrepareResult.Success>(streamer.prepare(nzb()), "prepare")
+            assertEquals(listOf(ids.first()), ids.filter { it in server.bodiesRead }, "articles of the recovery volume downloaded")
+        }
+    }
+
+    /**
+     * A recovery volume posted under a name that tells nothing is fetched (it may be a volume) and,
+     * naming its files first, passes for an index: it too is read no further than its file
+     * descriptions (N53).
+     */
+    @Test
+    fun `an obfuscated recovery volume is read no further than its file descriptions`() {
+        val payload = bytes("movie", 200_000)
+        val named = volumes("Movie.2020", "Movie.2020.mkv", payload)
+        named.forEach { (name, data) -> post(name, data) }
+        val ids = post("f1e2d3c4b5a6f7e8d9c0b1a2f3e4d5c6", buildPar2File(named, recoveryBlock = 1024 * 1024, descriptionsFirst = true))
+
+        withStreamer { streamer, server ->
+            val prepared = assertIs<PrepareResult.Success>(streamer.prepare(nzb()), "prepare")
+            assertContentEquals(payload, streamer.streamed(prepared))
+            val read = ids.count { it in server.bodiesRead }
+            assertTrue(read <= 4, "$read of the recovery volume's ${ids.size} articles were downloaded")
+        }
+    }
+
+    /**
+     * Whether a PAR2 file names files is told from its first 16 KB without taking a packet's length
+     * on trust: a recovery block's is its size, which can be tens of MB, here 2 GB (N53).
+     */
+    @Test
+    fun `a PAR2 packet's length isn't allocated before it is read`() {
+        val payload = bytes("movie", 200_000)
+        volumes("Movie.2020", "Movie.2020.mkv", payload).forEach { (name, data) -> post(name, data) }
+        val header = java.nio.ByteBuffer.allocate(64).order(java.nio.ByteOrder.LITTLE_ENDIAN)
+            .put("PAR2".toByteArray()).put(0).put("PKT".toByteArray()).putLong(Int.MAX_VALUE - 64L)
+            .put(ByteArray(32)).put("PAR 2.0".toByteArray()).put(0).put("RecvSlic".toByteArray()).array()
+        post("f1e2d3c4b5a6f7e8d9c0b1a2f3e4d5c6", header + bytes("block", 20_000))
+
+        withStreamer { streamer, _ ->
+            val prepared = assertIs<PrepareResult.Success>(streamer.prepare(nzb()), "prepare")
+            assertContentEquals(payload, streamer.streamed(prepared))
+        }
+    }
+
     private companion object {
         /** Names that look like an obfuscating poster's, one per volume. */
         val OBFUSCATED = listOf("a8f7d6e5", "b91c2d3e", "c07e4f1a", "d2b5a9c4", "e6f3c8b1", "f4a1d7e9")

@@ -31,6 +31,9 @@ class NzbEnrichmentService(
 ) {
     companion object {
         const val DEFAULT_ENRICHMENT_CONCURRENCY = 8
+
+        // How far a recovery volume standing in for a PAR2 index is read for its file descriptions.
+        private const val STAND_IN_READ_LIMIT = 16L * 1024 * 1024
     }
     private val logger = LoggerFactory.getLogger(NzbEnrichmentService::class.java)
     private val registry = Metrics.globalRegistry
@@ -70,7 +73,8 @@ class NzbEnrichmentService(
     /**
      * Fetches the first article of each file of [nzb] that prepare needs to open the release (see
      * [ReleaseFiles]: its archive volumes, or its content when it has none, and the PAR2 index or,
-     * without one, a recovery volume), then downloads the PAR2 index, then fetches any file that may
+     * without one, a recovery volume), then downloads the PAR2 index (or, when it names nothing,
+     * reads a recovery volume's file descriptions in its place), then fetches any file that may
      * be a volume posted under another extension and tells by the PAR2 index or its content whether
      * it is one ([ReleaseFiles.Volumes]). The enriched NZB holds those files, the volumes found among
      * the last too, but for any left out: a file the release opens without (a PAR2 file, another
@@ -96,34 +100,35 @@ class NzbEnrichmentService(
         }
         val kept = release.leftOut(lacking.keys).let { leftOut -> release.toFetch.filterNot { it in leftOut } }
 
-        // After enrichment, download the base PAR2 file (contains recovery set metadata).
+        // After enrichment, read the base PAR2 file's file descriptions (it names the files).
         // Skip .volXXX+YYY.par2 recovery volume files — they contain recovery blocks
-        // and can be very large (tens of MB each), causing OOM if loaded into memory. The one
-        // fetched in place of a missing index is downloaded only when its first 16 KB already
-        // name files: its blocks are that small.
+        // and can be very large (tens of MB each), causing OOM if loaded into memory: a file
+        // counts as an index when its first 16 KB name files, read packet by packet without
+        // taking their lengths on trust, and only its descriptions are held ([readPar2]). The
+        // smallest recovery volume stands in for an index that names nothing ([readStandIn]).
+        var standIn: Int? = null
         try {
             coroutineScope {
-                kept.map { nzb.files[it] }
-                    .filter { file ->
-                        val first16kb = file.first16kb ?: return@filter false
-                        Par2Parser.isPar2(first16kb) && Par2Parser.hasFileDescriptions(first16kb)
-                    }
+                kept.filter { it != release.recoveryStandIn }.map { nzb.files[it] }
+                    .filter { file -> namesFiles(file.first16kb) }
                     .map { file ->
                         async {
-                            withTimedPermit { downloadPar2(file) }
+                            withTimedPermit { readPar2(file) }
                         }
                     }.awaitAll()
             }
+            if (kept.none { nzb.files[it].par2Data != null }) standIn = readStandIn(nzb, release)
         } catch (@Suppress("TooGenericExceptionCaught") e: Exception) {
             rethrowCancellation(e)
             classifyEnrichmentFailure(e, phase = "PAR2 download")?.let { return it }
             throw e
         }
+        val named = (kept + listOfNotNull(standIn)).distinct()
 
         // Then the volumes posted under another extension (library issue N52), which the PAR2 index
         // names or their content shows to be: a file that may be one is fetched only when the index
         // names a volume no file holds, or doesn't name every volume the release has.
-        val volumes = release.Volumes(nzb.files, kept)
+        val volumes = release.Volumes(nzb.files, named)
         val found = try {
             val unknown = ConcurrentHashMap<Int, ArticleNotFoundException>()
             fetchFirstArticles(nzb, volumes.toCheck) { i, e -> unknown[i] = e }
@@ -154,7 +159,8 @@ class NzbEnrichmentService(
                 leftOut.size, leftOut.sorted().joinToString { release.nameOf(it) },
             )
         }
-        val files = (release.toFetch + found.keys).sorted().filterNot { it in leftOut }.map { nzb.files[it] }
+        val files = (named + found.keys + release.toFetch).distinct().sorted().filterNot { it in leftOut }
+            .map { nzb.files[it] }
         logger.debug("Enriched {} of {} files", files.size, nzb.files.size)
 
         sample.stop(enrichmentTimer)
@@ -245,15 +251,50 @@ class NzbEnrichmentService(
     }
 
     /**
-     * Downloads the PAR2 index [file] into its par2Data. One that lacks an article is left without:
-     * it only names obfuscated volumes, and the release opens without it.
+     * Reads the file descriptions of the release's smallest recovery volume into its par2Data, in
+     * place of a PAR2 index's (it has none, or the one it has lacks an article), fetching its first
+     * article first when it wasn't with the rest. Its index, or null when the release has none or
+     * it lacks its first article. It is read as it streams ([Par2Packets]): its recovery blocks
+     * skipped, never held, no further than [STAND_IN_READ_LIMIT] bytes nor past a block that
+     * follows its descriptions. One bigger than that with none in its first 16 KB is left there.
      */
-    private suspend fun downloadPar2(file: NzbFile) {
-        logger.debug("Downloading PAR2 file: {}", file.yencHeaders?.name)
-        val queue = SegmentQueueService.createFileQueue(file, 0, 0L)
+    private suspend fun readStandIn(nzb: NzbDocument, release: ReleaseFiles): Int? {
+        val i = release.recoveryStandIn ?: return null
+        val file = nzb.files[i]
+        if (i !in release.toFetch) {
+            enrichmentFiles.increment()
+            fetchFirstArticles(nzb, listOf(i)) { _, e ->
+                logger.warn("Going on without recovery volume {}, which lacks its first article: {}", release.nameOf(i), e.message)
+            }
+        }
+        val size = file.yencHeaders?.size ?: return null
+        if (file.first16kb?.let(Par2Parser::isPar2) != true) return null
+        if (size <= STAND_IN_READ_LIMIT || namesFiles(file.first16kb)) {
+            withTimedPermit { readPar2(file, minOf(size, STAND_IN_READ_LIMIT)) }
+        }
+        return i
+    }
+
+    /**
+     * Whether [first16kb] are those of a PAR2 file that names files in them, an index's: its packets
+     * are read one by one ([Par2Packets]), a length a packet gives never allocated before it is read.
+     */
+    private suspend fun namesFiles(first16kb: ByteArray?): Boolean =
+        first16kb != null && Par2Parser.isPar2(first16kb) && Par2Packets.fileDescriptions(ByteReadChannel(first16kb)) != null
+
+    /**
+     * Reads the file descriptions (its FileDesc packets) of the PAR2 file [file] into its par2Data
+     * as it streams, no further than [limit] bytes nor past a recovery block that follows them: its
+     * other packets, recovery blocks among them, are skipped, never held ([Par2Packets]). One that
+     * lacks an article is left without: it only names files, and the release opens without it.
+     */
+    private suspend fun readPar2(file: NzbFile, limit: Long = file.yencHeaders?.size ?: 0L) {
+        logger.debug("Reading PAR2 file: {}", file.yencHeaders?.name)
+        val queue = SegmentQueueService.createRangeQueue(NzbDocument(listOf(file)), 0, limit)
         try {
-            streamingService.streamSegments(queue, name = "par2:${file.yencHeaders?.name}") { channel ->
-                file.par2Data = channel.toByteArray()
+            // Few segments ahead: one that names its files before its blocks is left there.
+            streamingService.streamSegments(queue, concurrency = 2, readAheadSegments = 2, name = "par2:${file.yencHeaders?.name}") { channel ->
+                file.par2Data = Par2Packets.fileDescriptions(channel)
             }
         } catch (@Suppress("TooGenericExceptionCaught") e: Exception) {
             rethrowCancellation(e)
@@ -262,7 +303,7 @@ class NzbEnrichmentService(
             logger.warn("Going on without PAR2 file {}, which lacks an article: {}", file.yencHeaders?.name, missing.message)
             return
         }
-        logger.debug("Downloaded PAR2 file: {} ({} bytes)", file.yencHeaders?.name, file.par2Data?.size)
+        logger.debug("Read PAR2 file: {} ({} bytes of file descriptions)", file.yencHeaders?.name, file.par2Data?.size)
     }
 }
 

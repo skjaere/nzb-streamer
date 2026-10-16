@@ -15,8 +15,8 @@ import io.skjaere.nzbstreamer.nzb.printable
  * fetches those, the PAR2 index (which names obfuscated volumes) and any file whose name tells
  * nothing. A release without them is streamed file by file: prepare fetches its content (videos,
  * other files, unnamed ones) and the PAR2 index. PAR2 recovery volumes are not fetched, but for the
- * smallest when the release has no index (each carries the index's names), nor are NFOs, SFVs and
- * the like, and samples, unless they are all the release has.
+ * smallest when the release has no index, or the one it has names nothing (each carries the index's
+ * names), nor are NFOs, SFVs and the like, and samples, unless they are all the release has.
  *
  * A file prepare doesn't need to open the release may lack its first article: it is left out. So
  * may another episode's: a video (or other content beside videos) while one of its size is there,
@@ -42,9 +42,14 @@ internal class ReleaseFiles(files: List<NzbFile>) {
     // NFOs and the like are the content of a release that has nothing else, listed as they are.
     private val sideIsContent = roles.none { it in CONTENT }
 
-    // Without an index, the smallest recovery volume names the files in its place.
-    private val indexStandIn = roles.indices.filter { roles[it] == Role.RECOVERY }.minByOrNull { sizes[it] }
-        .takeIf { Role.PAR2 !in roles }
+    /**
+     * The smallest recovery volume, which names the files in place of a PAR2 index (each carries the
+     * index's file descriptions): fetched with the rest when the release has no index, and after
+     * them when the one it has names nothing (it lacks an article).
+     */
+    val recoveryStandIn: Int? = roles.indices.filter { roles[it] == Role.RECOVERY }.minByOrNull { sizes[it] }
+
+    private val indexStandIn = recoveryStandIn.takeIf { Role.PAR2 !in roles }
 
     /** Archive volumes by set: the volumes of one archive share a name but for their suffix. */
     private val sets = roles.indices.filter { roles[it] == Role.ARCHIVE }.groupBy { stemOf(names[it]!!) }.values

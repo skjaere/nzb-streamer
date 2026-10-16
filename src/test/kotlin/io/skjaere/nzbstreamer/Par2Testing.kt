@@ -34,17 +34,23 @@ internal fun buildPar2IndexFile(filename: String, fileSize: Long): ByteArray {
 /**
  * A PAR2 file naming [files] (name to bytes) in FileDesc packets, each with its size and the MD5 of
  * its first 16 KB, as a poster's PAR2 index does. When [recoveryBlock] is set, a recovery slice
- * packet of that many bytes comes first, as in a recovery volume of that block size.
+ * packet of that many bytes comes first (or last, with [descriptionsFirst]), as in a recovery
+ * volume of that block size.
  */
-internal fun buildPar2File(files: List<Pair<String, ByteArray>>, recoveryBlock: Int? = null): ByteArray {
+internal fun buildPar2File(
+    files: List<Pair<String, ByteArray>>,
+    recoveryBlock: Int? = null,
+    descriptionsFirst: Boolean = false,
+): ByteArray {
     val recovery = recoveryBlock?.let { par2Packet("RecvSlic", ByteArray(4 + it)) } ?: ByteArray(0)
-    return files.fold(recovery) { all, (name, data) ->
+    val descriptions = files.fold(ByteArray(0)) { all, (name, data) ->
         val padded = name.toByteArray(Charsets.UTF_8).let { it.copyOf((it.size + 3) and 3.inv()) }
         val hash16k = MessageDigest.getInstance("MD5").digest(data.copyOf(minOf(data.size, 16 * 1024)))
         val body = ByteBuffer.allocate(56 + padded.size).order(ByteOrder.LITTLE_ENDIAN)
             .put(ByteArray(16)).put(ByteArray(16)).put(hash16k).putLong(data.size.toLong()).put(padded)
         all + par2Packet("FileDesc", body.array())
     }
+    return if (descriptionsFirst) descriptions + recovery else recovery + descriptions
 }
 
 /** A PAR2 packet of [type] ("FileDesc", "RecvSlic") around [body], with zeros for its hash and set id. */
