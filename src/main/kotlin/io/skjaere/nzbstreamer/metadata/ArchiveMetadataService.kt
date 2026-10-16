@@ -5,6 +5,7 @@ import io.micrometer.core.instrument.Timer
 import io.skjaere.compressionutils.ArchiveFileEntry
 import io.skjaere.compressionutils.ArchiveService
 import io.skjaere.compressionutils.ListFilesResult
+import io.skjaere.compressionutils.MissingArchiveVolumeException
 import io.skjaere.compressionutils.Par2FileNames
 import io.skjaere.compressionutils.Par2Parser
 import io.skjaere.compressionutils.VolumeMetaData
@@ -121,15 +122,21 @@ class ArchiveMetadataService(
 
     /**
      * What a failure while reading the archive's headers means for the release, as enrichment
-     * classifies its own: an article no provider has is [PrepareResult.MissingArticles]; an NNTP
-     * failure (a connection that dropped, a timeout) or an archive the parser can't read
-     * ([io.skjaere.compressionutils.MalformedRarArchiveException], its other IOExceptions) is a
-     * [PrepareResult.Failure] with [e] as the cause. Null for anything else, a bug, which is thrown.
+     * classifies its own: an article no provider has, or a volume the volumes' headers show the
+     * release lacks ([MissingArchiveVolumeException], NR-21), is [PrepareResult.MissingArticles];
+     * an NNTP failure (a connection that dropped, a timeout) or an archive the parser can't read
+     * ([io.skjaere.compressionutils.MalformedRarArchiveException], volumes whose headers give one
+     * place, its other IOExceptions) is a [PrepareResult.Failure] with [e] as the cause. Null for
+     * anything else, a bug, which is thrown.
      */
     private fun classifyHeaderWalkFailure(e: Exception): PrepareResult? {
         e.firstCauseOfType<ArticleNotFoundException>()?.let { cause ->
             logger.warn("Article not found while reading the archive headers: {}", cause.message)
             return PrepareResult.MissingArticles(cause.message ?: "Article not found", e)
+        }
+        e.firstCauseOfType<MissingArchiveVolumeException>()?.let { cause ->
+            logger.warn("An archive volume is missing: {}", cause.message)
+            return PrepareResult.MissingArticles(cause.message ?: "Archive volume missing", e)
         }
         val cause = e.firstCauseOfType<NntpException>() ?: e.firstCauseOfType<IOException>() ?: return null
         logger.warn("Reading the archive headers failed: {}", cause.toString(), e)

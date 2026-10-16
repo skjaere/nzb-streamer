@@ -507,6 +507,38 @@ class PrepareNeededFilesTest {
     }
 
     /**
+     * RAR5 volumes posted under names that give no place, with no PAR2 data to name them, open in
+     * the order their main archive headers give, whatever order the NZB lists them in (NR-21).
+     */
+    @ParameterizedTest
+    @CsvSource("reversed, ''", "shuffled, ''", "reversed, .rar", "shuffled, .rar")
+    fun `volumes posted under names that give no place open in the order their headers give`(order: String, extension: String) {
+        val payload = bytes("movie", 200_000)
+        val named = volumes("Movie.2020", "Movie.2020.mkv", payload)
+        assertEquals(4, named.size)
+        val listed = if (order == "reversed") named.indices.reversed() else listOf(2, 0, 3, 1)
+        listed.forEach { v -> post("${OBFUSCATED[v]}$extension", named[v].second) }
+
+        withStreamer { streamer, _ ->
+            val prepared = assertIs<PrepareResult.Success>(streamer.prepare(nzb()), "prepare")
+            assertContentEquals(payload, streamer.streamed(prepared))
+        }
+    }
+
+    /** Their headers show such a set lacks a volume the NZB doesn't hold: it doesn't open without it (NR-21). */
+    @ParameterizedTest
+    @ValueSource(ints = [0, 1])
+    fun `a set posted under names that give no place that lacks a volume fails the release`(absent: Int) {
+        val named = volumes("Movie.2020", "Movie.2020.mkv", bytes("movie", 200_000))
+        named.indices.reversed().filter { it != absent }.forEach { v -> post(OBFUSCATED[v], named[v].second) }
+
+        withStreamer { streamer, _ ->
+            val result = assertIs<PrepareResult.MissingArticles>(streamer.prepare(nzb()), "prepare")
+            assertTrue("volume ${absent + 1}" in result.message, result.message)
+        }
+    }
+
+    /**
      * A recovery volume's file descriptions often follow its recovery block, past its first 16 KB:
      * it is read as it streams, its block skipped, until they are (library issue N53).
      */
