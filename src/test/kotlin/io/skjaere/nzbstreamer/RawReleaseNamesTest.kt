@@ -9,6 +9,8 @@ import io.skjaere.yenc.YencEncoder
 import kotlinx.coroutines.runBlocking
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.Test
+import org.junit.jupiter.params.ParameterizedTest
+import org.junit.jupiter.params.provider.CsvSource
 import kotlin.random.Random
 import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
@@ -58,12 +60,55 @@ class RawReleaseNamesTest {
         withPrepared { streamer, prepared ->
             assertIs<ExtractedMetadata.Raw>(prepared.metadata)
             assertEquals(episodes.keys.toList(), streamer.resolveStreamableFiles(prepared.metadata).map { it.path })
-            episodes.forEach { (name, data) ->
-                val resolved = assertIs<FileResolveResult.Streamable>(streamer.resolveFile(prepared.metadata, name), name)
-                var streamed = ByteArray(0)
-                streamer.streamFile(prepared.metadata, resolved.namedSplits) { streamed = it.toByteArray() }
-                assertContentEquals(data, streamed, name)
-            }
+            episodes.forEach { (name, data) -> assertStreams(streamer, prepared, name, data) }
         }
+    }
+
+    /**
+     * Disc images start alike (their first 32 KB are zeros), so the PAR2 index's descriptions of
+     * both give the same first 16 KB: their lengths tell them apart, and where they don't either,
+     * no description names either (NR-8).
+     */
+    @ParameterizedTest
+    @CsvSource("300000, 350000, false", "300000, 300000, false", "300000, 350000, true")
+    fun `disc images that start alike keep their own names`(first: Int, second: Int, obfuscated: Boolean) {
+        val discs = listOf("Show.S01.Disc1.iso" to first, "Show.S01.Disc2.iso" to second)
+            .associate { (name, size) -> name to ByteArray(32 * 1024) + Random(name.hashCode()).nextBytes(size - 32 * 1024) }
+        val postedAs = if (obfuscated) listOf("a8f7d6e5.iso", "b91c2d3e.iso") else discs.keys.toList()
+        discs.values.zip(postedAs).forEach { (data, posted) -> post(posted, data) }
+        post("Show.S01.par2", buildPar2File(discs.toList()))
+
+        withPrepared { streamer, prepared ->
+            val expected = if (first == second) postedAs else discs.keys.toList()
+            assertEquals(expected, streamer.resolveStreamableFiles(prepared.metadata).map { it.path })
+            expected.zip(discs.values).forEach { (name, data) -> assertStreams(streamer, prepared, name, data) }
+        }
+    }
+
+    /** A DVD's VIDEO_TS.BUP is a copy of its VIDEO_TS.IFO (and VTS_01_0.BUP of VTS_01_0.IFO): each keeps its name (NR-12). */
+    @Test
+    fun `a DVD folder posted as it is lists each file under its own name`() {
+        val ifo = Random(1).nextBytes(12_000)
+        val titleIfo = Random(2).nextBytes(20_000)
+        val dvd = listOf(
+            "VIDEO_TS.IFO" to ifo, "VIDEO_TS.BUP" to ifo.copyOf(),
+            "VTS_01_0.IFO" to titleIfo, "VTS_01_0.BUP" to titleIfo.copyOf(),
+            "VTS_01_1.VOB" to Random(3).nextBytes(100_000),
+        )
+        dvd.forEach { (name, data) -> post(name, data) }
+        post("VIDEO_TS.par2", buildPar2File(dvd))
+
+        withPrepared { streamer, prepared ->
+            assertEquals(dvd.map { it.first }, streamer.resolveStreamableFiles(prepared.metadata).map { it.path })
+            dvd.forEach { (name, data) -> assertStreams(streamer, prepared, name, data) }
+        }
+    }
+
+    /** [name] resolves to a file that streams [data]. */
+    private suspend fun assertStreams(streamer: NzbStreamer, prepared: PrepareResult.Success, name: String, data: ByteArray) {
+        val resolved = assertIs<FileResolveResult.Streamable>(streamer.resolveFile(prepared.metadata, name), name)
+        var streamed = ByteArray(0)
+        streamer.streamFile(prepared.metadata, resolved.namedSplits) { streamed = it.toByteArray() }
+        assertContentEquals(data, streamed, name)
     }
 }

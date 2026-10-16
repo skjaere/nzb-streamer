@@ -5,6 +5,7 @@ import io.micrometer.core.instrument.Timer
 import io.skjaere.compressionutils.ArchiveFileEntry
 import io.skjaere.compressionutils.ArchiveService
 import io.skjaere.compressionutils.ListFilesResult
+import io.skjaere.compressionutils.Par2FileNames
 import io.skjaere.compressionutils.Par2Parser
 import io.skjaere.compressionutils.VolumeMetaData
 import io.skjaere.nntp.ArticleNotFoundException
@@ -167,7 +168,7 @@ class ArchiveMetadataService(
     private fun resolveVolumes(nzb: NzbDocument): ResolvedVolumes {
         val par2Data = nzb.files.firstOrNull { it.par2Data != null }?.par2Data
         // Every PAR2 file's names, not only the first's: a season pack can have an index per episode.
-        val par2Names = VolumeNames.descriptions(nzb.files).associate { it.hash16kHex() to it.filename }
+        val par2Names = VolumeNames.names(VolumeNames.descriptions(nzb.files))
 
         val archiveFiles = nzb.files.filter { file ->
             val first16kb = file.first16kb
@@ -201,15 +202,15 @@ class ArchiveMetadataService(
 
     /**
      * The name [file] is ordered by among the volumes: its yEnc name when that is a volume's, else
-     * the name the PAR2 data ([par2Names], by the MD5 of the first 16 KB) gives it, else, for an
+     * the name the PAR2 data ([par2Names], by the first 16 KB and the length) gives it, else, for an
      * archive by its content posted under another extension, its name without that extension when
      * that places it ([VolumeNames.of], library issue N52).
      */
-    private fun volumeName(file: NzbFile, par2Names: Map<String, String>): String {
+    private fun volumeName(file: NzbFile, par2Names: Par2FileNames): String {
         val name = file.yencHeaders!!.name
         val first16kb = file.first16kb
         if (VolumeNames.isVolume(name) || first16kb == null) return name
-        return par2Names[VolumeNames.md5Hex(first16kb)]
+        return par2Names.nameOf(first16kb, file.yencHeaders!!.size)
             ?: VolumeNames.of(name)?.takeIf { VolumeNames.isArchive(first16kb) }
             ?: name
     }

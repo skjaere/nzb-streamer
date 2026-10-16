@@ -1,6 +1,7 @@
 package io.skjaere.nzbstreamer
 
 import io.ktor.utils.io.*
+import io.skjaere.compressionutils.Par2FileNames
 import io.skjaere.compressionutils.Par2Parser
 import io.skjaere.compressionutils.SplitInfo
 import io.skjaere.nzbstreamer.config.NntpConfig
@@ -154,24 +155,31 @@ class NzbStreamer private constructor(
         // can be on any file in the doc, normally only one slot has them). prepare keeps the
         // PAR2 files out of the doc, though: the name their data gives a file is the one it
         // lists the file under in the response's volumes, where that isn't its yEnc name
-        // (library issue N54).
-        val par2Index = FilenameResolver.indexPar2ByHash16k(
-            metadata.orderedArchiveNzb.files.firstOrNull { it.par2Data != null }?.par2Data
-        )
-        return metadata.orderedArchiveNzb.files.mapIndexedNotNull { index, file ->
+        // (library issue N54). Either names a file by its first 16 KB and its length, and
+        // none that start alike and are as long (NR-8); and no name is given two files.
+        val files = metadata.orderedArchiveNzb.files
+        val volumes = metadata.response.volumes
+        val par2Names = Par2FileNames.parse(files.firstOrNull { it.par2Data != null }?.par2Data)
+        val listedOnce = volumes.groupingBy { it }.eachCount().filterValues { it == 1 }.keys
+        val par2Filenames = files.mapIndexed { index, file ->
+            val headers = file.yencHeaders ?: return@mapIndexed null
+            FilenameResolver.hash16kHex(file.first16kb)?.let { par2Names.nameOf(it, headers.size) }
+                ?: volumes.getOrNull(index)?.takeIf { it != headers.name && it in listedOnce }
+        }
+        val best = files.mapIndexed { index, file ->
+            file.yencHeaders?.let { FilenameResolver.bestFilename(it.name, file.subject, par2Filenames[index]) }
+        }
+        val taken = best.filterNotNull().groupingBy { it }.eachCount()
+        return files.mapIndexedNotNull { index, file ->
             val headers = file.yencHeaders ?: return@mapIndexedNotNull null
-            val par2Filename = par2Index[FilenameResolver.hash16kHex(file.first16kb)]
-                ?: metadata.response.volumes.getOrNull(index)?.takeIf { it != headers.name }
-            val best = FilenameResolver.bestFilename(
-                yencName = headers.name,
-                subject = file.subject,
-                par2Filename = par2Filename,
-            )
+            // A PAR2 name another file is listed under too is neither's: this one keeps its own.
+            val name = best[index]!!.takeUnless { it == par2Filenames[index] && taken.getValue(it) > 1 }
+                ?: FilenameResolver.bestFilename(headers.name, file.subject, par2Filename = null)
             // Fall back to the previously-surfaced name only if FilenameResolver
             // returned an empty string (every source was blank — should be impossible
             // for a real NZB but guard against malformed inputs).
             StreamableFile(
-                path = best.ifBlank { metadata.response.volumes[index] },
+                path = name.ifBlank { volumes[index] },
                 totalSize = headers.size,
                 startVolumeIndex = index,
                 startOffsetInVolume = 0,

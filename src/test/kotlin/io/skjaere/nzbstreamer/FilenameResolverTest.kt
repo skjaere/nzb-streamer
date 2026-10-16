@@ -239,6 +239,18 @@ class FilenameResolverTest {
         assertEquals(emptyMap(), FilenameResolver.indexPar2ByHash16k("not a par2 file".toByteArray()))
     }
 
+    /** VIDEO_TS.BUP is a copy of VIDEO_TS.IFO: their shared hash names neither (NR-8). */
+    @Test
+    fun `indexPar2ByHash16k names nothing by a hash that descriptions with different names share`() {
+        val ifo = kotlin.random.Random(1).nextBytes(20_000)
+        val vob = kotlin.random.Random(2).nextBytes(20_000)
+        val index = FilenameResolver.indexPar2ByHash16k(
+            buildPar2File(listOf("VIDEO_TS.IFO" to ifo, "VIDEO_TS.BUP" to ifo.copyOf(), "VTS_01_1.VOB" to vob))
+        )
+
+        assertEquals(mapOf(FilenameResolver.hash16kHex(vob)!! to "VTS_01_1.VOB"), index)
+    }
+
     // Full ObfuscationHeuristic corpus lives in ObfuscationHeuristicTest — no parity
     // smoke tests here now that both files are in the same module.
 }

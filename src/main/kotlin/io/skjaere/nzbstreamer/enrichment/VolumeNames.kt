@@ -2,14 +2,15 @@ package io.skjaere.nzbstreamer.enrichment
 
 import io.skjaere.compressionutils.ArchiveService
 import io.skjaere.compressionutils.ArchiveTypeDetector
+import io.skjaere.compressionutils.Par2FileNames
 import io.skjaere.compressionutils.Par2Parser
 import io.skjaere.nzbstreamer.nzb.NzbFile
-import java.security.MessageDigest
 
 /**
  * What tells that a file is an archive volume, and which, beyond the name it was posted under
- * (library issue N52): the PAR2 data, which names each file by the MD5 of its first 16 KB, and its
- * content, which starts with an archive's signature (every RAR volume's does, a 7z set's first).
+ * (library issue N52): the PAR2 data, which names each file by the MD5 of its first 16 KB and its
+ * length, and its content, which starts with an archive's signature (every RAR volume's does, a 7z
+ * set's first).
  */
 internal object VolumeNames {
     private val PART_NUMBER = Regex("""(?i)\.part\d+$""")
@@ -27,9 +28,14 @@ internal object VolumeNames {
             }
         }
 
+    /**
+     * The names [descriptions] give files, each by its first 16 KB and its length: none to files
+     * that start alike and are as long, which several with different names describe (NR-8).
+     */
+    fun names(descriptions: List<Par2Parser.Par2FileDescription>): Par2FileNames = Par2FileNames(descriptions)
+
     /** The MD5 of [first16kb] in hex, as [Par2Parser.Par2FileDescription.hash16kHex] gives a file's. */
-    fun md5Hex(first16kb: ByteArray): String =
-        MessageDigest.getInstance("MD5").digest(first16kb).joinToString("") { "%02x".format(it) }
+    fun md5Hex(first16kb: ByteArray): String = Par2FileNames.md5Hex(first16kb)
 
     /** Whether [name] is an archive volume's (.partN.rar, .rar, .r00, .7z, .7z.001, ...). */
     fun isVolume(name: String): Boolean = ArchiveService.fileHasKnownExtension(name)

@@ -126,15 +126,15 @@ internal class ReleaseFiles(files: List<NzbFile>) {
     /**
      * The archive volumes the names don't show, once the files of [kept] (those of [toFetch] not
      * left out) are fetched, their PAR2 data with them. The PAR2 data names each file by the MD5 of
-     * its first 16 KB. When it names a volume of a set the release opens that no file holds (by
-     * that name or those 16 KB), or doesn't name a volume the release has (there is no index, or
-     * not that set's), [toCheck] lists the files of [mayHideVolume] to fetch: one the PAR2 data
-     * names a volume is one, and, where it doesn't name them all, one that starts with an archive's
-     * signature is too.
+     * its first 16 KB and its length. When it names a volume of a set the release opens that no file
+     * holds (by that name or those 16 KB and length), or doesn't name a volume the release has
+     * (there is no index, or not that set's), [toCheck] lists the files of [mayHideVolume] to fetch:
+     * one the PAR2 data names a volume is one, and, where it doesn't name them all, one that starts
+     * with an archive's signature is too.
      */
     inner class Volumes(private val files: List<NzbFile>, private val kept: List<Int>) {
         private val descriptions = VolumeNames.descriptions(kept.map { files[it] })
-        private val byHash = descriptions.associate { it.hash16kHex() to it.filename }
+        private val par2Names = VolumeNames.names(descriptions)
         private val byName = descriptions.associate { it.filename.lowercase() to it.filename }
         private val hashed = hashes()
 
@@ -164,7 +164,7 @@ internal class ReleaseFiles(files: List<NzbFile>) {
             val held = kept.mapNotNull { par2Name(it, hashes) ?: names[it] }.map { it.lowercase() }.toMutableSet()
             val found = mutableMapOf<Int, String>()
             for (i in toCheck.filterNot { it in unknown }) {
-                val named = hashes[i]?.let(byHash::get)
+                val named = describedAs(i, hashes)
                 val volume = when {
                     named != null -> named.takeIf { it in unheld }
                     byContent && VolumeNames.isArchive(files[i].first16kb) ->
@@ -192,20 +192,24 @@ internal class ReleaseFiles(files: List<NzbFile>) {
 
         /** The name the PAR2 data gives file [i]: by its first 16 KB once fetched ([hashes]), else by its own. */
         private fun par2Name(i: Int, hashes: Map<Int, String>): String? =
-            hashes[i]?.let(byHash::get) ?: names[i]?.lowercase()?.let(byName::get)
+            describedAs(i, hashes) ?: names[i]?.lowercase()?.let(byName::get)
+
+        /** The name the PAR2 data gives file [i] by its first 16 KB ([hashes]) and its length, once fetched. */
+        private fun describedAs(i: Int, hashes: Map<Int, String>): String? =
+            hashes[i]?.let { hash -> files[i].yencHeaders?.size?.let { par2Names.nameOf(hash, it) } }
 
         /** The sets whose volumes the release opens: those of [kept], and of [found]. */
         private fun opened(hashes: Map<Int, String>, found: Map<Int, String>): Set<String> =
             (kept.mapNotNull { par2Name(it, hashes) ?: names[it] } + found.values)
                 .filter(VolumeNames::isVolume).map(::stemOf).toSet()
 
-        /** The volumes the PAR2 data names of the sets [opened] that no file holds, by name or by first 16 KB. */
+        /** The volumes the PAR2 data names of the sets [opened] that no file holds, by name or by first 16 KB and length. */
         private fun unheld(opened: Set<String>, hashes: Map<Int, String>): List<String> {
             val named = names.mapNotNull { it?.lowercase() }.toSet()
-            val fetched = hashes.values.toSet()
+            val fetched = hashes.mapNotNull { (i, hash) -> files[i].yencHeaders?.let { hash to it.size } }.toSet()
             return descriptions.filter { d ->
                 VolumeNames.isVolume(d.filename) && stemOf(d.filename) in opened &&
-                    d.filename.lowercase() !in named && d.hash16kHex() !in fetched
+                    d.filename.lowercase() !in named && (d.hash16kHex() to d.fileSize) !in fetched
             }.map { it.filename }.distinct()
         }
     }

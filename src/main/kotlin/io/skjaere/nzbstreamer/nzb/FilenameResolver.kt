@@ -1,5 +1,6 @@
 package io.skjaere.nzbstreamer.nzb
 
+import io.skjaere.compressionutils.Par2FileNames
 import io.skjaere.compressionutils.Par2Parser
 import java.security.MessageDigest
 
@@ -82,24 +83,17 @@ object FilenameResolver {
     }
 
     /**
-     * Index a par2 byte blob by the SHA-of-first-16KB of each described file. The keys
+     * Index a par2 byte blob by the MD5-of-first-16KB of each described file. The keys
      * are the same `hash16k` field used by [Par2Parser]; debridav callers compute it
-     * from the NZB file's first 16KB and look up the matching descriptor here.
+     * from the NZB file's first 16KB and look up the matching descriptor here. A hash
+     * that descriptions with different names share (files that start alike: a DVD's
+     * VIDEO_TS.IFO and its copy VIDEO_TS.BUP, disc images) names nothing: it would name
+     * every such file the same. [Par2FileNames.nameOf] tells those apart by length too.
      *
      * Returns an empty map if [par2Data] is null, malformed, or empty. We never throw
      * out of this — par2 is best-effort metadata.
      */
-    @Suppress("TooGenericExceptionCaught")
-    fun indexPar2ByHash16k(par2Data: ByteArray?): Map<String, String> {
-        if (par2Data == null) return emptyMap()
-        return try {
-            Par2Parser.parse(par2Data).files
-                .filter { it.filename.isNotBlank() }
-                .associate { it.hash16kHex() to it.filename }
-        } catch (_: Exception) {
-            emptyMap()
-        }
-    }
+    fun indexPar2ByHash16k(par2Data: ByteArray?): Map<String, String> = Par2FileNames.parse(par2Data).byHash16k
 
     /**
      * Pick the best filename for an NZB file from the three candidate sources. Inputs
