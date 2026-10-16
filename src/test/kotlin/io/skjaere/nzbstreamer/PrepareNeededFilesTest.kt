@@ -320,6 +320,27 @@ class PrepareNeededFilesTest {
         }
     }
 
+    /**
+     * Without a PAR2 index, a file posted under another extension that starts with an archive's
+     * signature joins the release's archive only when its name places it in a set the release
+     * opens: the volume of another archive (here the first of an extra's two, the second not
+     * posted) is none of the film's, which opens without it (NR-14).
+     */
+    @ParameterizedTest
+    @ValueSource(strings = ["RAR4", "RAR5"])
+    fun `an archive of another set posted under another extension doesn't join the release's`(type: ContainerType) {
+        val payload = bytes("movie", 200_000)
+        val named = volumes("Movie.2020", "Movie.2020.mkv", payload, type)
+        named.forEach { (name, data) -> post(name, data) }
+        post("Extras.part1.bin", ArchiveGenerator.generate(bytes("extras", 100_000), 64L * 1024, ContainerType.RAR5, "Extras.mkv").first().data)
+
+        withStreamer { streamer, _ ->
+            val prepared = assertIs<PrepareResult.Success>(streamer.prepare(nzb()), "prepare")
+            assertEquals(named.map { it.first }, prepared.metadata.response.volumes)
+            assertContentEquals(payload, streamer.streamed(prepared))
+        }
+    }
+
     /** Without a PAR2 index nothing tells where such a volume goes: the release isn't opened in a guessed order (N52). */
     @Test
     fun `a volume posted under a name that doesn't give its place fails a release without a PAR2 index`() {

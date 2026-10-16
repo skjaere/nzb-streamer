@@ -156,11 +156,14 @@ internal class ReleaseFiles(files: List<NzbFile>) {
          * for the extension it was posted under), and the sets that lack a volume the PAR2 data
          * names, by one of their files with the cause. [Found.Missing] when the release can't open
          * whole: a set that lacks a volume isn't an episode's, or a file whose content was to tell
-         * lacks its first article; [Found.Unplaced] when nothing tells where a volume goes.
+         * lacks its first article; [Found.Unplaced] when nothing tells where a volume goes. One its
+         * content shows to be a volume whose name places it in a set the release doesn't open is
+         * another archive's (an extra's), none of the release's: it is left as before N52 (NR-14).
          */
         fun found(unknown: Map<Int, ArticleNotFoundException>): Found {
             if (byContent) unknown.minByOrNull { it.key }?.let { return Found.Missing(it.value) }
             val hashes = hashes()
+            val openedSets = opened(hashes, emptyMap())
             val held = kept.mapNotNull { par2Name(it, hashes) ?: names[it] }.map { it.lowercase() }.toMutableSet()
             val found = mutableMapOf<Int, String>()
             for (i in toCheck.filterNot { it in unknown }) {
@@ -168,7 +171,8 @@ internal class ReleaseFiles(files: List<NzbFile>) {
                 val volume = when {
                     named != null -> named.takeIf { it in unheld }
                     byContent && VolumeNames.isArchive(files[i].first16kb) ->
-                        VolumeNames.of(files[i].yencHeaders?.name ?: names[i]!!) ?: return Found.Unplaced(nameOf(i))
+                        (VolumeNames.of(files[i].yencHeaders?.name ?: names[i]!!) ?: return Found.Unplaced(nameOf(i)))
+                            .takeIf { stemOf(it) in openedSets }
                     else -> null
                 }
                 if (volume != null && held.add(volume.lowercase())) found[i] = volume
