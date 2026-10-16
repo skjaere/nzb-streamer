@@ -34,6 +34,7 @@ import kotlin.io.path.writeText
 import kotlin.streams.asSequence
 import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
@@ -44,9 +45,11 @@ class SegmentCacheTest {
     private fun cfg(dir: Path, maxBytes: Long = 1_000_000L) =
         SegmentCacheConfig(cacheDir = dir, maxBytes = maxBytes, evictThresholdRatio = 0.9)
 
-    private fun SegmentCache.pathOf(articleId: String): Path =
-        SegmentCache::class.java.getDeclaredMethod("filePathFor", String::class.java)
-            .apply { isAccessible = true }.invoke(this, articleId) as Path
+    private fun SegmentCache.pathOf(articleId: String): Path {
+        fun call(method: String, arg: String): Any = SegmentCache::class.java.getDeclaredMethod(method, String::class.java)
+            .apply { isAccessible = true }.invoke(this, arg)
+        return call("pathFor", call("nameFor", articleId) as String) as Path
+    }
 
     /** The cache's segment files: everything under [dir] but the index. */
     private fun segmentFiles(dir: Path): List<Path> = Files.walk(dir).use { paths ->
@@ -218,6 +221,108 @@ class SegmentCacheTest {
 
             assertNull(cache.get("a@id"), "a, written first, is still cached")
             assertNotNull(cache.get("c@id"), "c, written last, was evicted")
+        }
+    }
+
+    /** The cache's index and its files agree: each file an entry, and its bytes what the index counts. */
+    private fun assertMatchesDisk(cache: SegmentCache, dir: Path) {
+        val files = segmentFiles(dir)
+        val stats = cache.stats()
+        assertEquals(files.size, stats.entryCount, "entries in the index vs files on disk")
+        assertEquals(files.sumOf { Files.size(it) }, stats.totalBytes, "bytes in the index vs bytes on disk")
+    }
+
+    /**
+     * Android kills a process without closing anything. The index was saved at the 64th write;
+     * the files written since were in no index, never served, counted or evicted.
+     */
+    @Test
+    fun `a kill loses no segment written since the last save and leaks no file`(@TempDir tmp: Path) {
+        runBlocking {
+            val payload = ByteArray(100) { 0x44 }
+            val ids = (1..70).map { "k-$it@id" }
+            SegmentCache(cfg(tmp)).let { killed -> ids.forEach { id -> killed.getOrFetch(id) { payload } } }
+
+            val cache = SegmentCache(cfg(tmp))
+            assertMatchesDisk(cache, tmp)
+            assertEquals(ids.size, cache.stats().entryCount)
+            val fetches = AtomicInteger()
+            ids.forEach { id ->
+                assertContentEquals(payload, cache.getOrFetch(id) { fetches.incrementAndGet(); ByteArray(0) })
+            }
+            assertEquals(0, fetches.get(), "segments fetched again")
+        }
+    }
+
+    /** A kill in the middle of a write leaves the write's temporary file, which is nobody's. */
+    @Test
+    fun `a write cut short by a kill leaves no file behind`(@TempDir tmp: Path) {
+        runBlocking {
+            val payload = ByteArray(512) { 0x55 }
+            SegmentCache(cfg(tmp)).use { c -> c.getOrFetch("whole@id") { payload } }
+            val cutShort = tmp.resolve("ab").createDirectories().resolve("ab" + "0".repeat(62) + "123.tmp")
+            cutShort.writeBytes(ByteArray(100))
+
+            val cache = SegmentCache(cfg(tmp))
+            assertMatchesDisk(cache, tmp)
+            assertFalse(cutShort.exists(), "the cut-short write is still on disk")
+            assertContentEquals(payload, cache.get("whole@id"))
+        }
+    }
+
+    /**
+     * Versions that kept the index without a version wrote files in place, so a file their index
+     * doesn't list may be one a kill cut short: it is deleted, not taken in, and counts for nothing.
+     */
+    @Test
+    fun `a file an older index doesn't list is deleted`(@TempDir tmp: Path) {
+        runBlocking {
+            val paths = SegmentCache(cfg(tmp)).let { c -> listOf("listed@id", "unlisted@id").map { c.pathOf(it) } }
+            paths.forEach { path ->
+                path.parent.createDirectories()
+                path.writeBytes(ByteArray(1024) { 0x66 })
+            }
+            tmp.resolve("index.json").writeText("""{"entries":[{"articleId":"listed@id","size":1024,"lastAccessNanos":7}]}""")
+
+            val cache = SegmentCache(cfg(tmp))
+            assertMatchesDisk(cache, tmp)
+            assertEquals(1, cache.stats().entryCount)
+            assertNotNull(cache.get("listed@id"))
+            assertNull(cache.get("unlisted@id"))
+        }
+    }
+
+    /** An index that can't be read vouches for no file: they are deleted, not left on disk uncounted. */
+    @Test
+    fun `an unreadable index leaves no file uncounted`(@TempDir tmp: Path) {
+        runBlocking {
+            val paths = SegmentCache(cfg(tmp)).let { c -> listOf("a@id", "b@id").map { c.pathOf(it) } }
+            paths.forEach { path ->
+                path.parent.createDirectories()
+                path.writeBytes(ByteArray(1024) { 0x77 })
+            }
+            tmp.resolve("index.json").writeText("""{"entries":[{"artic""")
+
+            val cache = SegmentCache(cfg(tmp))
+            assertMatchesDisk(cache, tmp)
+        }
+    }
+
+    /** What a save keeps that the files' times don't: which entries were read since they were written. */
+    @Test
+    fun `save keeps the order of reads across a kill`(@TempDir tmp: Path) {
+        runBlocking {
+            val payload = ByteArray(1024) { 0x12 }
+            SegmentCache(cfg(tmp, maxBytes = 3 * 1024)).let { killed ->
+                listOf("a@id", "b@id", "c@id").forEach { id -> killed.getOrFetch(id) { payload } }
+                assertNotNull(killed.get("a@id"))
+                killed.save()
+            }
+
+            val cache = SegmentCache(cfg(tmp, maxBytes = 3 * 1024))
+            cache.getOrFetch("d@id") { payload }
+            assertNotNull(cache.get("a@id"), "a, the last read, was evicted")
+            assertNull(cache.get("b@id"), "b, the least recently used, is still cached")
         }
     }
 
