@@ -613,6 +613,55 @@ class PrepareNeededFilesTest {
     }
 
     /**
+     * par2cmdline spreads a recovery volume's critical packets (its Main packet, then its file
+     * descriptions and their slices' checksums, by file id) evenly between its slices: a volume of
+     * three, the smallest when the volumes are sized alike, names some files after its first slice
+     * and the rest after its second. It is read past a slice until its descriptions cover every
+     * file its Main packet lists, so every obfuscated volume is named, and in its place (NR-4, NR-6).
+     */
+    @ParameterizedTest
+    @ValueSource(strings = ["RAR4", "RAR5"])
+    fun `a recovery volume whose file descriptions are spread between its slices names every volume`(type: ContainerType) {
+        val payload = bytes("movie", 400_000)
+        val named = volumes("Movie.2020", "Movie.2020.mkv", payload, type)
+        assertEquals(7, named.size)
+        named.forEachIndexed { v, (_, data) -> post(OBFUSCATED[v], data) }
+        post("0b1c2d3e.vol000+003.par2", buildPar2File(named, recoveryBlock = 8 * 1024, slices = 3))
+        post("0b1c2d3e.vol003+004.par2", buildPar2File(named, recoveryBlock = 8 * 1024, slices = 4))
+
+        withStreamer { streamer, server ->
+            val prepared = assertIs<PrepareResult.Success>(streamer.prepare(nzb()), "prepare")
+            assertEquals(named.map { it.first }, prepared.metadata.response.volumes)
+            assertContentEquals(payload, streamer.streamed(prepared))
+            assertTrue(firstArticle("0b1c2d3e.vol003+004.par2") !in server.bodiesRead, "the larger recovery volume was fetched")
+        }
+    }
+
+    /**
+     * Obfuscated volumes the PAR2 data names beside one it doesn't: ordered by those names, the
+     * unnamed one would follow them wherever it goes. Without RAR5 headers to place it, the release
+     * fails rather than open out of order; RAR5 volumes open in the order their headers give (NR-4).
+     */
+    @ParameterizedTest
+    @ValueSource(strings = ["RAR4", "RAR5"])
+    fun `volumes the PAR2 data names beside one it doesn't open only where headers place them`(type: ContainerType) {
+        val payload = bytes("movie", 200_000)
+        val named = volumes("Movie.2020", "Movie.2020.mkv", payload, type)
+        named.forEachIndexed { v, (_, data) -> post(OBFUSCATED[v], data) }
+        post("0b1c2d3e.par2", buildPar2File(named.filterIndexed { v, _ -> v != 1 }))
+
+        withStreamer { streamer, _ ->
+            val result = streamer.prepare(nzb())
+            if (type == ContainerType.RAR4) {
+                val failure = assertIs<PrepareResult.Failure>(result, "prepare")
+                assertTrue(OBFUSCATED[1] in failure.message, failure.message)
+            } else {
+                assertContentEquals(payload, streamer.streamed(assertIs<PrepareResult.Success>(result, "prepare")))
+            }
+        }
+    }
+
+    /**
      * A recovery volume that names its files before its recovery block is read no further than
      * them: its block, which can be tens of MB, is neither held nor downloaded (N53).
      */
@@ -688,6 +737,6 @@ class PrepareNeededFilesTest {
 
     private companion object {
         /** Names that look like an obfuscating poster's, one per volume. */
-        val OBFUSCATED = listOf("a8f7d6e5", "b91c2d3e", "c07e4f1a", "d2b5a9c4", "e6f3c8b1", "f4a1d7e9")
+        val OBFUSCATED = listOf("a8f7d6e5", "b91c2d3e", "c07e4f1a", "d2b5a9c4", "e6f3c8b1", "f4a1d7e9", "a3e9c2f7", "b8d4e1a6")
     }
 }

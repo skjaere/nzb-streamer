@@ -162,11 +162,13 @@ internal class ReleaseFiles(files: List<NzbFile>) {
          * content shows to be a volume whose name places it in a set the release doesn't open is
          * another archive's (an extra's), none of the release's: it is left as before N52 (NR-14).
          * A set whose volumes skip one ([skipping]) lacks it as one that lacks a volume the PAR2 data
-         * names does (NR-13).
+         * names does (NR-13). A volume known by its content alone that nothing places, beside
+         * others the PAR2 data names, is [Found.Unplaced] too ([unplacedBesideNamed]).
          */
         fun found(unknown: Map<Int, ArticleNotFoundException>): Found {
             if (byContent) unknown.minByOrNull { it.key }?.let { return Found.Missing(it.value) }
             val hashes = hashes()
+            unplacedBesideNamed(hashes)?.let { return Found.Unplaced(nameOf(it)) }
             val openedSets = opened(hashes, emptyMap())
             val held = kept.mapNotNull { par2Name(it, hashes) ?: names[it] }.map { it.lowercase() }.toMutableSet()
             val found = mutableMapOf<Int, String>()
@@ -196,6 +198,24 @@ internal class ReleaseFiles(files: List<NzbFile>) {
                 incomplete.putIfAbsent(first, cause)
             }
             return Found.Volumes(found, incomplete)
+        }
+
+        /**
+         * Of the kept files that are archive volumes by their content alone (posted under names
+         * that tell nothing), one that nothing places (no PAR2 name nor its own name, nor a RAR5
+         * header that numbers it) while others are named (by the PAR2 data, or their own names):
+         * ordered by those names, it would follow them wherever it goes (NR-4). Null when there is
+         * none, or none of them is named. RAR5 volumes are placed by their headers, the named and
+         * the unnamed together.
+         */
+        private fun unplacedBesideNamed(hashes: Map<Int, String>): Int? {
+            val (named, unnamed) = kept.filter { roles[it] == Role.UNKNOWN && VolumeNames.isArchive(files[it].first16kb) }
+                .partition { i ->
+                    par2Name(i, hashes)?.let(VolumeNames::isVolume) == true ||
+                        (files[i].yencHeaders?.name ?: names[i])?.let(VolumeNames::of) != null
+                }
+            if (named.isEmpty()) return null
+            return unnamed.firstOrNull { files[it].first16kb?.let(Rar5Parser::volumeNumber) == null }
         }
 
         /**
