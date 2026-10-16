@@ -1,6 +1,7 @@
 package io.skjaere.nzbstreamer
 
 import io.ktor.utils.io.toByteArray
+import io.skjaere.compressionutils.MalformedSevenZipArchiveException
 import io.skjaere.compressionutils.generation.ArchiveGenerator
 import io.skjaere.compressionutils.generation.ContainerType
 import io.skjaere.nzbstreamer.config.NntpConfig
@@ -378,7 +379,7 @@ class PrepareNeededFilesTest {
     /**
      * A 7z set's volume past the first has no signature: without a PAR2 index its content can't
      * tell it is one. The set lacks it, and its end header lies past the end of what it holds, so
-     * the release fails rather than opening without it (N52).
+     * the release fails rather than opening without it (N52), as a malformed archive (NR-20).
      */
     @Test
     fun `a 7z volume posted under another extension fails a release without a PAR2 index`() {
@@ -386,7 +387,8 @@ class PrepareNeededFilesTest {
             .forEachIndexed { v, (name, data) -> post(if (v == 1) "Movie.2020.7z.002.bin" else name, data) }
 
         withStreamer { streamer, _ ->
-            assertIs<PrepareResult.Failure>(streamer.prepare(nzb()), "prepare")
+            val result = assertIs<PrepareResult.Failure>(streamer.prepare(nzb()), "prepare")
+            assertTrue(result.cause.firstCauseOfType<MalformedSevenZipArchiveException>() != null, "${result.cause}")
         }
     }
 

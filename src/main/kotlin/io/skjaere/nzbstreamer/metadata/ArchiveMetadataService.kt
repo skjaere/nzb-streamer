@@ -125,9 +125,10 @@ class ArchiveMetadataService(
      * classifies its own: an article no provider has, or a volume the volumes' headers show the
      * release lacks ([MissingArchiveVolumeException], NR-21), is [PrepareResult.MissingArticles];
      * an NNTP failure (a connection that dropped, a timeout) or an archive the parser can't read
-     * ([io.skjaere.compressionutils.MalformedRarArchiveException], volumes whose headers give one
-     * place, its other IOExceptions) is a [PrepareResult.Failure] with [e] as the cause. Null for
-     * anything else, a bug, which is thrown.
+     * ([io.skjaere.compressionutils.MalformedRarArchiveException], a 7z set whose headers lie past
+     * the end of its volumes, [io.skjaere.compressionutils.MalformedSevenZipArchiveException] (NR-20),
+     * volumes whose headers give one place, its other IOExceptions) is a [PrepareResult.Failure] with
+     * [e] as the cause. Null for anything else, a bug, which is thrown.
      */
     private fun classifyHeaderWalkFailure(e: Exception): PrepareResult? {
         e.firstCauseOfType<ArticleNotFoundException>()?.let { cause ->
