@@ -29,6 +29,8 @@ class PrepareNeededFilesTest {
     private val articles = mutableMapOf<String, ByteArray>()
     private val files = mutableListOf<String>()
     private val missing = mutableSetOf<String>()
+    // Articles whose answer the connection drops in (after 100 bytes), every time one is asked for.
+    private val dropped = mutableSetOf<String>()
     private val servers = mutableListOf<FakeNntpServer>()
 
     @AfterEach
@@ -83,7 +85,10 @@ class PrepareNeededFilesTest {
         """<nzb xmlns="http://www.newzbin.com/DTD/2003/nzb">${files.joinToString("")}</nzb>""").toByteArray()
 
     private fun <T> withStreamer(block: suspend (NzbStreamer, FakeNntpServer) -> T): T {
-        val server = FakeNntpServer(body = { id -> articles[id].takeUnless { id in missing } }).also { servers += it }
+        val server = FakeNntpServer(
+            body = { id -> articles[id].takeUnless { id in missing } },
+            dropAfter = { id -> 100.takeIf { id in dropped } },
+        ).also { servers += it }
         return NzbStreamer.fromConfig(NntpConfig("127.0.0.1", server.port, "", "", useTls = false, maxConnections = 4))
             .use { runBlocking { block(it, server) } }
     }
@@ -733,18 +738,64 @@ class PrepareNeededFilesTest {
     }
 
     /**
-     * Guard for N53: a recovery volume whose block, ahead of its file descriptions, is bigger than
-     * prepare reads of it is left after its first article.
+     * A recovery volume whose block, ahead of its file descriptions, is bigger than prepare reads of
+     * a PAR2 file is read from past it: the block's length is in the first 16 KB, so its articles are
+     * never fetched, and it names the volumes however big it is (NR-7).
      */
     @Test
-    fun `a recovery volume too big to read to its file descriptions is left after its first article`() {
+    fun `a recovery volume whose block is bigger than prepare reads names the volumes, its block not fetched`() {
         val named = volumes("Movie.2020", "Movie.2020.mkv", bytes("movie", 200_000))
-        named.indices.forEach { v -> post(OBFUSCATED[v], named[v].second) }
+        named.indices.reversed().forEach { v -> post(OBFUSCATED[v], named[v].second) }
         val ids = post("0b1c2d3e.vol00+01.par2", buildPar2File(named, recoveryBlock = 17 * 1024 * 1024), partSize = 512 * 1024)
 
         withStreamer { streamer, server ->
-            assertIs<PrepareResult.Success>(streamer.prepare(nzb()), "prepare")
-            assertEquals(listOf(ids.first()), ids.filter { it in server.bodiesRead }, "articles of the recovery volume downloaded")
+            val prepared = assertIs<PrepareResult.Success>(streamer.prepare(nzb()), "prepare")
+            assertEquals(named.map { it.first }, prepared.metadata.response.volumes)
+            assertEquals(listOf(ids.first(), ids.last()), ids.filter { it in server.bodiesRead }, "articles of the recovery volume downloaded")
+        }
+    }
+
+    /**
+     * The recovery volume standing in for the PAR2 index is read from past its block, so an article
+     * of the block that no provider has doesn't keep it from naming the volumes (NR-7).
+     */
+    @Test
+    fun `a recovery volume's block isn't fetched, so an article of it no provider has doesn't lose its names`() {
+        val payload = bytes("movie", 200_000)
+        val named = volumes("Movie.2020", "Movie.2020.mkv", payload)
+        named.indices.reversed().forEach { v -> post(OBFUSCATED[v], named[v].second) }
+        val ids = post("0b1c2d3e.vol00+01.par2", buildPar2File(named, recoveryBlock = 1024 * 1024))
+        missing += ids[5]
+
+        withStreamer { streamer, server ->
+            val prepared = assertIs<PrepareResult.Success>(streamer.prepare(nzb()), "prepare")
+            assertEquals(named.map { it.first }, prepared.metadata.response.volumes)
+            assertContentEquals(payload, streamer.streamed(prepared))
+            assertEquals(listOf(ids.first(), ids.last()), ids.filter { it in server.bodiesRead }, "articles of the recovery volume downloaded")
+        }
+    }
+
+    /**
+     * A recovery volume read in place of the PAR2 index only names files: one whose read fails any
+     * way (here the connection drops in an article of it every time, the one with its descriptions,
+     * or its first when it is fetched because the index lacks its own) names nothing, and the
+     * release opens as it would without it, here in the order its RAR5 headers give (NR-7).
+     */
+    @ParameterizedTest
+    @ValueSource(booleans = [false, true])
+    fun `a recovery volume whose read fails names nothing and fails nothing`(indexLacking: Boolean) {
+        val payload = bytes("movie", 200_000)
+        val named = volumes("Movie.2020", "Movie.2020.mkv", payload)
+        named.indices.reversed().forEach { v -> post(OBFUSCATED[v], named[v].second) }
+        if (indexLacking) missing += post("0b1c2d3e.par2", buildPar2File(named)).first()
+        val ids = post("0b1c2d3e.vol00+01.par2", buildPar2File(named, recoveryBlock = 64 * 1024))
+        val failing = if (indexLacking) ids.first() else ids.last()
+        dropped += failing
+
+        withStreamer { streamer, server ->
+            val result = streamer.prepare(nzb())
+            assertContentEquals(payload, streamer.streamed(assertIs<PrepareResult.Success>(result, "prepare: $result")))
+            assertTrue(failing in server.bodiesRead, "the recovery volume wasn't read")
         }
     }
 

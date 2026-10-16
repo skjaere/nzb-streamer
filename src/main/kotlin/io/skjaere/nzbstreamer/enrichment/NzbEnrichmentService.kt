@@ -32,8 +32,14 @@ class NzbEnrichmentService(
     companion object {
         const val DEFAULT_ENRICHMENT_CONCURRENCY = 8
 
-        // How far a recovery volume standing in for a PAR2 index is read for its file descriptions.
-        private const val STAND_IN_READ_LIMIT = 16L * 1024 * 1024
+        // How many bytes of a PAR2 file are read for its file descriptions past its first 16 KB, in
+        // how many reads: one, and one past each recovery slice skipped ([SKIP_OVER]), whose bytes
+        // aren't read (NR-7).
+        private const val PAR2_READ_LIMIT = 16L * 1024 * 1024
+        private const val MAX_PAR2_READS = 16
+
+        // A recovery slice this big or bigger is skipped by reading on from past it, not read through.
+        private const val SKIP_OVER = 1024L * 1024
     }
     private val logger = LoggerFactory.getLogger(NzbEnrichmentService::class.java)
     private val registry = Metrics.globalRegistry
@@ -254,24 +260,24 @@ class NzbEnrichmentService(
      * Reads the file descriptions of the release's smallest recovery volume into its par2Data, in
      * place of a PAR2 index's (it has none, or the one it has lacks an article), fetching its first
      * article first when it wasn't with the rest. Its index, or null when the release has none or
-     * it lacks its first article. It is read as it streams ([Par2Packets]): its recovery blocks
-     * skipped, never held, no further than [STAND_IN_READ_LIMIT] bytes nor past a block that
-     * follows its descriptions. One bigger than that with none in its first 16 KB is left there.
+     * that first article can't be fetched. It is read as [readPar2] reads a PAR2 file: its recovery
+     * block not read at all, however big (NR-7); a read that fails, any way, leaves it naming nothing.
      */
     private suspend fun readStandIn(nzb: NzbDocument, release: ReleaseFiles): Int? {
         val i = release.recoveryStandIn ?: return null
         val file = nzb.files[i]
         if (i !in release.toFetch) {
             enrichmentFiles.increment()
-            fetchFirstArticles(nzb, listOf(i)) { _, e ->
-                logger.warn("Going on without recovery volume {}, which lacks its first article: {}", release.nameOf(i), e.message)
+            try {
+                fetchFirstArticles(nzb, listOf(i)) { _, e -> throw e }
+            } catch (@Suppress("TooGenericExceptionCaught") e: Exception) {
+                rethrowCancellation(e)
+                logger.warn("Going on without recovery volume {}, whose first article can't be fetched: {}", release.nameOf(i), e.message)
+                return null
             }
         }
-        val size = file.yencHeaders?.size ?: return null
-        if (file.first16kb?.let(Par2Parser::isPar2) != true) return null
-        if (size <= STAND_IN_READ_LIMIT || namesFiles(file.first16kb)) {
-            withTimedPermit { readPar2(file, minOf(size, STAND_IN_READ_LIMIT)) }
-        }
+        if (file.yencHeaders == null || file.first16kb?.let(Par2Parser::isPar2) != true) return null
+        withTimedPermit { readPar2(file, standIn = true) }
         return i
     }
 
@@ -284,25 +290,51 @@ class NzbEnrichmentService(
 
     /**
      * Reads the file descriptions (its FileDesc packets) of the PAR2 file [file] into its par2Data
-     * as it streams, no further than [limit] bytes nor past a recovery block that follows them: its
-     * other packets, recovery blocks among them, are skipped, never held ([Par2Packets]). One that
-     * lacks an article is left without: it only names files, and the release opens without it.
+     * ([Par2Packets]): from its first 16 KB, then as it streams from where those end, its other
+     * packets skipped, never held. A recovery slice in the way of them, whose length its header
+     * gives, isn't read at all when it is [SKIP_OVER] bytes or more (or runs past the 16 KB): the
+     * next read starts past it, so a recovery volume's block is never downloaded (NR-7). No more
+     * than [PAR2_READ_LIMIT] bytes are read, in [MAX_PAR2_READS] reads. It only names files, and the
+     * release opens without it: an index that lacks an article is left without, and so is a
+     * recovery volume standing in for one ([standIn]) whose read fails any way.
      */
-    private suspend fun readPar2(file: NzbFile, limit: Long = file.yencHeaders?.size ?: 0L) {
+    private suspend fun readPar2(file: NzbFile, standIn: Boolean = false) {
+        val size = file.yencHeaders?.size ?: return
         logger.debug("Reading PAR2 file: {}", file.yencHeaders?.name)
-        val queue = SegmentQueueService.createRangeQueue(NzbDocument(listOf(file)), 0, limit)
+        val packets = Par2Packets()
+        var stop = packets.read(ByteReadChannel(file.first16kb ?: ByteArray(0)), 0)
+        var left = PAR2_READ_LIMIT
+        var reads = 0
         try {
-            // Few segments ahead: one that names its files before its blocks is left there.
-            streamingService.streamSegments(queue, concurrency = 2, readAheadSegments = 2, name = "par2:${file.yencHeaders?.name}") { channel ->
-                file.par2Data = Par2Packets.fileDescriptions(channel)
+            while (reads < MAX_PAR2_READS && left > 0) {
+                val at = when (val s = stop) {
+                    Par2Packets.Stop.Done -> break
+                    is Par2Packets.Stop.Next -> s.at
+                    is Par2Packets.Stop.End -> s.at
+                }
+                // Past the end (a slice that claims more than the file holds, its end wrapped round included).
+                if (at !in 0 until size) break
+                val queue = SegmentQueueService.createRangeQueue(NzbDocument(listOf(file)), at, minOf(size - at, left))
+                val before = packets.bytesRead
+                // Few segments ahead: one that names its files before its blocks is left there.
+                streamingService.streamSegments(queue, concurrency = 2, readAheadSegments = 2, name = "par2:${file.yencHeaders?.name}") { channel ->
+                    stop = packets.read(channel, at, SKIP_OVER)
+                }
+                left -= packets.bytesRead - before
+                reads++
             }
         } catch (@Suppress("TooGenericExceptionCaught") e: Exception) {
             rethrowCancellation(e)
-            val missing = e.firstCauseOfType<ArticleNotFoundException>() ?: throw e
+            val missing = e.firstCauseOfType<ArticleNotFoundException>()
+            if (missing == null && !standIn) throw e
             file.par2Data = null
-            logger.warn("Going on without PAR2 file {}, which lacks an article: {}", file.yencHeaders?.name, missing.message)
+            logger.warn(
+                "Going on without PAR2 file {}, which {}: {}",
+                file.yencHeaders?.name, if (missing != null) "lacks an article" else "couldn't be read", (missing ?: e).message,
+            )
             return
         }
+        file.par2Data = packets.descriptions
         logger.debug("Read PAR2 file: {} ({} bytes of file descriptions)", file.yencHeaders?.name, file.par2Data?.size)
     }
 }
