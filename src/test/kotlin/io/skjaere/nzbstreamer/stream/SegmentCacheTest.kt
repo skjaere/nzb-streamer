@@ -2,6 +2,7 @@ package io.skjaere.nzbstreamer.stream
 
 import io.skjaere.nzbstreamer.config.SegmentCacheConfig
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
@@ -15,6 +16,7 @@ import kotlinx.coroutines.joinAll
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.yield
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.io.TempDir
 import java.nio.file.Files
@@ -409,6 +411,70 @@ class SegmentCacheTest {
             cache.resize(8 * 1024)
             listOf("e@id", "f@id", "g@id").forEach { id -> cache.getOrFetch(id) { payload } }
             assertEquals(SegmentCache.Stats(5, 5 * 1024, 8 * 1024), cache.stats())
+        }
+    }
+
+    /**
+     * close ran save in runBlocking: on the one thread of a dispatcher where a save was under way
+     * (the main thread, say), it blocked the thread that save had to resume on to finish.
+     */
+    @Test
+    fun `close on the thread of a save in progress returns`(@TempDir tmp: Path) {
+        val cache = SegmentCache(cfg(tmp))
+        val executor = Executors.newSingleThreadExecutor { Thread(it, "main").apply { isDaemon = true } }
+        try {
+            runBlocking { cache.getOrFetch("a@id") { ByteArray(64) } }
+            // Not runBlocking's child: if close never returns, the join times out rather than hangs.
+            val done = CoroutineScope(executor.asCoroutineDispatcher()).launch {
+                launch { cache.save() }
+                // The save runs until it goes off to write; the close then runs while it is away.
+                yield()
+                cache.close()
+            }
+            runBlocking { withTimeout(10_000) { done.join() } }
+        } finally {
+            executor.shutdownNow()
+        }
+    }
+
+    @Test
+    fun `close writes the index only if it changed since the last save`(@TempDir tmp: Path) {
+        runBlocking {
+            val index = tmp.resolve("index.json")
+            SegmentCache(cfg(tmp)).let { cache ->
+                cache.getOrFetch("a@id") { ByteArray(64) }
+                cache.save()
+                Files.delete(index)
+                cache.close()
+                assertFalse(index.exists(), "close wrote an index nothing had changed")
+            }
+            SegmentCache(cfg(tmp)).let { cache ->
+                cache.save()
+                cache.getOrFetch("b@id") { ByteArray(64) }
+                Files.delete(index)
+                cache.close()
+                assertTrue(index.exists(), "close didn't write a changed index")
+                Files.delete(index)
+                cache.close()
+                assertFalse(index.exists(), "closing again wrote the index again")
+            }
+        }
+    }
+
+    /** Closed, the cache leaves its directory alone, so another instance can take it over. */
+    @Test
+    fun `a closed cache serves and stores nothing`(@TempDir tmp: Path) {
+        runBlocking {
+            val cache = SegmentCache(cfg(tmp))
+            cache.getOrFetch("a@id") { ByteArray(64) { 1 } }
+            cache.close()
+
+            assertNull(cache.get("a@id"))
+            val fetches = AtomicInteger()
+            assertContentEquals(ByteArray(64) { 2 }, cache.getOrFetch("b@id") { fetches.incrementAndGet(); ByteArray(64) { 2 } })
+            assertEquals(1, fetches.get())
+            assertEquals(1, segmentFiles(tmp).size, "a closed cache wrote a file")
+            assertContentEquals(ByteArray(64) { 1 }, SegmentCache(cfg(tmp)).get("a@id"))
         }
     }
 
