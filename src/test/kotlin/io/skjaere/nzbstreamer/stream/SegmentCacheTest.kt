@@ -321,6 +321,65 @@ class SegmentCacheTest {
         }
     }
 
+    /**
+     * Android deletes cache files to free storage, the app running, so one can go between the load's
+     * listing of its shard and its stat: the whole load failed, every file left uncounted (and never
+     * evicted). A link to nothing, with the segment's name, stands in for the file gone.
+     */
+    @Test
+    fun `a file gone during the load's walk leaves the rest counted`(@TempDir tmp: Path) {
+        runBlocking {
+            val ids = listOf("a@id", "b@id", "c@id", "gone@id")
+            val gone = SegmentCache(cfg(tmp)).use { c ->
+                ids.forEach { id -> c.getOrFetch(id) { payloadOf(id) } }
+                c.pathOf("gone@id")
+            }
+            Files.delete(gone)
+            Files.createSymbolicLink(gone, gone.resolveSibling("deleted"))
+
+            val cache = SegmentCache(cfg(tmp))
+            assertMatchesDisk(cache, tmp)
+            assertEquals(3, cache.stats().entryCount)
+            ids.dropLast(1).forEach { id -> assertContentEquals(payloadOf(id), cache.get(id), id) }
+            assertNull(cache.get("gone@id"))
+        }
+    }
+
+    /**
+     * A load that fails (here a shard directory it may not list) leaves on disk the files an older
+     * index doesn't vouch for. An index of this version saved after it vouched for them: the next load
+     * took them in, a write a kill cut short among them, as whole segments.
+     */
+    @Test
+    fun `after a failed load the files an older index doesn't list are still not taken in`(@TempDir tmp: Path) {
+        runBlocking {
+            val ids = listOf("listed@id", "cut@id")
+            val (paths, shards) = SegmentCache(cfg(tmp)).let { c ->
+                ids.map { c.pathOf(it) } to (ids + "new@id").map { c.pathOf(it).parent.name }
+            }
+            paths.forEach { path ->
+                path.parent.createDirectories()
+                path.writeBytes(ByteArray(1024) { 0x66 })
+            }
+            tmp.resolve("index.json").writeText("""{"entries":[{"articleId":"listed@id","size":1024,"lastAccessNanos":7}]}""")
+            val locked = tmp.resolve((0..255).map { "%02x".format(it) }.first { it !in shards }).createDirectories().toFile()
+            assertTrue(locked.setReadable(false))
+            try {
+                SegmentCache(cfg(tmp)).use { failed ->
+                    assertEquals(0, failed.stats().entryCount, "the load didn't fail")
+                    failed.getOrFetch("new@id") { ByteArray(512) { 0x67 } }
+                }
+            } finally {
+                locked.setReadable(true)
+            }
+
+            val cache = SegmentCache(cfg(tmp))
+            assertMatchesDisk(cache, tmp)
+            assertNull(cache.get("cut@id"), "a file the older index didn't list was taken in")
+            assertNotNull(cache.get("listed@id"))
+        }
+    }
+
     /** An index that can't be read vouches for no file: they are deleted, not left on disk uncounted. */
     @Test
     fun `an unreadable index leaves no file uncounted`(@TempDir tmp: Path) {

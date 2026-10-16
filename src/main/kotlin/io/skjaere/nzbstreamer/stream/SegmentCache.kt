@@ -18,6 +18,7 @@ import kotlinx.serialization.json.jsonPrimitive
 import org.slf4j.LoggerFactory
 import java.io.IOException
 import java.nio.file.Files
+import java.nio.file.NoSuchFileException
 import java.nio.file.Path
 import java.nio.file.StandardCopyOption
 import java.nio.file.attribute.BasicFileAttributes
@@ -118,10 +119,15 @@ class SegmentCache(private val config: SegmentCacheConfig) : AutoCloseable {
     private val indexTempPath: Path = config.cacheDir.resolve("index.json$TEMP_SUFFIX")
     private val evictThreshold: Long get() = (maxBytes.get() * config.evictThresholdRatio).toLong()
 
+    // Whether the index is saved: not after a load that failed before it deleted the files an older
+    // index, or none, doesn't vouch for. One of this version saved then would vouch for them, and the
+    // next load take them in, a write a kill cut short among them; left as it is, it deletes them.
+    private val savesIndex: Boolean
+
     init {
         require(config.maxBytes > 0) { "maxBytes must be > 0" }
         config.cacheDir.createDirectories()
-        load()
+        savesIndex = load()
 
         // Gauges read state on every scrape; AtomicLong satisfies Number, and the
         // index gauge reads .size unsynchronized — fine for a metric.
@@ -140,12 +146,13 @@ class SegmentCache(private val config: SegmentCacheConfig) : AutoCloseable {
      * whose file is gone is dropped, and one whose file isn't the size it gives (cut short, or
      * written over) is dropped and its file deleted, so the usage loaded is the bytes on disk.
      * Temporary files (writes or saves a kill cut short) are deleted. A failure leaves the cache
-     * empty.
+     * empty, and the files on disk to the next load. Whether the index may be saved ([savesIndex]).
      */
-    private fun load() {
-        runCatching {
+    private fun load(): Boolean {
+        var read: Listed? = null
+        return runCatching {
             indexTempPath.deleteIfExists()
-            val listed = readIndex()
+            val listed = readIndex().also { read = it }
             var takenIn = 0
             var deleted = 0
             for ((name, attributes) in scanSegmentFiles()) {
@@ -174,10 +181,12 @@ class SegmentCache(private val config: SegmentCacheConfig) : AutoCloseable {
             )
             val inStep = listed.current && takenIn == 0 && deleted == 0 && dropped == 0
             if (inStep || writeIndex(snapshot())) savedChanges = changes
-        }.onFailure {
+            true
+        }.getOrElse {
             logger.warn("Failed to load segment cache index, starting empty", it)
             index.clear()
             totalBytes.set(0)
+            read?.current == true
         }
     }
 
@@ -198,11 +207,15 @@ class SegmentCache(private val config: SegmentCacheConfig) : AutoCloseable {
         }
     }
 
-    /** The segment files under the cache directory, by name; temporary files are deleted on the way. */
+    /**
+     * The segment files under the cache directory, by name; temporary files are deleted on the way.
+     * One deleted meanwhile, or its shard's directory (as Android deletes cache files to free storage,
+     * the app running), is left out.
+     */
     private fun scanSegmentFiles(): Map<String, BasicFileAttributes> =
         config.cacheDir.listDirectoryEntries()
             .filter { it.isDirectory() && SHARD_NAME.matches(it.name) }
-            .flatMap { it.listDirectoryEntries() }
+            .flatMap { shard -> unlessGone { shard.listDirectoryEntries() }.orEmpty() }
             .mapNotNull { path ->
                 when {
                     path.name.endsWith(TEMP_SUFFIX) -> {
@@ -210,22 +223,31 @@ class SegmentCache(private val config: SegmentCacheConfig) : AutoCloseable {
                         null
                     }
                     SEGMENT_NAME.matches(path.name) && path.name.startsWith(path.parent.name) ->
-                        path.name to path.readAttributes<BasicFileAttributes>()
+                        unlessGone { path.readAttributes<BasicFileAttributes>() }?.let { path.name to it }
                     else -> null
                 }
             }
             .toMap()
 
+    /** What [read] reads, or null if it was deleted since it was listed. */
+    private inline fun <T> unlessGone(read: () -> T): T? = try {
+        read()
+    } catch (_: NoSuchFileException) {
+        null
+    }
+
     /**
      * Writes the index now. Only the index keeps when entries were last read (a file taken in on
      * load is stamped with its modification time): save it when the process may be killed, as
      * when an app goes to the background. Stores save it every 64 writes too. Writes nothing if
-     * the index hasn't changed since it was last written.
+     * the index hasn't changed since it was last written, nor after a load that failed with an
+     * older index or none (it is left for the next load to finish).
      */
     suspend fun save() = withContext(Dispatchers.IO) { saveNow() }
 
     /** [save], on the calling thread. */
     private fun saveNow() {
+        if (!savesIndex) return
         saveLock.withLock {
             val (snapshot, upTo) = indexLock.withLock { snapshot() to changes }
             if (upTo == savedChanges) return
