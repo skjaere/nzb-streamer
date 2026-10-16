@@ -202,9 +202,13 @@ internal class ReleaseFiles(private val files: List<NzbFile>) {
          * for the extension it was posted under), and the sets that lack a volume the PAR2 data
          * names, by one of their files with the cause. [Found.Missing] when the release can't open
          * whole: a set that lacks a volume isn't an episode's, or a file whose content was to tell
-         * lacks its first article, and may be a volume ([mayBeVolume]) of a set that isn't an
-         * episode's or that its name doesn't place it in (one that can't be a volume fails nothing,
-         * NR-3, NR-16); [Found.Unplaced] when nothing tells where a volume goes. One its
+         * lacks its first article, and is a volume the release lacks of a set that isn't an episode's
+         * or that nothing places it in: one its name places in a set the release opens, whatever its
+         * size (a set's last volume is smaller than the rest), or one its name places nowhere (or,
+         * where every set the release opens is named obfuscated, in a set of its own) that may be a
+         * volume by its size ([mayBeVolume]). One its name places where the release holds a volume,
+         * or in another archive, and one that can't be a volume fail nothing (NR-3, NR-16).
+         * [Found.Unplaced] when nothing tells where a volume goes. One its
          * content shows to be a volume whose name places it in a set the release doesn't open, by
          * any name it goes by ([opened]), is another archive's (an extra's), none of the release's:
          * it is left as before N52, but where every set the release opens is named obfuscated, so
@@ -216,19 +220,26 @@ internal class ReleaseFiles(private val files: List<NzbFile>) {
         fun found(unknown: Map<Int, ArticleNotFoundException>): Found {
             val hashes = hashes()
             val incomplete = mutableMapOf<Int, Exception>()
+            val openedSets = opened(hashes, emptyMap())
+            val held = kept.flatMap { listOfNotNull(par2Name(it, hashes) ?: names[it], files[it].yencHeaders?.name) }
+                .map { it.lowercase() }.toMutableSet()
             if (byContent) {
                 val setSizes = volumeSizes(hashes)
-                for ((i, cause) in unknown.toSortedMap().filterKeys { mayBeVolume(it, setSizes) }) {
-                    val placed = names[i]?.let(VolumeNames::of)
+                for ((i, cause) in unknown.toSortedMap()) {
+                    val placed = (files[i].yencHeaders?.name ?: names[i])?.let(VolumeNames::of)
+                    val lacked = when {
+                        placed == null -> mayBeVolume(i, setSizes)
+                        placed.lowercase() in held -> false
+                        stemOf(placed) in openedSets -> true
+                        else -> obfuscatedOnly(hashes) && mayBeVolume(i, setSizes)
+                    }
+                    if (!lacked) continue
                     val set = placed?.let { sets.firstOrNull { set -> stemOf(it) in stemsOf(set) } }
                     if (set == null || !setsApart) return Found.Missing(cause)
                     incomplete.putIfAbsent(set.first(), cause)
                 }
             }
             unplacedBesideNamed(hashes)?.let { return Found.Unplaced(nameOf(it)) }
-            val openedSets = opened(hashes, emptyMap())
-            val held = kept.flatMap { listOfNotNull(par2Name(it, hashes) ?: names[it], files[it].yencHeaders?.name) }
-                .map { it.lowercase() }.toMutableSet()
             val found = mutableMapOf<Int, String>()
             for (i in toCheck.filterNot { it in unknown }) {
                 val named = describedAs(i, hashes)
@@ -277,11 +288,12 @@ internal class ReleaseFiles(private val files: List<NzbFile>) {
             .mapValues { (_, set) -> set.maxOf(sizes::get) }
 
         /**
-         * Whether file [i], which lacks its first article, may be a volume of a set the release
-         * opens whose absence nothing else shows: one but the set's last, as big as its biggest
-         * ([volumeSizes]) by the size the NZB gives it, within the few bytes yEnc's escapes and
-         * names add to a volume posted as big. A bigger file is none of its volumes, and a smaller
-         * one could be its last only, whose absence isn't seen this way either (NR-3).
+         * Whether file [i], which lacks its first article and whose name doesn't place it in a set
+         * the release opens, may be a volume of one whose absence nothing else shows: one but the
+         * set's last, as big as its biggest ([volumeSizes]) by the size the NZB gives it, within the
+         * few bytes yEnc's escapes and names add to a volume posted as big. A bigger file is none of
+         * its volumes, and a smaller one could be its last only, which, under a name that doesn't
+         * place it, is seen missing no more than one not posted (NR-3).
          */
         private fun mayBeVolume(i: Int, volumeSizes: Map<String, Long>): Boolean =
             volumeSizes.values.any { size -> abs(sizes[i] - size) * SIZE_TOLERANCE <= size }

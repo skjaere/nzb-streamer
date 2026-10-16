@@ -559,6 +559,71 @@ class PrepareNeededFilesTest {
     }
 
     /**
+     * Without PAR2 data, a file beside the archive that lacks its first article and whose name
+     * places it in a set the release opens is that set's volume, whatever its size: a set's last
+     * volume is smaller than the rest. The release doesn't open without it (NR-3).
+     */
+    @ParameterizedTest
+    @CsvSource("RAR5, Movie.2020.part4.bin", "RAR4, Movie.2020.r02.bin")
+    fun `a set's last volume posted under another extension that lacks its first article fails the release`(
+        type: ContainerType,
+        postedAs: String,
+    ) {
+        val named = volumes("Movie.2020", "Movie.2020.mkv", bytes("movie", 200_000), type)
+        assertEquals(4, named.size)
+        named.forEachIndexed { v, (name, data) -> if (v == 3) missing += post(postedAs, data).first() else post(name, data) }
+
+        withStreamer { streamer, _ ->
+            val result = streamer.prepare(nzb())
+            assertIs<PrepareResult.MissingArticles>(result, "prepare: $result")
+        }
+    }
+
+    /** As a middle one, an episode's last volume posted under another extension that lacks its first article leaves out only that episode (NR-3). */
+    @ParameterizedTest
+    @ValueSource(strings = ["RAR5", "RAR4"])
+    fun `a season pack leaves out an episode whose last volume, posted under another extension, lacks its first article`(type: ContainerType) {
+        val episodes = (1..3).associate { e -> "Show.S01E0$e" to bytes("episode $e", 150_000) }
+        episodes.forEach { (base, data) ->
+            val named = volumes(base, "$base.mkv", data, type)
+            assertEquals(3, named.size)
+            named.forEachIndexed { v, (name, volume) ->
+                if (base == "Show.S01E02" && v == 2) missing += post("$name.bin", volume).first() else post(name, volume)
+            }
+        }
+
+        withStreamer { streamer, _ ->
+            val result = streamer.prepare(nzb())
+            val prepared = assertIs<PrepareResult.Success>(result, "prepare: $result")
+            assertEquals(listOf("Show.S01E01.mkv", "Show.S01E03.mkv"), streamer.resolveStreamableFiles(prepared.metadata).map { it.path })
+            assertContentEquals(episodes.getValue("Show.S01E03"), streamer.streamed(prepared, "Show.S01E03.mkv"))
+        }
+    }
+
+    /**
+     * A lacking file beside the archive whose name places it where the release holds a volume (a
+     * repost of one) or in another archive (an extra's, as one held is, NR-14) is none of the
+     * volumes the release lacks, whatever its size: it fails nothing (NR-3).
+     */
+    @ParameterizedTest
+    @ValueSource(strings = ["Movie.2020.part4.bin", "Extras.part1.bin"])
+    fun `a lacking file whose name places it as no volume the release lacks doesn't fail it`(beside: String) {
+        val payload = bytes("movie", 200_000)
+        val named = volumes("Movie.2020", "Movie.2020.mkv", payload)
+        named.forEach { (name, data) -> post(name, data) }
+        val data = if (beside.startsWith("Extras")) volumes("Extras", "Extras.mkv", bytes("extras", 100_000)).first().second else named.last().second
+        missing += post(beside, data).first()
+
+        withStreamer { streamer, server ->
+            val result = streamer.prepare(nzb())
+            val prepared = assertIs<PrepareResult.Success>(result, "prepare: $result")
+            assertEquals(named.map { it.first }, prepared.metadata.response.volumes)
+            assertContentEquals(payload, streamer.streamed(prepared))
+            assertTrue(firstArticle(beside) in server.bodiesRead, "the file beside the archive wasn't fetched")
+        }
+    }
+
+    /**
      * Each episode has its PAR2 index: the second's names the volume of its set posted under another
      * extension (N52). An index made over the season's folder names each file with its path in it,
      * matched by the name it ends in (NR-11).
