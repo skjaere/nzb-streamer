@@ -401,6 +401,58 @@ class PrepareNeededFilesTest {
     }
 
     /**
+     * Without PAR2 data the files beside the archive are fetched to tell by their content whether
+     * one is a volume posted under another extension. One that lacks its first article fails the
+     * release only when it may be a volume: a set's volumes but its last are as big as its biggest,
+     * so a proof picture, a subtitle or a featurette bigger than any volume can't be one (NR-3).
+     */
+    @ParameterizedTest
+    @ValueSource(strings = ["Movie.2020.Proof.jpg", "Movie.2020.eng.srt", "Movie.2020.Featurette.mkv"])
+    fun `a file beside the archive that can't be a volume and lacks its first article doesn't fail the release`(beside: String) {
+        val payload = bytes("movie", 200_000)
+        volumes("Movie.2020", "Movie.2020.mkv", payload).forEach { (name, data) -> post(name, data) }
+        missing += post(beside, bytes(beside, if (beside.endsWith(".mkv")) 300_000 else 20_000)).first()
+        post("Movie.2020.nfo", bytes("nfo", 1_000))
+
+        withStreamer { streamer, server ->
+            val prepared = assertIs<PrepareResult.Success>(streamer.prepare(nzb()), "prepare")
+            assertContentEquals(payload, streamer.streamed(prepared))
+            assertTrue(firstArticle(beside) in server.bodiesRead, "the file beside the archive wasn't fetched")
+        }
+    }
+
+    /**
+     * In a season pack whose sets open on their own, a file beside them that lacks its first
+     * article and may be a volume leaves out only the set its name places it in, and one that can't
+     * be a volume nothing; one that may be a volume whose name places it nowhere fails the pack (NR-16).
+     */
+    @ParameterizedTest
+    @CsvSource(
+        "RAR5, Show.S01E02.part2.bin, Show.S01E01.mkv|Show.S01E03.mkv", "RAR4, Show.S01E02.r00.bin, Show.S01E01.mkv|Show.S01E03.mkv",
+        "RAR5, Show.S01E02.eng.srt, Show.S01E01.mkv|Show.S01E02.mkv|Show.S01E03.mkv", "RAR5, x7f3k9q2.avi, ",
+    )
+    fun `a season pack leaves out only the set a lacking file beside it may be a volume of`(type: ContainerType, beside: String, listed: String?) {
+        val episodes = (1..3).associate { e -> "Show.S01E0$e" to bytes("episode $e", 150_000) }
+        episodes.forEach { (base, data) ->
+            volumes(base, "$base.mkv", data, type).forEachIndexed { v, (name, volume) ->
+                if (base == "Show.S01E02" && v == 1 && !beside.endsWith(".srt")) missing += post(beside, volume).first() else post(name, volume)
+            }
+        }
+        if (beside.endsWith(".srt")) missing += post(beside, bytes(beside, 20_000)).first()
+
+        withStreamer { streamer, _ ->
+            val result = streamer.prepare(nzb())
+            if (listed == null) {
+                assertIs<PrepareResult.MissingArticles>(result, "prepare")
+            } else {
+                val prepared = assertIs<PrepareResult.Success>(result, "prepare")
+                assertEquals(listed.split("|"), streamer.resolveStreamableFiles(prepared.metadata).map { it.path })
+                assertContentEquals(episodes.getValue("Show.S01E03"), streamer.streamed(prepared, "Show.S01E03.mkv"))
+            }
+        }
+    }
+
+    /**
      * Each episode has its PAR2 index: the second's names the volume of its set posted under another
      * extension (N52). An index made over the season's folder names each file with its path in it,
      * matched by the name it ends in (NR-11).
