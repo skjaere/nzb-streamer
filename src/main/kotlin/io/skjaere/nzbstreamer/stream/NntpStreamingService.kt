@@ -1453,30 +1453,26 @@ class NntpStreamingService(
         // back in the finally: a HALF_OPEN breaker has one, and if it's kept, the breaker stays
         // half-open with none and this pool is skipped until the process restarts.
         var settled = false
+        // Completed once the pool has handed a connection over: a timeout before that was the wait for one.
+        val connected = CompletableDeferred<Unit>()
         return try {
-            var result: ByteArray? = null
-            withTimeout(timeoutMs.milliseconds) {
-                // Read inside withClient, not through pool.bodyYenc: there a connection that drops
-                // mid-article fails only the Body channel's reader, outside withClient, and the
-                // segment fails. Read here, the failure is withClient's, and the pool fetches the
-                // article again on another connection (its command retry). Nothing is handed on
-                // before the whole segment is read, so no byte is delivered twice. Read whole, it
-                // is decoded straight into one array, not through a channel and copied out of it.
-                result = entry.pool.withClient(NntpPriority.STREAMING.value) { client ->
-                    client.bodyYencBytes("<$articleId>").data
-                }
+            // Read inside withClient, not through pool.bodyYenc: there a connection that drops
+            // mid-article fails only the Body channel's reader, outside withClient, and the
+            // segment fails. Read here, the failure is withClient's, and the pool fetches the
+            // article again on another connection (its command retry). Nothing is handed on
+            // before the whole segment is read, so no byte is delivered twice. Read whole, it
+            // is decoded straight into one array, not through a channel and copied out of it.
+            val payload = withConnectionWithin(entry.pool, timeoutMs, connected) { client ->
+                client.bodyYencBytes("<$articleId>").data
             }
-            val payload = result
-            if (payload != null) {
-                breaker?.onResult(
-                    System.nanoTime() - callStart,
-                    java.util.concurrent.TimeUnit.NANOSECONDS,
-                    payload,
-                )
-                settled = true
-                if (index > 0) {
-                    logger.debug("Segment <{}> served by fallback pool[{}]", shown, index)
-                }
+            breaker?.onResult(
+                System.nanoTime() - callStart,
+                java.util.concurrent.TimeUnit.NANOSECONDS,
+                payload,
+            )
+            settled = true
+            if (index > 0) {
+                logger.debug("Segment <{}> served by fallback pool[{}]", shown, index)
             }
             payload
         } catch (e: ArticleNotFoundException) {
@@ -1495,9 +1491,8 @@ class NntpStreamingService(
             // cancelled this coroutine too, and goes on up as the caller's.
             currentCoroutineContext().ensureActive()
             val poolName = entry.name
-            val timeout = SegmentTimeoutException(
-                articleId, timeoutMs, "Segment <$shown> timed out after ${timeoutMs}ms on pool[$index] ($poolName)", e,
-            )
+            val what = if (connected.isCompleted) "timed out after ${timeoutMs}ms" else "got no connection within ${timeoutMs}ms"
+            val timeout = SegmentTimeoutException(articleId, timeoutMs, "Segment <$shown> $what on pool[$index] ($poolName)", e)
             breaker?.onError(
                 System.nanoTime() - callStart,
                 java.util.concurrent.TimeUnit.NANOSECONDS,
@@ -1568,6 +1563,33 @@ class NntpStreamingService(
             null
         } finally {
             if (!settled) breaker?.releasePermission()
+        }
+    }
+
+    /**
+     * [fetch] on one of [pool]'s connections, given [timeoutMs] from when the pool hands one over.
+     * The wait for it (every connection fetching, or still reading off what a cancelled fetch left
+     * on the wire, or connecting) doesn't use that time up, and has [timeoutMs] of its own. The
+     * whole call, the pool's fetch again on another connection after one dropped included, has
+     * twice that. Any of them running out throws a [TimeoutCancellationException]; [connected] is
+     * completed once the pool has handed a connection over.
+     */
+    private suspend fun <T> withConnectionWithin(
+        pool: NntpClientPool,
+        timeoutMs: Long,
+        connected: CompletableDeferred<Unit>,
+        fetch: suspend (io.skjaere.nntp.NntpClient) -> T,
+    ): T = withTimeout(timeoutMs.milliseconds * 2) {
+        coroutineScope {
+            val call = async {
+                pool.withClient(NntpPriority.STREAMING.value) { client ->
+                    connected.complete(Unit)
+                    withTimeout(timeoutMs.milliseconds) { fetch(client) }
+                }
+            }
+            // A call that fails before it has a connection fails this scope, which ends the wait.
+            withTimeout(timeoutMs.milliseconds) { connected.await() }
+            call.await()
         }
     }
 

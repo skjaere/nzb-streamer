@@ -35,6 +35,10 @@ data class StreamingConfig(
      * timeout) would only fail on the OS-level keepalive timeout, which can be hours away —
      * during which the in-flight streamSegments coroutineScope cannot unwind and its
      * activeStreams counter stays stuck.
+     *
+     * It runs from when the pool hands the fetch a connection: a fetch queued behind the
+     * others for one isn't given less. The wait for a connection has as long again of its own,
+     * and a fetch on one pool, its retry on another connection included, twice this at most.
      */
     val segmentFetchTimeoutMs: Long = 5_000L,
     /**
