@@ -28,6 +28,7 @@ import kotlinx.coroutines.flow.asFlow
 import kotlinx.coroutines.flow.toList
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeoutOrNull
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.Test
 
@@ -79,36 +80,35 @@ class ReadAheadBytesTest {
         return writer.await()
     }
 
-    /** How many segments were asked for once no more have been for 300 ms (at most 10 s). */
-    private suspend fun settledAsks(): Int {
-        var last = -1
-        repeat(100) {
-            val now = asked.size
-            if (now == last) return now
-            last = now
-            delay(300)
-        }
+    /**
+     * How many segments were asked for once [expected] have been (waiting 10 s at most) and 500 ms
+     * more have passed, time for one more to be asked. Waiting until two counts agreed took none asked
+     * yet for all of them, when the first connect was slow.
+     */
+    private suspend fun asksAfter(expected: Int): Int {
+        withTimeoutOrNull(10_000) { while (asked.size < expected) delay(10) }
+        delay(500)
         return asked.size
     }
 
     @Test
     fun `a stream holds no more segments than its byte budget allows`() = runBlocking {
-        val service = service(StreamingConfig(readAheadBytes = 3L * segmentSize))
-        val writer = start(service)
-        // Nothing read yet: the writer waits on the first segment, two more downloaded behind it.
-        assertEquals(3, settledAsks(), "segments asked for before anything was read")
-        assertContentEquals(whole, writer.channel.toByteArray())
-        assertEquals(segments.indices.toList(), asked.sorted())
-        service.close()
+        service(StreamingConfig(readAheadBytes = 3L * segmentSize)).use { service ->
+            val writer = start(service)
+            // Nothing read yet: the writer waits on the first segment, two more downloaded behind it.
+            assertEquals(3, asksAfter(3), "segments asked for before anything was read")
+            assertContentEquals(whole, writer.channel.toByteArray())
+            assertEquals(segments.indices.toList(), asked.sorted())
+        }
     }
 
     @Test
     fun `a budget smaller than a segment still streams, a segment at a time`() = runBlocking {
-        val service = service(StreamingConfig(readAheadBytes = segmentSize / 2L))
-        val writer = start(service)
-        assertEquals(1, settledAsks(), "segments asked for before anything was read")
-        assertContentEquals(whole, writer.channel.toByteArray())
-        service.close()
+        service(StreamingConfig(readAheadBytes = segmentSize / 2L)).use { service ->
+            val writer = start(service)
+            assertEquals(1, asksAfter(1), "segments asked for before anything was read")
+            assertContentEquals(whole, writer.channel.toByteArray())
+        }
     }
 
     /**
@@ -122,44 +122,44 @@ class ReadAheadBytesTest {
         val short = file.copy(yencHeaders = file.yencHeaders!!.copy(size = 100L * whole.size, total = segments.size))
         val queue = SegmentQueueService.createFileQueue(short, 0, 0L)
         assertTrue(queue.toList().last().segmentDecodedSize > 50L * whole.size, "the last part is given the rest of the file")
-        val service = service(StreamingConfig(readAheadBytes = 3L * segmentSize))
-        val writer = start(service, queue)
-        assertEquals(3, settledAsks(), "segments asked for before anything was read")
-        assertContentEquals(whole, writer.channel.toByteArray())
-        service.close()
+        service(StreamingConfig(readAheadBytes = 3L * segmentSize)).use { service ->
+            val writer = start(service, queue)
+            assertEquals(3, asksAfter(3), "segments asked for before anything was read")
+            assertContentEquals(whole, writer.channel.toByteArray())
+        }
     }
 
     @Test
     fun `a segment larger than the budget is held alone, and those after it read ahead again`() = runBlocking {
         val items = SegmentQueueService.createFileQueue(file, 0, 0L).toList()
         val large = items.first().let { it.copy(segmentDecodedSize = 30L * segmentSize, readEnd = 30L * segmentSize) }
-        val service = service(StreamingConfig(readAheadBytes = 3L * segmentSize))
-        val writer = start(service, (listOf(large) + items.drop(1)).asFlow())
-        assertEquals(1, settledAsks(), "segments asked for before anything was read")
-        val first = ByteArray(segmentSize)
-        writer.channel.readFully(first)
-        assertContentEquals(segments[0], first)
-        assertEquals(4, settledAsks(), "segments asked for once the large one was read")
-        assertContentEquals(segments.drop(1).reduce { a, b -> a + b }, writer.channel.toByteArray())
-        service.close()
+        service(StreamingConfig(readAheadBytes = 3L * segmentSize)).use { service ->
+            val writer = start(service, (listOf(large) + items.drop(1)).asFlow())
+            assertEquals(1, asksAfter(1), "segments asked for before anything was read")
+            val first = ByteArray(segmentSize)
+            writer.channel.readFully(first)
+            assertContentEquals(segments[0], first)
+            assertEquals(4, asksAfter(4), "segments asked for once the large one was read")
+            assertContentEquals(segments.drop(1).reduce { a, b -> a + b }, writer.channel.toByteArray())
+        }
     }
 
     @Test
     fun `without a byte budget the read-ahead is counted in segments`() = runBlocking {
-        val service = service()
-        val writer = start(service)
-        // The one being written, the six read ahead and the one waiting to join them.
-        assertEquals(8, settledAsks(), "segments asked for before anything was read")
-        assertContentEquals(whole, writer.channel.toByteArray())
-        service.close()
+        service().use { service ->
+            val writer = start(service)
+            // The one being written, the six read ahead and the one waiting to join them.
+            assertEquals(8, asksAfter(8), "segments asked for before anything was read")
+            assertContentEquals(whole, writer.channel.toByteArray())
+        }
     }
 
     @Test
     fun `the byte budget can be changed for the streams opened next`() {
-        val service = service(StreamingConfig(readAheadBytes = 5_000_000))
-        assertEquals(5_000_000, service.getReadAheadBytes())
-        service.setReadAheadBytes(null)
-        assertEquals(null, service.getReadAheadBytes())
-        service.close()
+        service(StreamingConfig(readAheadBytes = 5_000_000)).use { service ->
+            assertEquals(5_000_000, service.getReadAheadBytes())
+            service.setReadAheadBytes(null)
+            assertEquals(null, service.getReadAheadBytes())
+        }
     }
 }
