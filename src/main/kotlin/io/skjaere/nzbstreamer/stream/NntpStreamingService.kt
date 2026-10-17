@@ -9,7 +9,6 @@ import io.ktor.network.selector.SelectorManager
 import io.ktor.utils.io.ByteReadChannel
 import io.ktor.utils.io.WriterJob
 import io.ktor.utils.io.cancel
-import io.ktor.utils.io.toByteArray
 import io.ktor.utils.io.writeFully
 import io.ktor.utils.io.writer
 import io.micrometer.core.instrument.Metrics
@@ -20,7 +19,6 @@ import io.skjaere.nntp.ArticleNotFoundException
 import io.skjaere.nntp.NntpClientPool
 import io.skjaere.nntp.NntpException
 import io.skjaere.nntp.StatResult
-import io.skjaere.nntp.YencEvent
 import io.skjaere.nntp.YencHeaders
 import io.skjaere.nzbstreamer.config.NntpConfig
 import io.skjaere.nzbstreamer.config.StreamingConfig
@@ -1462,13 +1460,10 @@ class NntpStreamingService(
                 // mid-article fails only the Body channel's reader, outside withClient, and the
                 // segment fails. Read here, the failure is withClient's, and the pool fetches the
                 // article again on another connection (its command retry). Nothing is handed on
-                // before the whole segment is read, so no byte is delivered twice.
-                entry.pool.withClient(NntpPriority.STREAMING.value) { client ->
-                    client.bodyYenc("<$articleId>").collect { event ->
-                        if (event is YencEvent.Body) {
-                            result = event.data.toByteArray()
-                        }
-                    }
+                // before the whole segment is read, so no byte is delivered twice. Read whole, it
+                // is decoded straight into one array, not through a channel and copied out of it.
+                result = entry.pool.withClient(NntpPriority.STREAMING.value) { client ->
+                    client.bodyYencBytes("<$articleId>").data
                 }
             }
             val payload = result
