@@ -249,6 +249,9 @@ class NntpStreamingService(
     @Volatile
     private var currentReadAheadSegments: Int = streamingConfig.readAheadSegments
 
+    @Volatile
+    private var currentReadAheadBytes: Long? = streamingConfig.readAheadBytes
+
     private val registry = Metrics.globalRegistry
     private val segmentsDownloaded = registry.counter("nzb.segments.downloaded")
     private val segmentsBytes = registry.counter("nzb.segments.bytes")
@@ -476,9 +479,17 @@ class NntpStreamingService(
         currentReadAheadSegments = value
     }
 
+    /** See [StreamingConfig.readAheadBytes]; null removes the limit. Applies to streams opened from now on. */
+    fun setReadAheadBytes(value: Long?) {
+        require(value == null || value > 0) { "readAheadBytes must be > 0, got $value" }
+        currentReadAheadBytes = value
+    }
+
     fun getStreamingConcurrency(): Int = currentConcurrency
 
     fun getReadAheadSegments(): Int = currentReadAheadSegments
+
+    fun getReadAheadBytes(): Long? = currentReadAheadBytes
 
     /**
      * Tries [block] on each pool in order. Falls back to the next pool on conditions
@@ -1082,6 +1093,7 @@ class NntpStreamingService(
         concurrency: Int = currentConcurrency,
         readAheadSegments: Int = currentReadAheadSegments,
         name: String = "unknown",
+        readAheadBytes: Long? = currentReadAheadBytes,
         consume: suspend (ByteReadChannel) -> Unit
     ) {
         val bitrate = acquireBitrateState(name)
@@ -1089,7 +1101,7 @@ class NntpStreamingService(
         val failure = java.util.concurrent.atomic.AtomicReference<Throwable?>()
         try {
             val early = coroutineScope {
-                val writerJob = launchStreamSegments(queue, concurrency, readAheadSegments, bitrate, name) {
+                val writerJob = launchStreamSegments(queue, concurrency, readAheadSegments, readAheadBytes, bitrate, name) {
                     failure.compareAndSet(null, it)
                 }
                 try {
@@ -1132,10 +1144,11 @@ class NntpStreamingService(
         queue: Flow<SegmentQueueItem>,
         concurrency: Int = currentConcurrency,
         readAheadSegments: Int = currentReadAheadSegments,
-        name: String = "unknown"
+        name: String = "unknown",
+        readAheadBytes: Long? = currentReadAheadBytes,
     ): WriterJob {
         val bitrate = acquireBitrateState(name)
-        val writerJob = launchStreamSegments(queue, concurrency, readAheadSegments, bitrate, name)
+        val writerJob = launchStreamSegments(queue, concurrency, readAheadSegments, readAheadBytes, bitrate, name)
         writerJob.job.invokeOnCompletion { releaseBitrateState(name) }
         return writerJob
     }
@@ -1150,6 +1163,7 @@ class NntpStreamingService(
         queue: Flow<SegmentQueueItem>,
         concurrency: Int,
         readAheadSegments: Int,
+        readAheadBytes: Long?,
         bitrate: BitrateState,
         name: String,
         onFailure: (Throwable) -> Unit = {},
@@ -1199,6 +1213,14 @@ class NntpStreamingService(
                     if (items.isEmpty()) return@coroutineScope
 
                     val downloadSemaphore = Semaphore(concurrency)
+                    // Segments downloaded or downloading that the channel hasn't taken yet, as many as
+                    // readAheadBytes holds of the largest (one at least): taken before a download
+                    // starts, given back once its bytes are written.
+                    val heldSegments = readAheadBytes?.let { budget ->
+                        val largest = items.filter { it.gap == null }.maxOfOrNull { it.segmentDecodedSize } ?: 1L
+                        (budget / largest.coerceAtLeast(1)).coerceIn(1, Int.MAX_VALUE.toLong()).toInt()
+                    }
+                    val held = heldSegments?.let { Semaphore(it) }
 
                     // The read-ahead downloads are children of a supervisor: one that fails (an
                     // article no provider has) cancels neither the others nor the writer. Its
@@ -1215,6 +1237,7 @@ class NntpStreamingService(
                                     send(item to unlisted)
                                     return@produce
                                 }
+                                held?.acquire()
                                 downloadSemaphore.acquire()
                                 if (index == 0) {
                                     tFirstAcq = System.nanoTime()
@@ -1263,15 +1286,16 @@ class NntpStreamingService(
                                         "Stream startup trace [{}] articleId={}: " +
                                             "resolved={}ms toList={}ms acquire={}ms async={}ms " +
                                             "send={}ms recv={}ms await={}ms write={}ms " +
-                                            "(items={}, concurrency={}, readAhead={})",
+                                            "(items={}, concurrency={}, readAhead={}, heldSegments={})",
                                         name, firstArticleId?.printable(),
                                         ms(tResolved), ms(tToList), ms(tFirstAcq), ms(tFirstAsync),
                                         ms(tFirstSend), ms(tFirstRecv), ms(tFirstAwait), ms(tFirstWrite),
-                                        items.size, concurrency, readAheadSegments,
+                                        items.size, concurrency, readAheadSegments, heldSegments ?: "unlimited",
                                     )
                                     firstArticleId = null
                                 }
                             }
+                            held?.release()
                         }
                     }
                 }

@@ -52,6 +52,14 @@ data class StreamingConfig(
      * the threshold count starts over and the breaker can re-open.
      */
     val circuitBreakerCooldownMs: Long = 60_000L,
+    /**
+     * The most a stream holds of segments it has downloaded, or is downloading, that its reader
+     * hasn't taken yet, counted at their decoded size: with segments this large or larger it
+     * downloads fewer at once and reads fewer ahead than [concurrency] and [readAheadSegments]
+     * allow (always one at least). Null: no limit in bytes, only those counts. An app on a small
+     * heap needs it: twelve segments read ahead of a release posted in 3.84 MB parts are 46 MB.
+     */
+    val readAheadBytes: Long? = null,
 )
 
 data class PrepareConfig(
