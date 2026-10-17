@@ -76,7 +76,12 @@ data class StreamingConfig(
      * segment cache.
      */
     val readAheadBytes: Long? = null,
-)
+) {
+    init {
+        // As NntpStreamingService.setReadAheadBytes: no bytes would stream a segment at a time.
+        require(readAheadBytes == null || readAheadBytes > 0) { "readAheadBytes must be > 0, got $readAheadBytes" }
+    }
+}
 
 data class PrepareConfig(
     val verifySegments: Boolean = false,

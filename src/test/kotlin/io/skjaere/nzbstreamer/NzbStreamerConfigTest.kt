@@ -15,6 +15,7 @@ import java.nio.file.Path
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
 import kotlin.test.assertIs
 import kotlin.test.assertNull
@@ -151,5 +152,13 @@ class NzbStreamerConfigTest {
             config.toString(),
         )
         assertFalse("horse" in "$config")
+    }
+
+    /** setReadAheadBytes refused a budget of no bytes, and a config took one: it streamed a segment at a time. */
+    @Test
+    fun `a streaming config refuses a read-ahead of no bytes`() {
+        listOf(0L, -1L).forEach { bytes -> assertFailsWith<IllegalArgumentException>("$bytes bytes") { StreamingConfig(readAheadBytes = bytes) } }
+        assertEquals(1L, StreamingConfig(readAheadBytes = 1).readAheadBytes)
+        assertNull(StreamingConfig().readAheadBytes)
     }
 }
