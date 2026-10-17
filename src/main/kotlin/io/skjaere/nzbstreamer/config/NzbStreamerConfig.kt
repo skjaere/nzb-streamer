@@ -57,11 +57,23 @@ data class StreamingConfig(
      */
     val circuitBreakerCooldownMs: Long = 60_000L,
     /**
-     * The most a stream holds of segments it has downloaded, or is downloading, that its reader
-     * hasn't taken yet, counted at their decoded size: with segments this large or larger it
-     * downloads fewer at once and reads fewer ahead than [concurrency] and [readAheadSegments]
-     * allow (always one at least). Null: no limit in bytes, only those counts. An app on a small
-     * heap needs it: twelve segments read ahead of a release posted in 3.84 MB parts are 46 MB.
+     * The most a stream holds of segments it has downloaded, or is downloading, and hasn't written
+     * to its channel yet: their decoded sizes, each rounded up to a whole 64 KiB, total at most
+     * this, except that one larger than this is held alone. With segments this large it downloads
+     * fewer at once and reads fewer ahead than [concurrency] and [readAheadSegments] allow (always
+     * one at least). Null: no limit in bytes, only those counts. An app on a small heap needs it:
+     * twelve segments read ahead of a release posted in 3.84 MB parts are 46 MB.
+     *
+     * The stream's channel isn't counted. A segment counts until its write returns, and meanwhile
+     * its bytes are in its array and copied into the channel. The write returns once less than
+     * 1 MiB waits in the channel, and the reader's side takes all that waits at once, so it may
+     * still hold the segment written last while the next one's copy waits. So with segments of
+     * 1 MiB or more a stream's segments take up to this plus two segments, and 1 MiB more if its
+     * reader waits for more than a byte at a time (it may then take more with under 1 MiB unread).
+     * Smaller ones are written on until 1 MiB waits, so each side may hold under 1 MiB beside a
+     * segment: with any sizes, up to this plus two segments and 3 MiB (under 5 MiB more with
+     * segments under 1 MiB). Nor are each download's socket and decoder buffers counted, or the
+     * segment cache.
      */
     val readAheadBytes: Long? = null,
 )

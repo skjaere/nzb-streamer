@@ -1219,7 +1219,8 @@ class NntpStreamingService(
                     // holds: a segment takes its units before its download starts and gives them back
                     // once its bytes are written. One larger than the budget takes all of it, so it is
                     // held alone, and a large one doesn't cut what the others hold. Only this producer
-                    // takes units, so taking several one at a time can't deadlock.
+                    // takes units, so taking several one at a time can't deadlock. What the channel
+                    // holds isn't counted: see StreamingConfig.readAheadBytes.
                     val heldUnits = readAheadBytes?.let { budget -> (budget / HELD_UNIT_BYTES).coerceIn(1, Int.MAX_VALUE.toLong()).toInt() }
                     val held = heldUnits?.let { Semaphore(it) }
                     fun unitsOf(item: SegmentQueueItem): Int =
