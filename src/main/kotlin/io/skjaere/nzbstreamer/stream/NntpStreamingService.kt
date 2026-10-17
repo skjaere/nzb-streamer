@@ -69,6 +69,9 @@ import kotlin.concurrent.write
 /** Smallest STAT batch worth a pipeline of its own. */
 private const val STAT_CHUNK_MIN = 32
 
+/** What a stream's read-ahead in bytes ([StreamingConfig.readAheadBytes]) is counted in. */
+private const val HELD_UNIT_BYTES = 64L * 1024
+
 /** A STAT answer that settles an article on a pool: a 223, or a 430. Any other is the pool failing. */
 private val StatResult.settles: Boolean
     get() = this is StatResult.Found || (this is StatResult.NotFound && code == 430)
@@ -1211,14 +1214,16 @@ class NntpStreamingService(
                     if (items.isEmpty()) return@coroutineScope
 
                     val downloadSemaphore = Semaphore(concurrency)
-                    // Segments downloaded or downloading that the channel hasn't taken yet, as many as
-                    // readAheadBytes holds of the largest (one at least): taken before a download
-                    // starts, given back once its bytes are written.
-                    val heldSegments = readAheadBytes?.let { budget ->
-                        val largest = items.filter { it.gap == null }.maxOfOrNull { it.segmentDecodedSize } ?: 1L
-                        (budget / largest.coerceAtLeast(1)).coerceIn(1, Int.MAX_VALUE.toLong()).toInt()
-                    }
-                    val held = heldSegments?.let { Semaphore(it) }
+                    // Segments downloaded or downloading that the channel hasn't taken yet, counted at
+                    // their decoded size in HELD_UNIT_BYTES (each rounded up), as many as readAheadBytes
+                    // holds: a segment takes its units before its download starts and gives them back
+                    // once its bytes are written. One larger than the budget takes all of it, so it is
+                    // held alone, and a large one doesn't cut what the others hold. Only this producer
+                    // takes units, so taking several one at a time can't deadlock.
+                    val heldUnits = readAheadBytes?.let { budget -> (budget / HELD_UNIT_BYTES).coerceIn(1, Int.MAX_VALUE.toLong()).toInt() }
+                    val held = heldUnits?.let { Semaphore(it) }
+                    fun unitsOf(item: SegmentQueueItem): Int =
+                        ((item.segmentDecodedSize - 1) / HELD_UNIT_BYTES + 1).coerceIn(1, heldUnits?.toLong() ?: 1).toInt()
 
                     // The read-ahead downloads are children of a supervisor: one that fails (an
                     // article no provider has) cancels neither the others nor the writer. Its
@@ -1235,7 +1240,7 @@ class NntpStreamingService(
                                     send(item to unlisted)
                                     return@produce
                                 }
-                                held?.acquire()
+                                held?.let { units -> repeat(unitsOf(item)) { units.acquire() } }
                                 downloadSemaphore.acquire()
                                 if (index == 0) {
                                     tFirstAcq = System.nanoTime()
@@ -1284,16 +1289,16 @@ class NntpStreamingService(
                                         "Stream startup trace [{}] articleId={}: " +
                                             "resolved={}ms toList={}ms acquire={}ms async={}ms " +
                                             "send={}ms recv={}ms await={}ms write={}ms " +
-                                            "(items={}, concurrency={}, readAhead={}, heldSegments={})",
+                                            "(items={}, concurrency={}, readAhead={}, readAheadBytes={})",
                                         name, firstArticleId?.printable(),
                                         ms(tResolved), ms(tToList), ms(tFirstAcq), ms(tFirstAsync),
                                         ms(tFirstSend), ms(tFirstRecv), ms(tFirstAwait), ms(tFirstWrite),
-                                        items.size, concurrency, readAheadSegments, heldSegments ?: "unlimited",
+                                        items.size, concurrency, readAheadSegments, readAheadBytes ?: "unlimited",
                                     )
                                     firstArticleId = null
                                 }
                             }
-                            held?.release()
+                            held?.let { units -> repeat(unitsOf(item)) { units.release() } }
                         }
                     }
                 }
