@@ -46,6 +46,8 @@ tasks.test {
         ?: "${System.getProperty("user.home")}/rapidyenc/build"
     systemProperty("jna.library.path", libPath)
     systemProperty("kotlinx.coroutines.test.default.timeout", "PT5M")
+    // SegmentCacheTest looks at the temporary direct buffers the JDK keeps per thread (sun.nio.ch.Util).
+    jvmArgs("--add-opens", "java.base/sun.nio.ch=ALL-UNNAMED")
 }
 
 publishing {

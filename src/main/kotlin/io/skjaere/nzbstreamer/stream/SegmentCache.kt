@@ -21,6 +21,7 @@ import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import org.slf4j.LoggerFactory
 import java.io.IOException
+import java.io.RandomAccessFile
 import java.nio.file.Files
 import java.nio.file.NoSuchFileException
 import java.nio.file.Path
@@ -39,7 +40,6 @@ import kotlin.io.path.listDirectoryEntries
 import kotlin.io.path.moveTo
 import kotlin.io.path.name
 import kotlin.io.path.readAttributes
-import kotlin.io.path.readBytes
 import kotlin.io.path.readText
 import kotlin.io.path.writeBytes
 import kotlin.io.path.writeText
@@ -313,7 +313,7 @@ class SegmentCache(private val config: SegmentCacheConfig) : AutoCloseable {
     }
 
     private suspend fun readEntry(articleId: String, entry: Entry): ByteArray? = withContext(Dispatchers.IO) {
-        val bytes = runCatching { pathFor(entry.name).readBytes() }
+        val bytes = runCatching { readWhole(pathFor(entry.name)) }
             .onFailure { logger.warn("Failed to read cached segment {}: {}", articleId, it.message) }
             .getOrNull()
         when {
@@ -335,6 +335,17 @@ class SegmentCache(private val config: SegmentCacheConfig) : AutoCloseable {
                 }
             }
         }
+    }
+
+    /**
+     * [path]'s bytes, read straight into the array. Path.readBytes reads through a temporary direct
+     * buffer of the file's size, which the JDK keeps for the thread's next read: Java heap on ART, a
+     * 3.84 MB one on every IO thread that had read a segment (library issue N98).
+     */
+    private fun readWhole(path: Path): ByteArray = RandomAccessFile(path.toFile(), "r").use { file ->
+        val length = file.length()
+        if (length > Int.MAX_VALUE) throw IOException("$path is $length bytes, too large for an array")
+        ByteArray(length.toInt()).also { file.readFully(it) }
     }
 
     /**

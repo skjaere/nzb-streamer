@@ -828,6 +828,33 @@ class SegmentCacheTest {
         assertContentEquals(replacement, path.readBytes())
     }
 
+    /**
+     * Path.readBytes read a segment through a temporary direct buffer of its size, which the JDK keeps
+     * for the thread that read (sun.nio.ch.Util's buffer cache) for its next read: on ART that's Java
+     * heap, a 3.84 MB buffer on each Dispatchers.IO thread that read a segment, 15-22 MB measured on
+     * an emulator, up to one per IO thread after seeks and replays (library issue N98).
+     */
+    @Test
+    fun `a cached segment is read without a temporary direct buffer kept on the thread`(@TempDir tmp: Path) = runBlocking<Unit> {
+        val cache = SegmentCache(cfg(tmp, maxBytes = 64_000_000L))
+        // Larger than any other test's segments, so a buffer an earlier read left on the thread can't serve it.
+        val payload = Random(98).nextBytes(6_000_000)
+        cache.getOrFetch("big@id") { payload }
+        // From an IO thread the cache reads on it (its own withContext(Dispatchers.IO) stays there): its buffers are this thread's.
+        val (read, kept) = withContext(Dispatchers.IO) { cache.get("big@id") to temporaryDirectBuffersOfThisThread() }
+        assertContentEquals(payload, read)
+        assertTrue(kept.none { it >= payload.size }, "temporary direct buffers kept on the thread: $kept bytes")
+    }
+
+    /** The capacities of the temporary direct buffers the JDK keeps for the calling thread (the test JVM opens sun.nio.ch for it). */
+    private fun temporaryDirectBuffersOfThisThread(): List<Int> {
+        val util = Class.forName("sun.nio.ch.Util")
+        val perThread = util.getDeclaredField("bufferCache").apply { isAccessible = true }.get(null) as ThreadLocal<*>
+        val cache = perThread.get() ?: return emptyList()
+        val buffers = cache.javaClass.getDeclaredField("buffers").apply { isAccessible = true }.get(cache) as Array<*>
+        return buffers.filterIsInstance<java.nio.ByteBuffer>().map { it.capacity() }
+    }
+
     @Test
     fun `get returns null for missing entry`(@TempDir tmp: Path) = runBlocking {
         val cache = SegmentCache(cfg(tmp))
