@@ -89,10 +89,17 @@ data class StreamingConfig(
      * The segments a stream downloads, its first ones, until its reader has taken the first one's
      * bytes (more where the writer needs them to tell, below): then the rest of its read-ahead
      * starts, as [concurrency], [readAheadSegments] and [readAheadBytes] allow. A player's first
-     * opens and a probe of the file read a few KB before they close or seek, and a media server's
+     * open and a probe of the file read a few KB before they close or seek, and a media server's
      * scan opens many streams that do: each started the whole read-ahead, a dozen segments of
      * 3.84 MB for a 4K remux. With two the first comes as soon as before, and the second is there
      * when the reader gets to it while the rest start. Null: the whole read-ahead at once.
+     *
+     * A file's stream starts with them only from the file's first byte, where those reads are. One
+     * opened further on (a seek, a resume, an index at the file's end) starts its whole read-ahead at
+     * once: its reader reads on, and a player waits for seconds of it before it plays, several
+     * segments of a high-bitrate release, all but two of which would come a segment's download later.
+     * The streams of segments a seekable stream reads through (archive headers, an encrypted file:
+     * [io.skjaere.nzbstreamer.seekable.NntpSeekableInputStream]) start with them wherever they start.
      *
      * The writer learns that its reader took bytes only from its writes waiting, as a write waits
      * while the channel holds 1 MiB the reader hasn't taken. So a stream of segments of 1 MiB or

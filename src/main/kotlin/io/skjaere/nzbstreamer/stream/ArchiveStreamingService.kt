@@ -129,7 +129,7 @@ class ArchiveStreamingService(
                 ).collect { emit(it) }
             }
         }
-        streamingService.streamSegments(combinedQueue, name = namedSplits.name, consume = consume)
+        streamingService.streamSegments(combinedQueue, name = namedSplits.name, initialReadAheadSegments = firstSegmentsFor(range), consume = consume)
     }
 
     /**
@@ -163,8 +163,19 @@ class ArchiveStreamingService(
                 ).collect { emit(it) }
             }
         }
-        return streamingService.launchStreamSegments(combinedQueue, name = namedSplits.name)
+        return streamingService.launchStreamSegments(combinedQueue, name = namedSplits.name, initialReadAheadSegments = firstSegmentsFor(range))
     }
+
+    /**
+     * The first segments a stream of a file's [range] starts with
+     * ([io.skjaere.nzbstreamer.config.StreamingConfig.initialReadAheadSegments]). From the file's
+     * first byte, where a player's first open, a probe of the file and a media server's scan read a
+     * few KB and stop, the configured few. From anywhere else (a seek, a resume, an index at the
+     * end) the whole read-ahead at once: a reader that opens there reads on, and a player waits for
+     * seconds of it, a few segments of a high-bitrate release, before it plays.
+     */
+    private fun firstSegmentsFor(range: LongRange?): Int? =
+        if (range == null || range.first == 0L) streamingService.getInitialReadAheadSegments() else null
 
     /**
      * Streams an encrypted RAR5 file by AES-CBC decrypting on the fly.

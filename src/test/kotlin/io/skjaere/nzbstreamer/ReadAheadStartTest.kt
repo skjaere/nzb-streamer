@@ -4,6 +4,7 @@ import io.ktor.utils.io.WriterJob
 import io.ktor.utils.io.cancel
 import io.ktor.utils.io.readFully
 import io.ktor.utils.io.toByteArray
+import io.skjaere.compressionutils.SplitInfo
 import io.skjaere.nntp.YencHeaders
 import io.skjaere.nzbstreamer.config.NntpConfig
 import io.skjaere.nzbstreamer.config.StreamingConfig
@@ -12,6 +13,8 @@ import io.skjaere.nzbstreamer.nzb.NzbFile
 import io.skjaere.nzbstreamer.nzb.NzbSegment
 import io.skjaere.nzbstreamer.queue.SegmentQueueItem
 import io.skjaere.nzbstreamer.queue.SegmentQueueService
+import io.skjaere.nzbstreamer.stream.ArchiveStreamingService
+import io.skjaere.nzbstreamer.stream.NamedSplits
 import io.skjaere.nzbstreamer.stream.NntpStreamingService
 import io.skjaere.nzbstreamer.stream.writesUntilFirstTaken
 import io.skjaere.yenc.YencEncoder
@@ -38,9 +41,10 @@ import org.junit.jupiter.api.Test
 /**
  * A stream's first segments ([StreamingConfig.initialReadAheadSegments]): the first two download
  * until its reader has taken the first one's bytes, then the whole read-ahead. A player's first
- * opens and the track probe read a few KB and close or seek: each queued the whole read-ahead, a
+ * open and the track probe read a few KB and close or seek: each queued the whole read-ahead, a
  * dozen 3.84 MB segments of a 4K remux, and a probe allocated 68-284 MB in under a second on an
- * emulator. A Plex scan through debridav opens many streams that read a few KB each.
+ * emulator. A Plex scan through debridav opens many streams that read a few KB each. A file's
+ * stream opened further on, a seek, gets its whole read-ahead at once.
  */
 class ReadAheadStartTest {
     private val servers = mutableListOf<FakeNntpServer>()
@@ -116,9 +120,12 @@ class ReadAheadStartTest {
         }
     }
 
-    /** A seek: the stream at the old position closed, one at the new opened. */
+    /**
+     * A stream of segments, as the seekable stream opens one at each of its seeks (archive headers,
+     * an encrypted file), starts with two wherever it starts: only a file's own streams look at where.
+     */
     @Test
-    fun `a stream opened further on starts with two segments again`() = runBlocking<Unit> {
+    fun `a stream of segments opened further on starts with two segments again`() = runBlocking<Unit> {
         service().use { service ->
             val first = start(service)
             first.channel.readFully(ByteArray(4096))
@@ -134,6 +141,47 @@ class ReadAheadStartTest {
             assertEquals(2, asksAfter(2), "segments asked for by the second stream")
             assertEquals(listOf(6, 7), asked.sorted())
             second.channel.cancel()
+        }
+    }
+
+    /** Starts streaming [range] of the file from a session coroutine, as the app does: the service's four at once, six read ahead. */
+    private suspend fun startFile(service: NntpStreamingService, range: LongRange): WriterJob {
+        val size = whole.size.toLong()
+        val writer = CompletableDeferred<WriterJob>()
+        sessions.launch {
+            writer.complete(ArchiveStreamingService(service).launchStreamFile(NzbDocument(listOf(file)), NamedSplits(listOf(SplitInfo(0, 0, size)), size, "data.bin"), range))
+        }
+        return writer.await()
+    }
+
+    /** A player's first open and a probe of the file read its first few KB and close or seek. */
+    @Test
+    fun `a file streamed from its start starts with two segments`() = runBlocking<Unit> {
+        service(StreamingConfig(concurrency = 4, readAheadSegments = 6)).use { service ->
+            val writer = startFile(service, 0L until whole.size)
+            writer.channel.readFully(ByteArray(4096))
+            assertEquals(2, asksAfter(2), "segments asked for by a reader that read 4 KB")
+            writer.channel.cancel()
+        }
+    }
+
+    /**
+     * A seek, a resume or a container's index: a reader that opens a file further on reads on, and a
+     * player waits for seconds of it before it plays. Two first would put most of those a segment's
+     * download behind.
+     */
+    @Test
+    fun `a file streamed from further on downloads its whole read-ahead at once`() = runBlocking<Unit> {
+        service(StreamingConfig(concurrency = 4, readAheadSegments = 6)).use { service ->
+            val from = 3L * segmentSize + 100
+            val writer = startFile(service, from until whole.size)
+            // Before anything is read: the one being written, the six read ahead and the one waiting to join them.
+            assertEquals(8, asksAfter(8), "segments asked for by a stream opened at $from")
+            assertEquals((3 until 11).toList(), asked.sorted())
+            val read = ByteArray(4096)
+            writer.channel.readFully(read)
+            assertContentEquals(whole.copyOfRange(from.toInt(), from.toInt() + read.size), read)
+            writer.channel.cancel()
         }
     }
 
