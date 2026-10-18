@@ -43,6 +43,7 @@ class NzbStreamerConfigTest {
             segmentFetchTimeoutMs = 1_234,
             circuitBreakerFailureThreshold = 9,
             circuitBreakerCooldownMs = 4_321,
+            initialReadAheadSegments = 3,
         )
         NzbStreamer.fromConfig(config(server()), streaming).use { streamer ->
             assertEquals(
@@ -53,6 +54,7 @@ class NzbStreamerConfigTest {
                     "segmentFetchTimeoutMs" to 1_234L,
                     "circuitBreakerFailureThreshold" to 9L,
                     "circuitBreakerCooldownMs" to 4_321L,
+                    "initialReadAheadSegments" to 3L,
                 ),
                 mapOf(
                     "concurrency" to streamer.getStreamingConcurrency().toLong(),
@@ -61,6 +63,7 @@ class NzbStreamerConfigTest {
                     "segmentFetchTimeoutMs" to streamer.getSegmentFetchTimeoutMs(),
                     "circuitBreakerFailureThreshold" to streamer.getCircuitBreakerFailureThreshold().toLong(),
                     "circuitBreakerCooldownMs" to streamer.getCircuitBreakerCooldownMs(),
+                    "initialReadAheadSegments" to streamer.getInitialReadAheadSegments()?.toLong(),
                 ),
             )
         }

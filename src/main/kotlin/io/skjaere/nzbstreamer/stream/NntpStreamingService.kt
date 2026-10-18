@@ -75,6 +75,41 @@ private const val STAT_CHUNK_MIN = 32
 /** What a stream's read-ahead in bytes ([StreamingConfig.readAheadBytes]) is counted in. */
 private const val HELD_UNIT_BYTES = 64L * 1024
 
+/** What a Ktor channel holds before its writer waits for the reader (Ktor's CHANNEL_MAX_SIZE). */
+private const val CHANNEL_HOLDS = 1L shl 20
+
+/**
+ * How many of a stream's first writes, of [sizes], it takes before the writer knows its reader has
+ * taken the first one's bytes, if the reader reads on; null if they never show it. The channel
+ * shows it only by making writes wait: a write returns once less than [CHANNEL_HOLDS] waits in it,
+ * and the reader takes all that waits whenever it has read all it took before (if it waits for a
+ * byte at a time). So a write of [CHANNEL_HOLDS] or more returns only once the reader has read all
+ * but what waited before it, and once any write returns the reader holds less than twice that and
+ * the largest write unread.
+ */
+internal fun writesUntilFirstTaken(sizes: Sequence<Long>): Int? {
+    var first = 0L
+    var written = 0L
+    var largest = 0L
+    // Once the last write returned: the most that may wait in the channel, and the least the reader has read.
+    var waiting = 0L
+    var read = 0L
+    sizes.forEachIndexed { i, size ->
+        if (i == 0) first = size
+        if (size >= CHANNEL_HOLDS) {
+            read = maxOf(read, written - waiting)
+            waiting = 0
+        } else {
+            waiting = minOf(waiting + size, CHANNEL_HOLDS - 1)
+        }
+        written += size
+        largest = maxOf(largest, size)
+        read = maxOf(read, written - waiting - (CHANNEL_HOLDS - 1 + largest))
+        if (i > 0 && read >= first) return i + 1
+    }
+    return null
+}
+
 /** A STAT answer that settles an article on a pool: a 223, or a 430. Any other is the pool failing. */
 private val StatResult.settles: Boolean
     get() = this is StatResult.Found || (this is StatResult.NotFound && code == 430)
@@ -262,6 +297,9 @@ class NntpStreamingService(
 
     @Volatile
     private var currentReadAheadBytes: Long? = streamingConfig.readAheadBytes
+
+    @Volatile
+    private var currentInitialReadAheadSegments: Int? = streamingConfig.initialReadAheadSegments
 
     private val registry = Metrics.globalRegistry
     private val segmentsDownloaded = registry.counter("nzb.segments.downloaded")
@@ -498,11 +536,19 @@ class NntpStreamingService(
         currentReadAheadBytes = value
     }
 
+    /** See [StreamingConfig.initialReadAheadSegments]; null starts the whole read-ahead at once. Applies to streams opened from now on. */
+    fun setInitialReadAheadSegments(value: Int?) {
+        require(value == null || value > 0) { "initialReadAheadSegments must be > 0, got $value" }
+        currentInitialReadAheadSegments = value
+    }
+
     fun getStreamingConcurrency(): Int = currentConcurrency
 
     fun getReadAheadSegments(): Int = currentReadAheadSegments
 
     fun getReadAheadBytes(): Long? = currentReadAheadBytes
+
+    fun getInitialReadAheadSegments(): Int? = currentInitialReadAheadSegments
 
     /**
      * Tries [block] on each pool in order. Falls back to the next pool on conditions
@@ -1168,6 +1214,7 @@ class NntpStreamingService(
         readAheadSegments: Int = currentReadAheadSegments,
         name: String = "unknown",
         readAheadBytes: Long? = currentReadAheadBytes,
+        initialReadAheadSegments: Int? = currentInitialReadAheadSegments,
         consume: suspend (ByteReadChannel) -> Unit
     ) {
         val bitrate = acquireBitrateState(name)
@@ -1175,7 +1222,7 @@ class NntpStreamingService(
         val failure = java.util.concurrent.atomic.AtomicReference<Throwable?>()
         try {
             val early = coroutineScope {
-                val writerJob = launchStreamSegments(queue, concurrency, readAheadSegments, readAheadBytes, bitrate, name) {
+                val writerJob = launchStreamSegments(queue, concurrency, readAheadSegments, readAheadBytes, initialReadAheadSegments, bitrate, name) {
                     failure.compareAndSet(null, it)
                 }
                 try {
@@ -1220,9 +1267,10 @@ class NntpStreamingService(
         readAheadSegments: Int = currentReadAheadSegments,
         name: String = "unknown",
         readAheadBytes: Long? = currentReadAheadBytes,
+        initialReadAheadSegments: Int? = currentInitialReadAheadSegments,
     ): WriterJob {
         val bitrate = acquireBitrateState(name)
-        val writerJob = launchStreamSegments(queue, concurrency, readAheadSegments, readAheadBytes, bitrate, name)
+        val writerJob = launchStreamSegments(queue, concurrency, readAheadSegments, readAheadBytes, initialReadAheadSegments, bitrate, name)
         writerJob.job.invokeOnCompletion { releaseBitrateState(name) }
         return writerJob
     }
@@ -1238,6 +1286,7 @@ class NntpStreamingService(
         concurrency: Int,
         readAheadSegments: Int,
         readAheadBytes: Long?,
+        initialReadAheadSegments: Int?,
         bitrate: BitrateState,
         name: String,
         onFailure: (Throwable) -> Unit = {},
@@ -1299,6 +1348,14 @@ class NntpStreamingService(
                     fun unitsOf(item: SegmentQueueItem): Int =
                         ((item.segmentDecodedSize - 1) / HELD_UNIT_BYTES + 1).coerceIn(1, heldUnits?.toLong() ?: 1).toInt()
 
+                    // The stream starts only its first startCount segments (StreamingConfig.initialReadAheadSegments)
+                    // until its reader has taken the first one's bytes, which the firstTaken'th write
+                    // returning shows; then the rest of its read-ahead.
+                    val firstTaken = initialReadAheadSegments?.let { writesUntilFirstTaken(items.asSequence().map { item -> item.readEnd - item.readStart }) }
+                    val startCount = if (firstTaken != null && initialReadAheadSegments != null) maxOf(firstTaken, initialReadAheadSegments) else items.size
+                    val widened = CompletableDeferred<Unit>()
+                    var handed = 0
+
                     // The read-ahead downloads are children of a supervisor: one that fails (an
                     // article no provider has) cancels neither the others nor the writer. Its
                     // failure is thrown when the writer gets to it and awaits it, after everything
@@ -1314,6 +1371,7 @@ class NntpStreamingService(
                                     send(item to unlisted)
                                     return@produce
                                 }
+                                if (index == startCount) widened.await()
                                 held?.let { units -> repeat(unitsOf(item)) { units.acquire() } }
                                 downloadSemaphore.acquire()
                                 if (index == 0) {
@@ -1363,16 +1421,18 @@ class NntpStreamingService(
                                         "Stream startup trace [{}] articleId={}: " +
                                             "resolved={}ms toList={}ms acquire={}ms async={}ms " +
                                             "send={}ms recv={}ms await={}ms write={}ms " +
-                                            "(items={}, concurrency={}, readAhead={}, readAheadBytes={})",
+                                            "(items={}, concurrency={}, readAhead={}, readAheadBytes={}, start={})",
                                         name, firstArticleId?.printable(),
                                         ms(tResolved), ms(tToList), ms(tFirstAcq), ms(tFirstAsync),
                                         ms(tFirstSend), ms(tFirstRecv), ms(tFirstAwait), ms(tFirstWrite),
                                         items.size, concurrency, readAheadSegments, readAheadBytes ?: "unlimited",
+                                        startCount,
                                     )
                                     firstArticleId = null
                                 }
                             }
                             held?.let { units -> repeat(unitsOf(item)) { units.release() } }
+                            if (++handed == firstTaken) widened.complete(Unit)
                         }
                     }
                 }

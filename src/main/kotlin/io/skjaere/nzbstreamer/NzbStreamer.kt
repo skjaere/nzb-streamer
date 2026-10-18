@@ -271,6 +271,11 @@ class NzbStreamer private constructor(
         streamingService.setReadAheadBytes(value)
     }
 
+    /** See [io.skjaere.nzbstreamer.config.StreamingConfig.initialReadAheadSegments]. */
+    fun setInitialReadAheadSegments(value: Int?) {
+        streamingService.setInitialReadAheadSegments(value)
+    }
+
     // NOTE: only mutates the top-level VerificationService used by [verifySegments].
     // ArchiveMetadataService holds its own internal VerificationService for
     // prepare-time enrichment (sized from streamingConfig.concurrency at build time)
@@ -285,6 +290,8 @@ class NzbStreamer private constructor(
     fun getReadAheadSegments(): Int = streamingService.getReadAheadSegments()
 
     fun getReadAheadBytes(): Long? = streamingService.getReadAheadBytes()
+
+    fun getInitialReadAheadSegments(): Int? = streamingService.getInitialReadAheadSegments()
 
     fun getVerificationConcurrency(): Int = verificationService.getConcurrency()
 
@@ -343,6 +350,8 @@ class NzbStreamer private constructor(
         var readAheadSegments: Int? = null
         /** See [StreamingConfig.readAheadBytes]. */
         var readAheadBytes: Long? = null
+        /** See [StreamingConfig.initialReadAheadSegments]. */
+        var initialReadAheadSegments: Int? = StreamingConfig.DEFAULT_INITIAL_READ_AHEAD_SEGMENTS
         var segmentCache: SegmentCache? = null
         /** See [NzbStreamer.fromConfig]'s closeSegmentCache. */
         var closeSegmentCache: Boolean = true
@@ -362,6 +371,7 @@ class NzbStreamer private constructor(
                 verificationConcurrency = verificationConcurrency ?: concurrency,
                 readAheadSegments = readAheadSegments ?: (concurrency * 3),
                 readAheadBytes = readAheadBytes,
+                initialReadAheadSegments = initialReadAheadSegments,
             )
             val prepareConfig = PrepareConfig(verifySegments = prepareBuilder.verifySegments)
             return create(poolBuilders.map { it.toConfig() }, streamingConfig, prepareConfig, segmentCache, closeSegmentCache)

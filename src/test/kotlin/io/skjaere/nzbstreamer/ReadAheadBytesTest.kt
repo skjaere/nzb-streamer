@@ -35,7 +35,9 @@ import org.junit.jupiter.api.Test
 /**
  * A stream's read-ahead in bytes ([StreamingConfig.readAheadBytes]). Counted in segments only, a
  * release posted in 3.84 MB parts held twelve of them ahead of its reader, 46 MB, beside the
- * player's own buffer: on a TV box's 192 MB heap the app ran out of memory.
+ * player's own buffer: on a TV box's 192 MB heap the app ran out of memory. These streams start
+ * their whole read-ahead at once (no [StreamingConfig.initialReadAheadSegments]), so it can be
+ * counted before anything is read; ReadAheadStartTest has it bound a stream that started small.
  */
 class ReadAheadBytesTest {
     private val servers = mutableListOf<FakeNntpServer>()
@@ -67,7 +69,7 @@ class ReadAheadBytesTest {
             asked += i
             YencEncoder.encodeSinglePart(segments[i], "data.bin").data
         }).also { servers += it }
-        return NntpStreamingService(listOf(NntpConfig("127.0.0.1", server.port, "", "", useTls = false, maxConnections = 4)), config)
+        return NntpStreamingService(listOf(NntpConfig("127.0.0.1", server.port, "", "", useTls = false, maxConnections = 4)), config.copy(initialReadAheadSegments = null))
             .also { runBlocking { it.connect() } }
     }
 

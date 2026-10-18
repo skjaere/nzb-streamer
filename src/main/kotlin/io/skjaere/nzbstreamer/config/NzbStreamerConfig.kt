@@ -85,10 +85,34 @@ data class StreamingConfig(
      * either way, and no circuit breaker hears of it.
      */
     val crcMismatch: CrcMismatchPolicy = CrcMismatchPolicy.TOLERATE,
+    /**
+     * The segments a stream downloads, its first ones, until its reader has taken the first one's
+     * bytes (more where the writer needs them to tell, below): then the rest of its read-ahead
+     * starts, as [concurrency], [readAheadSegments] and [readAheadBytes] allow. A player's first
+     * opens and a probe of the file read a few KB before they close or seek, and a media server's
+     * scan opens many streams that do: each started the whole read-ahead, a dozen segments of
+     * 3.84 MB for a 4K remux. With two the first comes as soon as before, and the second is there
+     * when the reader gets to it while the rest start. Null: the whole read-ahead at once.
+     *
+     * The writer learns that its reader took bytes only from its writes waiting, as a write waits
+     * while the channel holds 1 MiB the reader hasn't taken. So a stream of segments of 1 MiB or
+     * more widens when the second one's write returns; one of smaller segments starts as many more
+     * as make 2 MiB and a segment past the first (five of 750 KB) and widens once the last of them
+     * is written; one that starts in a segment's last MiB starts one more.
+     */
+    val initialReadAheadSegments: Int? = DEFAULT_INITIAL_READ_AHEAD_SEGMENTS,
 ) {
     init {
         // As NntpStreamingService.setReadAheadBytes: no bytes would stream a segment at a time.
         require(readAheadBytes == null || readAheadBytes > 0) { "readAheadBytes must be > 0, got $readAheadBytes" }
+        require(initialReadAheadSegments == null || initialReadAheadSegments > 0) {
+            "initialReadAheadSegments must be > 0, got $initialReadAheadSegments"
+        }
+    }
+
+    companion object {
+        /** See [initialReadAheadSegments]. */
+        const val DEFAULT_INITIAL_READ_AHEAD_SEGMENTS = 2
     }
 }
 
