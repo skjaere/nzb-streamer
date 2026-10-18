@@ -195,6 +195,38 @@ class SegmentCacheTest {
     }
 
     /**
+     * Bytes a fetch got that aren't to be stored (a damaged copy used for want of a better one) are
+     * its followers' all the same, and aren't stored: the next fetch tries again.
+     */
+    @Test
+    fun `bytes a leader may not store are its followers' too, and not stored`(@TempDir tmp: Path) {
+        runBlocking<Unit> {
+            val cache = SegmentCache(cfg(tmp))
+            val payload = ByteArray(1024) { it.toByte() }
+            val answered = CompletableDeferred<Unit>()
+            val leader = async(start = CoroutineStart.UNDISPATCHED) {
+                cache.getOrFetchStorable("d@id") {
+                    answered.await()
+                    SegmentCache.Fetched(payload, storable = false)
+                }
+            }
+            val followerFetches = AtomicInteger()
+            val follower = async(start = CoroutineStart.UNDISPATCHED) {
+                cache.getOrFetch("d@id") { followerFetches.incrementAndGet(); ByteArray(1) }
+            }
+            answered.complete(Unit)
+
+            assertContentEquals(payload, leader.await())
+            assertContentEquals(payload, follower.await())
+            assertEquals(0, followerFetches.get())
+            assertNull(cache.get("d@id"))
+            assertEquals(0, cache.stats().entryCount)
+            assertContentEquals(payload, cache.getOrFetch("d@id") { payload })
+            assertContentEquals(payload, cache.get("d@id"), "a storable fetch after it is stored")
+        }
+    }
+
+    /**
      * The leader is cancelled while it writes the segment's file, a store that would go over
      * capacity: the file it wrote, and the ones that store evicts, are either in the index or gone.
      * A file the index doesn't know is never evicted.

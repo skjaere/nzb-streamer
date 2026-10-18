@@ -370,7 +370,18 @@ class SegmentCache(private val config: SegmentCacheConfig) : AutoCloseable {
      * leader is cancelled fetches for itself (or follows the next leader), at once, not once the
      * leader's fetch returns ([lead]).
      */
-    suspend fun getOrFetch(articleId: String, fetch: suspend () -> ByteArray): ByteArray {
+    suspend fun getOrFetch(articleId: String, fetch: suspend () -> ByteArray): ByteArray =
+        getOrFetchStorable(articleId) { Fetched(fetch(), storable = true) }
+
+    /** Bytes a fetch got for [getOrFetchStorable], and whether they may be stored. */
+    internal class Fetched(val bytes: ByteArray, val storable: Boolean)
+
+    /**
+     * [getOrFetch], for a [fetch] that may get bytes not to be stored: a damaged copy of a segment
+     * used for want of a better one, which the next fetch tries again for. Its followers get them
+     * all the same.
+     */
+    internal suspend fun getOrFetchStorable(articleId: String, fetch: suspend () -> Fetched): ByteArray {
         get(articleId)?.let { return it }
 
         val ourDeferred = CompletableDeferred<ByteArray>()
@@ -379,7 +390,7 @@ class SegmentCache(private val config: SegmentCacheConfig) : AutoCloseable {
             return follow(existing) ?: run {
                 // The cancelled leader may not have let go of it yet.
                 inFlight.remove(articleId, existing)
-                getOrFetch(articleId, fetch)
+                getOrFetchStorable(articleId, fetch)
             }
         }
 
@@ -388,7 +399,10 @@ class SegmentCache(private val config: SegmentCacheConfig) : AutoCloseable {
                 // Leader-side recheck: a previous leader may have finished and removed
                 // itself between our fast-path `get` and our `putIfAbsent`. Outside any
                 // lock — other articles' fetches are unaffected by this disk read.
-                get(articleId) ?: fetch().also { store(articleId, it) }
+                get(articleId) ?: fetch().let { fetched ->
+                    if (fetched.storable) store(articleId, fetched.bytes)
+                    fetched.bytes
+                }
             }
         } catch (t: Throwable) {
             ourDeferred.completeExceptionally(t)

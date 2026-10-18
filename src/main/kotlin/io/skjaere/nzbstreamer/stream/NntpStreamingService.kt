@@ -19,7 +19,10 @@ import io.skjaere.nntp.ArticleNotFoundException
 import io.skjaere.nntp.NntpClientPool
 import io.skjaere.nntp.NntpException
 import io.skjaere.nntp.StatResult
+import io.skjaere.nntp.YencArticle
+import io.skjaere.nntp.YencCrcMismatchException
 import io.skjaere.nntp.YencHeaders
+import io.skjaere.nzbstreamer.config.CrcMismatchPolicy
 import io.skjaere.nzbstreamer.config.NntpConfig
 import io.skjaere.nzbstreamer.config.StreamingConfig
 import io.skjaere.nzbstreamer.nzb.printable
@@ -99,6 +102,12 @@ private data class CachedYencHeaders(
  */
 private fun headersKey(articleId: String) = "$articleId\u0000yenc-headers"
 
+/**
+ * An article fetched whole ([NntpStreamingService.fetchArticle]), and whether it may be cached: not
+ * a damaged copy used for want of a good one.
+ */
+internal class FetchedArticle(val article: YencArticle, val storable: Boolean)
+
 /** [close] closes [segmentCache] unless [closeSegmentCache] is false (a cache the caller keeps). */
 class NntpStreamingService(
     initialConfigs: List<NntpConfig>,
@@ -133,7 +142,8 @@ class NntpStreamingService(
      * from [StreamingConfig]). Failures that count: timeouts, IOExceptions, and
      * NntpException family — anything we can't blame on a clean server 430.
      * ArticleNotFoundException is *ignored* (server cleanly said the article
-     * doesn't exist — that's not the pool's fault). The breaker is inert when
+     * doesn't exist — that's not the pool's fault), and so is YencCrcMismatchException
+     * (the pool's copy of that article is damaged, the pool is fine). The breaker is inert when
      * only one pool is configured, see [executeWithCircuitBreaker].
      *
      * [currentCircuitBreakerConfig] is mutable so the live override path in
@@ -163,7 +173,7 @@ class NntpStreamingService(
                 IOException::class.java,
                 TimeoutCancellationException::class.java,
             )
-            .ignoreExceptions(ArticleNotFoundException::class.java)
+            .ignoreExceptions(ArticleNotFoundException::class.java, YencCrcMismatchException::class.java)
             .build()
 
     private val circuitBreakerRegistry: CircuitBreakerRegistry =
@@ -262,6 +272,8 @@ class NntpStreamingService(
         .register(registry)
     private val segmentsFailed = registry.counter("nzb.segments.failed")
     private val segmentsFallback = registry.counter("nzb.segments.fallback")
+    // Segments (and prepare's first articles) no pool had a good copy of, used damaged (CrcMismatchPolicy.TOLERATE).
+    private val segmentsCrcMismatchUsed = registry.counter("nzb.segments.crc_mismatch_used")
     private val segmentCacheHits = registry.counter("nzb.segments.cache.hits")
     private val segmentCacheMisses = registry.counter("nzb.segments.cache.misses")
 
@@ -506,6 +518,8 @@ class NntpStreamingService(
      *  - [NntpAuthenticationException] (this pool's login was rejected: an expired
      *    account, or too many connections on it; the pool throws it at once, and
      *    another provider's account may well serve the call)
+     *  - [YencCrcMismatchException] (this pool's copy of the article is damaged; another
+     *    provider's may not be. Like a 430, not counted against the pool's breaker)
      *
      * Not caught (propagated directly):
      *  - [kotlinx.coroutines.CancellationException] — structured-concurrency
@@ -517,7 +531,7 @@ class NntpStreamingService(
     @Suppress("TooGenericExceptionCaught")
     private suspend fun <T> withFallback(
         logPrefix: String,
-        block: suspend (pool: NntpClientPool) -> T
+        block: suspend (entry: PoolEntry) -> T
     ): T {
         val snapshot = poolLock.read { pools.toList() }
         if (snapshot.isEmpty()) {
@@ -588,12 +602,12 @@ class NntpStreamingService(
         index: Int,
         totalPools: Int,
         logPrefix: String,
-        block: suspend (pool: NntpClientPool) -> T,
+        block: suspend (entry: PoolEntry) -> T,
         recordException: (Throwable) -> Unit,
     ): T? {
         val callStart = System.nanoTime()
         return try {
-            val result = block(entry.pool)
+            val result = block(entry)
             // Pass Unit rather than `result`: T is unbounded (could be nullable),
             // and resilience4j only inspects the result when a recordResultPredicate
             // is configured (we don't). Avoids the Java Object/T platform-type warning.
@@ -611,6 +625,19 @@ class NntpStreamingService(
                 logger.debug(
                     "{} not found on pool[{}] ({}:{}) — falling back to pool[{}]",
                     logPrefix, index, entry.config.host, entry.config.port, index + 1,
+                )
+                segmentsFallback.increment()
+            }
+            null
+        } catch (e: YencCrcMismatchException) {
+            // A damaged copy of the article, read to its end: the pool is healthy, its copy isn't.
+            // Like a clean 430, nothing the breaker records; another pool may have a good copy.
+            breaker?.releasePermission()
+            recordException(e)
+            if (index < totalPools - 1) {
+                logger.debug(
+                    "{} CRC mismatch on pool[{}] ({}:{}) — falling back to pool[{}]: {}",
+                    logPrefix, index, entry.config.host, entry.config.port, index + 1, e.message,
                 )
                 segmentsFallback.increment()
             }
@@ -681,7 +708,51 @@ class NntpStreamingService(
     suspend fun <T> withClient(
         priority: NntpPriority = NntpPriority.HEALTH_CHECK,
         block: suspend (io.skjaere.nntp.NntpClient) -> T
-    ): T = withFallback("Article") { pool -> pool.withClient(priority.value, block) }
+    ): T = withFallback("Article") { entry -> entry.pool.withClient(priority.value, block) }
+
+    /**
+     * [articleId]'s article whole, its yEnc headers and decoded bytes, from the first pool that has
+     * it, at [priority]: prepare reads a file's name and size from its first article's. A damaged
+     * copy (its CRC isn't its =yend line's) is tried on the next pool, and with no good copy on any
+     * it is used or is the failure, as [StreamingConfig.crcMismatch] says, as for a segment.
+     */
+    internal suspend fun fetchArticle(articleId: String, priority: NntpPriority): FetchedArticle {
+        val shown = articleId.printable()
+        // Pools whose copy of it is damaged, in the order tried, with the mismatch.
+        val mismatched = mutableListOf<Pair<String, YencCrcMismatchException>>()
+        return try {
+            val article = withFallback("Article <$shown>") { entry ->
+                try {
+                    entry.pool.withClient(priority.value) { it.bodyYencBytes("<$articleId>") }
+                } catch (e: YencCrcMismatchException) {
+                    mismatched += entry.name to e
+                    throw e
+                }
+            }
+            FetchedArticle(article, storable = true)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (@Suppress("TooGenericExceptionCaught") e: Exception) {
+            FetchedArticle(tolerated("Article <$shown>", mismatched) ?: throw e, storable = false)
+        }
+    }
+
+    /**
+     * The copy to use of an article no pool has a good copy of, as [StreamingConfig.crcMismatch]
+     * says: the first of [mismatched] (each a pool's name and its copy's mismatch) under TOLERATE,
+     * with a warning naming [what] and the pools, counted; null under STRICT, the mismatch then
+     * being the failure.
+     */
+    private fun tolerated(what: String, mismatched: List<Pair<String, YencCrcMismatchException>>): YencArticle? {
+        if (streamingConfig.crcMismatch != CrcMismatchPolicy.TOLERATE) return null
+        val (pool, first) = mismatched.firstOrNull { it.second.article != null } ?: return null
+        logger.warn(
+            "{}: no pool has a copy whose CRC matches (damaged on {}); using the copy from {}, not cached: {}",
+            what, mismatched.joinToString { it.first }, pool, first.message,
+        )
+        segmentsCrcMismatchUsed.increment()
+        return first.article
+    }
 
     suspend fun statAcrossPools(articleId: String): StatResult {
         val snapshot = poolLock.read { pools.toList() }
@@ -1087,7 +1158,9 @@ class NntpStreamingService(
      *
      * A segment that no pool delivers within the segment fetch timeout fails like any other, with a
      * [SegmentTimeoutException]; parts of a file its NZB lists no article for
-     * ([SegmentQueueItem.gap]) fail with an [io.skjaere.nntp.ArticleNotFoundException].
+     * ([SegmentQueueItem.gap]) fail with an [io.skjaere.nntp.ArticleNotFoundException]. One that no
+     * pool has a good copy of, only damaged ones, is streamed damaged or fails with the
+     * [YencCrcMismatchException], as [StreamingConfig.crcMismatch] says.
      */
     suspend fun streamSegments(
         queue: Flow<SegmentQueueItem>,
@@ -1316,6 +1389,8 @@ class NntpStreamingService(
      *
      * @throws SegmentTimeoutException when no pool delivers it and one timed out (the segment
      *   fetch timeout), even if the others said 430: the one that timed out may have it.
+     * @throws YencCrcMismatchException when every pool that has it has a damaged copy, under
+     *   [CrcMismatchPolicy.STRICT]; under TOLERATE, the default, the first such copy is returned.
      */
     suspend fun fetchSegment(articleId: String): ByteArray = downloadSegment(articleId)
 
@@ -1355,15 +1430,16 @@ class NntpStreamingService(
             // Singleflight in SegmentCache dedupes concurrent fetches for the same article.
             val getOrFetchSample = Timer.start(registry)
             try {
-                return segmentCache.getOrFetch(articleId) { fetchSegmentFromNntp(articleId) }
+                return segmentCache.getOrFetchStorable(articleId) { fetchSegmentFromNntp(articleId) }
             } finally {
                 getOrFetchSample.stop(segmentCacheGetOrFetchTimer)
             }
         }
-        return fetchSegmentFromNntp(articleId)
+        return fetchSegmentFromNntp(articleId).bytes
     }
 
-    private suspend fun fetchSegmentFromNntp(articleId: String): ByteArray {
+    /** [articleId]'s bytes, from the first pool with a good copy; or, with none, a damaged one not to be cached ([tolerated]). */
+    private suspend fun fetchSegmentFromNntp(articleId: String): SegmentCache.Fetched {
         val sample = Timer.start(registry)
         // The id as logged and reported: an NZB can put a CR/LF in it (it's never sent then).
         val shown = articleId.printable()
@@ -1390,9 +1466,13 @@ class NntpStreamingService(
         // missing", which downstream (NzbImportService, NzbFileResource) treats as
         // DMCA/retention drop and blocklists the NZB or skips it silently. The same goes
         // for a pool that failed any other way (its connection dropped mid-article, a
-        // protocol or decoding error): surface that failure if no pool timed out.
+        // protocol or decoding error): surface that failure if no pool timed out. A pool whose
+        // copy is damaged (a CRC mismatch) did answer: its mismatch is surfaced only if no pool
+        // failed otherwise, when no damaged copy is used instead (StreamingConfig.crcMismatch).
         var firstTimeout: SegmentTimeoutException? = null
         var firstError: Exception? = null
+        // Pools whose copy is damaged, in the order tried, with the mismatch.
+        val mismatched = mutableListOf<Pair<String, YencCrcMismatchException>>()
         var anyAttempted = false
         suspend fun fetchFromPools(useBreakers: Boolean): ByteArray? = snapshot.withIndex().firstNotNullOfOrNull { (index, entry) ->
             val breaker = if (useBreakers) circuitBreakerFor(entry) else null
@@ -1407,6 +1487,7 @@ class NntpStreamingService(
             anyAttempted = true
             fetchFromPool(articleId, entry, index, snapshot.size, breaker, timeoutMs) { e ->
                 when {
+                    e is YencCrcMismatchException -> mismatched += entry.name to e
                     e is SegmentTimeoutException -> if (firstTimeout == null) firstTimeout = e
                     firstError == null -> firstError = e
                 }
@@ -1426,21 +1507,25 @@ class NntpStreamingService(
         }
 
         sample.stop(segmentDownloadTimer)
-        if (data != null) {
+        // No pool had a good copy: a damaged one may do instead, not to be cached.
+        val fetched = data?.let { SegmentCache.Fetched(it, storable = true) }
+            ?: tolerated("Segment <$shown>", mismatched)?.let { SegmentCache.Fetched(it.data, storable = false) }
+        if (fetched != null) {
             segmentsDownloaded.increment()
-            segmentsBytes.increment(data.size.toDouble())
-            return data
+            segmentsBytes.increment(fetched.bytes.size.toDouble())
+            return fetched
         }
         segmentsFailed.increment()
         firstTimeout?.let { throw it }
         firstError?.let { throw it }
+        mismatched.firstOrNull()?.let { (_, mismatch) -> throw mismatch }
         throw ArticleNotFoundException("Article <$shown> not found on any pool")
     }
 
     /**
      * One attempt at [articleId] on [entry]'s pool, reporting to [breaker] (if any) how it went.
      * Returns null to move on to the next pool; a failure other than a clean 430 (a timeout, as a
-     * [SegmentTimeoutException], a connection that dropped) also goes to [onFailure].
+     * [SegmentTimeoutException], a connection that dropped, a damaged copy) also goes to [onFailure].
      */
     @Suppress("LongParameterList", "LongMethod")
     private suspend fun fetchFromPool(
@@ -1488,6 +1573,18 @@ class NntpStreamingService(
                 logger.debug(
                     "Segment <{}> not found on pool[{}] ({}:{}), trying pool[{}]",
                     shown, index, entry.config.host, entry.config.port, index + 1
+                )
+                segmentsFallback.increment()
+            }
+            null
+        } catch (e: YencCrcMismatchException) {
+            // A damaged copy, read to its end: the pool answered, its copy of the article is bad.
+            // Not a pool health signal either, so the finally releases the permit without recording it.
+            onFailure(e)
+            if (index < poolCount - 1) {
+                logger.warn(
+                    "Segment <{}> CRC mismatch on pool[{}] ({}:{}), trying pool[{}]: {}",
+                    shown, index, entry.config.host, entry.config.port, index + 1, e.message
                 )
                 segmentsFallback.increment()
             }

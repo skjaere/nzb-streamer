@@ -43,7 +43,8 @@ data class StreamingConfig(
     val segmentFetchTimeoutMs: Long = 5_000L,
     /**
      * Per-pool circuit breaker: number of *consecutive* failures (timeouts, IO errors,
-     * protocol/connection NntpExceptions — anything that wasn't a clean server 430)
+     * protocol/connection NntpExceptions — anything that wasn't a clean server 430, or a
+     * damaged copy of an article, see [crcMismatch])
      * before the circuit opens and that pool is skipped for [circuitBreakerCooldownMs].
      * A single success resets the counter. The breaker is inert when only one pool is
      * configured — there'd be nowhere to fall back to and skipping it would just turn
@@ -76,11 +77,32 @@ data class StreamingConfig(
      * segment cache.
      */
     val readAheadBytes: Long? = null,
+    /**
+     * What becomes of a segment (streamed, read at random, or a first article prepare reads) that no
+     * pool has a good copy of, only copies whose yEnc CRC isn't the one their =yend line gives: used
+     * ([CrcMismatchPolicy.TOLERATE]) or failed ([CrcMismatchPolicy.STRICT]). A copy like that is a
+     * damaged copy on its provider, not the provider failing: the next pool is tried for a good one
+     * either way, and no circuit breaker hears of it.
+     */
+    val crcMismatch: CrcMismatchPolicy = CrcMismatchPolicy.TOLERATE,
 ) {
     init {
         // As NntpStreamingService.setReadAheadBytes: no bytes would stream a segment at a time.
         require(readAheadBytes == null || readAheadBytes > 0) { "readAheadBytes must be > 0, got $readAheadBytes" }
     }
+}
+
+/** What a segment gets that no pool has a good copy of, only damaged ones ([StreamingConfig.crcMismatch]). */
+enum class CrcMismatchPolicy {
+    /**
+     * The first damaged copy's bytes are used, with a warning naming the segment and the pools, and
+     * counted (nzb.segments.crc_mismatch_used): a few wrong bytes in a video play through, where a
+     * failed segment ends the stream. They are never cached, so a later play tries again.
+     */
+    TOLERATE,
+
+    /** The segment fails with the mismatch ([io.skjaere.nntp.YencCrcMismatchException]), as with a timeout or a dropped connection. */
+    STRICT,
 }
 
 data class PrepareConfig(

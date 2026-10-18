@@ -6,7 +6,6 @@ import io.micrometer.core.instrument.Metrics
 import io.micrometer.core.instrument.Timer
 import io.skjaere.nntp.ArticleNotFoundException
 import io.skjaere.nntp.NntpException
-import io.skjaere.nntp.YencEvent
 import io.skjaere.nzbstreamer.nzb.NzbDocument
 import io.skjaere.nzbstreamer.nzb.NzbFile
 import io.skjaere.nzbstreamer.queue.SegmentQueueService
@@ -276,7 +275,10 @@ class NzbEnrichmentService(
     /**
      * Fetches [file]'s first article into its yencHeaders and first16kb; the article, decoded. It
      * goes through the segment cache, its headers kept beside it, so a release prepared again (a
-     * replay, a resume) fetches it no more, and streaming finds it there.
+     * replay, a resume) fetches it no more, and streaming finds it there. A damaged copy (its CRC
+     * doesn't match) is fetched from the next pool, and with no good copy on any, used or the
+     * failure as StreamingConfig.crcMismatch says ([NntpStreamingService.fetchArticle]): a copy
+     * used so still has the headers, but isn't cached.
      */
     private suspend fun enrichFile(file: NzbFile): ByteArray? {
         val articleId = file.segments.first().articleId
@@ -286,23 +288,13 @@ class NzbEnrichmentService(
             logger.debug("Enriched file from the segment cache: {}", headers.name)
             return article
         }
-        var article: ByteArray? = null
-        streamingService.withClient(NntpPriority.PREPARE) { client ->
-            client.bodyYenc("<$articleId>").collect { event ->
-                when (event) {
-                    is YencEvent.Headers -> file.yencHeaders = event.yencHeaders
-                    is YencEvent.Body -> {
-                        val data = event.data.toByteArray()
-                        file.first16kb = data.copyOf(min(16384, data.size))
-                        article = data
-                    }
-                }
-            }
-        }
-        val headers = file.yencHeaders
-        article?.let { if (headers != null) streamingService.cacheArticle(articleId, headers, it) }
-        logger.debug("Enriched file: {}", file.yencHeaders?.name)
-        return article
+        val fetched = streamingService.fetchArticle(articleId, NntpPriority.PREPARE)
+        val article = fetched.article
+        file.yencHeaders = article.headers
+        file.first16kb = article.data.copyOf(min(16384, article.data.size))
+        if (fetched.storable) streamingService.cacheArticle(articleId, article.headers, article.data)
+        logger.debug("Enriched file: {}", article.headers.name)
+        return article.data
     }
 
     /**
