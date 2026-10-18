@@ -67,15 +67,15 @@ class ReadAheadStartTest {
         yencHeaders = YencHeaders(line = 128, size = whole.size.toLong(), name = "data.bin", partEnd = segmentSize.toLong()),
     )
 
-    /** A service on a server of four connections that holds back the segments [hold] names until the test ends. */
-    private fun service(config: StreamingConfig = StreamingConfig(), hold: (Int) -> Boolean = { false }): NntpStreamingService {
+    /** A service on a server of [connections] connections that holds back the segments [hold] names until the test ends. */
+    private fun service(config: StreamingConfig = StreamingConfig(), connections: Int = 4, hold: (Int) -> Boolean = { false }): NntpStreamingService {
         val server = FakeNntpServer(body = { id ->
             val i = id.removePrefix("<seg").substringBefore('@').toInt()
             asked += i
             if (hold(i)) held.await()
             YencEncoder.encodeSinglePart(segments[i], "data.bin").data
         }).also { servers += it }
-        return NntpStreamingService(listOf(NntpConfig("127.0.0.1", server.port, "", "", useTls = false, maxConnections = 4)), config)
+        return NntpStreamingService(listOf(NntpConfig("127.0.0.1", server.port, "", "", useTls = false, maxConnections = connections)), config)
             .also { runBlocking { it.connect() } }
     }
 
@@ -137,10 +137,13 @@ class ReadAheadStartTest {
         }
     }
 
-    /** Segments from the third on wait at the server: those asked for meanwhile are the ones downloading at once. */
+    /**
+     * Segments from the third on wait at the server: those asked for meanwhile are the ones downloading
+     * at once. The provider has twice the stream's four connections, so its pool doesn't bound them.
+     */
     @Test
     fun `once it reads on a stream downloads as many at once as its concurrency allows and no more`() = runBlocking<Unit> {
-        service(hold = { it >= 2 }).use { service ->
+        service(connections = 8, hold = { it >= 2 }).use { service ->
             val writer = start(service)
             writer.channel.readFully(ByteArray(segmentSize + 4096))
             assertEquals(6, asksAfter(6), "the first two, then four at once")
