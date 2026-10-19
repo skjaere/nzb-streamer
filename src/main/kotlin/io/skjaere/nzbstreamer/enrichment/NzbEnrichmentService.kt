@@ -93,7 +93,10 @@ class NzbEnrichmentService(
      * without one, a recovery volume), then downloads the PAR2 index (or, when it names nothing,
      * reads a recovery volume's file descriptions in its place), then fetches any file that may
      * be a volume posted under another extension and tells by the PAR2 index or its content whether
-     * it is one ([ReleaseFiles.Volumes]). The enriched NZB holds those files, the volumes found among
+     * it is one ([ReleaseFiles.Volumes]). Files whose names tell nothing that are bigger than an index
+     * can be, which may be recovery volumes, are fetched once the PAR2 index among the rest is read,
+     * and then only those it may describe ([ReleaseFiles.deferred], library issue N99); the others
+     * are left out. The enriched NZB holds those files, the volumes found among
      * the last too, but for any left out: a file the release opens without (a PAR2 file, another
      * episode's video or archive set) that lacks its first article, or another episode's set that
      * lacks a volume its PAR2 index names, which is logged. A file it needs that lacks it, or a
@@ -110,47 +113,33 @@ class NzbEnrichmentService(
         // The first articles, whole, of the PAR2 files by name, which their reads start from (NR-10):
         // not those of recovery volumes posted under an index's name, which aren't read (NR-9).
         val heads = ConcurrentHashMap<Int, ByteArray>()
-        try {
-            fetchFirstArticles(nzb, release.toFetch, { i, article -> if (holds(release, i, article)) hold(heads, i, nzb.files[i], article) }) { i, e ->
-                if (!release.mayLack(i)) throw e
-                lacking[i] = e
-            }
-            release.needed(lacking.keys)?.let { throw lacking.getValue(it) }
-        } catch (@Suppress("TooGenericExceptionCaught") e: Exception) {
-            rethrowCancellation(e)
-            classifyEnrichmentFailure(e, phase = "enrichment")?.let { return it }
-            throw e
-        }
-        val kept = release.leftOut(lacking.keys).let { leftOut -> release.toFetch.filterNot { it in leftOut } }
+        // Files that may be recovery volumes wait for the PAR2 data of the others, which tells which
+        // of them may be content (N99).
+        val first = release.toFetch.filterNot { it in release.deferred }
+        fetchFirst(nzb, release, first, lacking, heads)?.let { return it }
 
         // After enrichment, read the base PAR2 file's file descriptions (it names the files).
-        // Skip .volXXX+YYY.par2 recovery volume files — they contain recovery blocks
-        // and can be very large (tens of MB each), causing OOM if loaded into memory: a file
-        // counts as an index when it is named as one (and is PAR2), or else when its first 16 KB
-        // name files, read packet by packet without taking their lengths on trust; only its
-        // descriptions are held ([readPar2]). An index over a thousand files or more names none in
-        // its first 16 KB, its Main packet's list of them longer (NR-9), but a recovery volume posted
-        // under an index's name (<hash>.par2) starts with its recovery slice: it counts as one only
-        // as any other file does. A recovery set's smallest volume stands in for its index when that
-        // names nothing ([readStandIns]), where the release needs names (NR-10).
+        val keptFirst = kept(release, first, lacking)
+        readIndexes(nzb, release, keptFirst, heads)?.let { return it }
+        val then = release.deferredToFetch(VolumeNames.descriptions(keptFirst.map { nzb.files[it] }))
+        if (then.isNotEmpty()) {
+            fetchFirst(nzb, release, then, lacking, heads)?.let { return it }
+            readIndexes(nzb, release, kept(release, then, lacking), heads)?.let { return it }
+        }
+        val skipped = release.deferred.filterNot { it in then }
+        if (skipped.isNotEmpty()) {
+            logger.debug(
+                "Not fetching {} file(s) that may be recovery volumes, none the PAR2 data describes: {}",
+                skipped.size, skipped.joinToString { release.nameOf(it) },
+            )
+        }
+        val fetched = release.toFetch.filterNot { it in skipped }
+        val kept = kept(release, fetched, lacking)
+
+        // A recovery set's smallest volume stands in for its index when that names nothing
+        // ([readStandIns]), where the release needs names (NR-10).
         var standIns = emptyList<Int>()
         try {
-            coroutineScope {
-                kept.filterNot(release::isRecovery)
-                    .filter { i ->
-                        val first16kb = nzb.files[i].first16kb
-                        if (release.isIndex(i) && first16kb?.let(Par2Packets::startsWithRecoverySlice) == false) {
-                            Par2Parser.isPar2(first16kb)
-                        } else {
-                            namesFiles(first16kb)
-                        }
-                    }
-                    .map { i ->
-                        async {
-                            withTimedPermit { readPar2(nzb.files[i], heads.remove(i)) }
-                        }
-                    }.awaitAll()
-            }
             if (release.needsNames(nzb.files, kept)) standIns = readStandIns(nzb, release, heads)
         } catch (@Suppress("TooGenericExceptionCaught") e: Exception) {
             rethrowCancellation(e)
@@ -195,13 +184,80 @@ class NzbEnrichmentService(
                 leftOut.size, leftOut.sorted().joinToString { release.nameOf(it) },
             )
         }
-        val files = (named + found.keys + release.toFetch).distinct().sorted().filterNot { it in leftOut }
+        val files = (named + found.keys + fetched).distinct().sorted().filterNot { it in leftOut }
             .map { nzb.files[it] }
         logger.debug("Enriched {} of {} files", files.size, nzb.files.size)
 
         sample.stop(enrichmentTimer)
-        enrichmentFiles.increment((release.toFetch.size + volumes.toCheck.size).toDouble())
+        enrichmentFiles.increment((fetched.size + volumes.toCheck.size).toDouble())
         return EnrichmentResult.Success(NzbDocument(files, nzb.password))
+    }
+
+    /**
+     * Fetches the first articles of the files of [nzb] at [indices] ([fetchFirstArticles]), holding a
+     * PAR2 file's in [heads] to be read from ([holds]); one that lacks it goes to [lacking] where the
+     * release may open without it ([ReleaseFiles.mayLack]). The failure, or null: a file that lacks
+     * its first article and that the release needs fails it ([ReleaseFiles.needed]).
+     */
+    private suspend fun fetchFirst(
+        nzb: NzbDocument,
+        release: ReleaseFiles,
+        indices: List<Int>,
+        lacking: ConcurrentHashMap<Int, Exception>,
+        heads: ConcurrentHashMap<Int, ByteArray>,
+    ): EnrichmentResult? = try {
+        fetchFirstArticles(nzb, indices, { i, article -> if (holds(release, i, article)) hold(heads, i, nzb.files[i], article) }) { i, e ->
+            if (!release.mayLack(i)) throw e
+            lacking[i] = e
+        }
+        release.needed(lacking.keys)?.let { throw lacking.getValue(it) }
+        null
+    } catch (@Suppress("TooGenericExceptionCaught") e: Exception) {
+        rethrowCancellation(e)
+        classifyEnrichmentFailure(e, phase = "enrichment") ?: throw e
+    }
+
+    /** Of [indices], fetched, those not left out for what lacks a first article ([ReleaseFiles.leftOut]). */
+    private fun kept(release: ReleaseFiles, indices: List<Int>, lacking: Map<Int, Exception>): List<Int> =
+        release.leftOut(lacking.keys).let { leftOut -> indices.filterNot { it in leftOut } }
+
+    /**
+     * Reads the file descriptions of the PAR2 files among [indices] (fetched and kept), from their
+     * first articles held in [heads]. Recovery volumes by their names are skipped: they contain
+     * recovery blocks and can be very large (tens of MB each), causing OOM if loaded into memory. A
+     * file counts as an index when it is named as one (and is PAR2), or else when its first 16 KB
+     * name files, read packet by packet without taking their lengths on trust; only its descriptions
+     * are held ([readPar2]). An index over a thousand files or more names none in its first 16 KB,
+     * its Main packet's list of them longer (NR-9), but a recovery volume posted under an index's
+     * name (<hash>.par2) starts with its recovery slice: it counts as one only as any other file
+     * does. The failure, or null.
+     */
+    private suspend fun readIndexes(
+        nzb: NzbDocument,
+        release: ReleaseFiles,
+        indices: List<Int>,
+        heads: ConcurrentHashMap<Int, ByteArray>,
+    ): EnrichmentResult? = try {
+        coroutineScope {
+            indices.filterNot(release::isRecovery)
+                .filter { i ->
+                    val first16kb = nzb.files[i].first16kb
+                    if (release.isIndex(i) && first16kb?.let(Par2Packets::startsWithRecoverySlice) == false) {
+                        Par2Parser.isPar2(first16kb)
+                    } else {
+                        namesFiles(first16kb)
+                    }
+                }
+                .map { i ->
+                    async {
+                        withTimedPermit { readPar2(nzb.files[i], heads.remove(i)) }
+                    }
+                }.awaitAll()
+        }
+        null
+    } catch (@Suppress("TooGenericExceptionCaught") e: Exception) {
+        rethrowCancellation(e)
+        classifyEnrichmentFailure(e, phase = "PAR2 download") ?: throw e
     }
 
     /**

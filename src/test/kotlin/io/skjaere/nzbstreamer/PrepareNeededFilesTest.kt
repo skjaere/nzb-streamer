@@ -1255,6 +1255,108 @@ class PrepareNeededFilesTest {
         }
     }
 
+    /**
+     * An obfuscated post names none of its files in its subjects, so any of them may be a volume,
+     * the content or a PAR2 file. Prepare reads the PAR2 index from the files no bigger than one can
+     * be, then fetches the first articles of the bigger ones it may describe: not those of its
+     * recovery volumes, as big as any other's (16 of 3.84 MB for one remux, library issue N99), so
+     * one of them that lacks its first article doesn't fail the release either.
+     */
+    @ParameterizedTest
+    @CsvSource("raw, false", "raw, true", "rar, false", "rar, true")
+    fun `an obfuscated post's recovery volumes aren't fetched once its PAR2 index names its files`(shape: String, lacking: Boolean) {
+        val payload = bytes("movie", if (shape == "raw") 6 * MIB else 11 * MIB)
+        val content = if (shape == "raw") {
+            listOf("Qx7vRp2mLw9a.mkv" to payload)
+        } else {
+            ArchiveGenerator.generate(payload, 6L * MIB, ContainerType.RAR5, "Qx7vRp2mLw9a.mkv")
+                .mapIndexed { v, volume -> "Qx7vRp2mLw9a.part${v + 1}.rar" to volume.data }
+        }
+        content.forEachIndexed { n, (name, data) -> post(name, data, BIG_PARTS, subject = NAMELESS[n]) }
+        post("Qx7vRp2mLw9a.par2", buildPar2File(content), subject = NAMELESS[4])
+        val recovery = listOf("vol000+001", "vol001+002").mapIndexed { n, volume ->
+            post("Qx7vRp2mLw9a.$volume.par2", buildPar2File(content, recoveryBlock = RECOVERY_BLOCK), BIG_PARTS, subject = NAMELESS[5 + n])
+        }
+        if (lacking) missing += recovery.first().first()
+
+        withStreamer { streamer, server ->
+            val result = streamer.prepare(nzb())
+            val prepared = assertIs<PrepareResult.Success>(result, "prepare: $result")
+            if (shape == "rar") assertEquals(content.map { it.first }, prepared.metadata.response.volumes)
+            assertContentEquals(payload, streamer.streamed(prepared))
+            assertEquals(emptyList(), recovery.map { it.first() }.filter { it in server.bodiesRead }, "recovery volumes' first articles fetched")
+        }
+    }
+
+    /**
+     * Recovery volumes posted under an index's name ('<hash>.par2') may each be the index, as far as
+     * their names tell: those bigger than an index can be are fetched only when the index beside
+     * them names nothing (N99).
+     */
+    @Test
+    fun `recovery volumes posted under an index's name aren't fetched once the index names the files`() {
+        val payload = bytes("movie", 200_000)
+        val named = volumes("Movie.2020", "Movie.2020.mkv", payload, ContainerType.RAR4)
+        named.indices.reversed().forEach { v -> post(OBFUSCATED[v], named[v].second) }
+        post("0b1c2d3e.par2", buildPar2File(named))
+        val recovery = post("${OBFUSCATED[5]}.par2", buildPar2File(named, recoveryBlock = RECOVERY_BLOCK), BIG_PARTS)
+
+        withStreamer { streamer, server ->
+            val prepared = assertIs<PrepareResult.Success>(streamer.prepare(nzb()), "prepare")
+            assertEquals(named.map { it.first }, prepared.metadata.response.volumes)
+            assertContentEquals(payload, streamer.streamed(prepared))
+            assertTrue(recovery.first() !in server.bodiesRead, "the recovery volume's first article was fetched")
+        }
+    }
+
+    /**
+     * A file of an obfuscated post that its PAR2 data doesn't describe is still fetched when it is
+     * of the size of what it does (here an episode of a season pack posted without its index), so
+     * the release still lists it; the other episode's recovery volume isn't fetched (N99).
+     */
+    @Test
+    fun `an episode an obfuscated season pack's PAR2 data doesn't describe is still listed`() {
+        val first = bytes("episode 1", 6 * MIB)
+        val second = bytes("episode 2", 4 * MIB)
+        val described = listOf("Pk4Tz8Wn3Qa.mkv" to first)
+        post("Pk4Tz8Wn3Qa.mkv", first, BIG_PARTS, subject = NAMELESS[0])
+        post("Pk4Tz8Wn3Qa.par2", buildPar2File(described), subject = NAMELESS[1])
+        val recovery = post("Pk4Tz8Wn3Qa.vol000+001.par2", buildPar2File(described, recoveryBlock = RECOVERY_BLOCK), BIG_PARTS, subject = NAMELESS[2])
+        post("Hm6Rb1Xs9Vd.mkv", second, BIG_PARTS, subject = NAMELESS[3])
+
+        withStreamer { streamer, server ->
+            val prepared = assertIs<PrepareResult.Success>(streamer.prepare(nzb()), "prepare")
+            val listed = streamer.resolveStreamableFiles(prepared.metadata).map { it.path }
+            assertEquals(2, listed.size, "listed: $listed")
+            assertContentEquals(second, streamer.streamed(prepared, listed.single { it.startsWith("Hm6Rb1Xs9Vd") }))
+            assertTrue(recovery.first() !in server.bodiesRead, "the recovery volume's first article was fetched")
+        }
+    }
+
+    /**
+     * Where the PAR2 index lacks its first article, a recovery volume posted under a name that tells
+     * nothing, as big as any, is fetched and read in its place as before: it names the volumes
+     * (N36, N99).
+     */
+    @Test
+    fun `an obfuscated recovery volume names the volumes when the PAR2 index lacks its first article`() {
+        val payload = bytes("movie", 200_000)
+        val named = volumes("Movie.2020", "Movie.2020.mkv", payload)
+        named.indices.reversed().forEach { v -> post(OBFUSCATED[v], named[v].second) }
+        missing += post("0b1c2d3e.par2", buildPar2File(named)).first()
+        val recovery = post(
+            "0b1c2d3e.vol00+01.par2", buildPar2File(named, recoveryBlock = RECOVERY_BLOCK, descriptionsFirst = true), BIG_PARTS,
+            subject = NAMELESS[0],
+        )
+
+        withStreamer { streamer, server ->
+            val prepared = assertIs<PrepareResult.Success>(streamer.prepare(nzb()), "prepare")
+            assertEquals(named.map { it.first }, prepared.metadata.response.volumes)
+            assertContentEquals(payload, streamer.streamed(prepared))
+            assertTrue(recovery.first() in server.bodiesRead, "the recovery volume wasn't read")
+        }
+    }
+
     /** Where [bytes] first appear in these, or -1. */
     private fun ByteArray.indexOfBytes(bytes: ByteArray): Int =
         (0..size - bytes.size).firstOrNull { at -> bytes.indices.all { this[at + it] == bytes[it] } } ?: -1
@@ -1262,5 +1364,16 @@ class PrepareNeededFilesTest {
     private companion object {
         /** Names that look like an obfuscating poster's, one per volume. */
         val OBFUSCATED = listOf("a8f7d6e5", "b91c2d3e", "c07e4f1a", "d2b5a9c4", "e6f3c8b1", "f4a1d7e9", "a3e9c2f7", "b8d4e1a6")
+
+        /** Subjects that name no file, as an obfuscating poster's do. */
+        val NAMELESS = listOf("Wq3ZbXk81Lmp", "Tn5HcVy2Rd7s", "Jb8MfQe4Gx1z", "Lr2KpWu6Ns9c", "Yd7XtBh3Vq5m", "Fg1NsCz8Pk4w", "Mv6RqLa2Hj9t")
+
+        const val MIB = 1024 * 1024
+
+        /** Bigger than a PAR2 index can be as posted: 2.2 MiB. */
+        const val RECOVERY_BLOCK = 22 * MIB / 10
+
+        /** Article size for files of several MiB. */
+        const val BIG_PARTS = 512 * 1024
     }
 }

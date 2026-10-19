@@ -1,6 +1,7 @@
 package io.skjaere.nzbstreamer.enrichment
 
 import io.skjaere.compressionutils.ArchiveService
+import io.skjaere.compressionutils.Par2Parser
 import io.skjaere.compressionutils.Rar5Parser
 import io.skjaere.nntp.ArticleNotFoundException
 import io.skjaere.nzbstreamer.nzb.FilenameResolver
@@ -19,7 +20,8 @@ import kotlin.math.abs
  * other files, unnamed ones) and the PAR2 index. PAR2 recovery volumes are not fetched, but for a
  * recovery set's smallest when it has no index, or the one it has names nothing (each carries its
  * index's names, [standIns]), nor are NFOs, SFVs and the like, and samples, unless they are all the
- * release has.
+ * release has. Where names tell nothing (an obfuscated post), the files that may be recovery volumes
+ * wait for the PAR2 data of the others, which tells which of them to fetch ([deferred]).
  *
  * A file prepare doesn't need to open the release may lack its first article: it is left out. So
  * may another episode's: a video (or other content beside videos) while one of its size is there,
@@ -73,6 +75,35 @@ internal class ReleaseFiles(private val files: List<NzbFile>) {
 
     /** Indices of the files whose first article prepare fetches, in order. */
     val toFetch: List<Int> = roles.indices.filter { fetched(roles[it]) || it == indexStandIn }
+
+    /**
+     * Indices of the files of [toFetch] that may be PAR2 recovery volumes, whose first articles wait
+     * until the PAR2 data of the others is read (library issue N99): their names tell nothing or are
+     * an index's (an obfuscating poster names every PAR2 file so), and they are bigger than an index
+     * can be ([INDEX_LIMIT]) by the sizes the NZB gives each of their articles. An obfuscated post
+     * names none of its files, so its recovery volumes, whose first articles are as big as any, were
+     * fetched with its content: 16 of 3.84 MB for one remux. A file whose NZB leaves out an article's
+     * size doesn't wait: its size can't tell it from content.
+     */
+    val deferred: List<Int> = toFetch.filter { i ->
+        (roles[i] == Role.UNKNOWN || roles[i] == Role.PAR2) && sizes[i] > INDEX_LIMIT && files[i].segments.all { it.bytes > 0 }
+    }
+
+    /**
+     * Of [deferred], the files to fetch once the PAR2 data of the others names [described]: all of
+     * them when it names none. Else those whose names tell nothing that are at least half as big as
+     * the smallest file it describes that is longer than a quarter of [INDEX_LIMIT], or all of those
+     * when it describes none so long (it is a sample's set, or an extra's): a file it describes,
+     * posted at least as long as it is (yEnc lengthens what it encodes), and one of its size that it
+     * doesn't describe (another episode's, posted without its index). A shorter one, posted at most
+     * twice as long (yEnc escapes a byte as two at most), isn't deferred. Not the rest: recovery
+     * volumes, smaller than what they cover, and PAR2 files under an index's name.
+     */
+    fun deferredToFetch(described: List<Par2Parser.Par2FileDescription>): List<Int> {
+        if (described.isEmpty()) return deferred
+        val smallest = described.map { it.fileSize }.filter { it * 4 > INDEX_LIMIT }.minOrNull() ?: 0L
+        return deferred.filter { roles[it] == Role.UNKNOWN && ofItsSize(sizes[it], smallest) }
+    }
 
     /**
      * Indices of the files [toFetch] leaves that may yet be archive volumes posted under another
@@ -419,6 +450,11 @@ internal class ReleaseFiles(private val files: List<NzbFile>) {
     private companion object {
         // A volume posted as big as another is so within a hundredth, by the sizes the NZB gives.
         const val SIZE_TOLERANCE = 100
+
+        // More than a PAR2 index takes as posted for a release of up to about 3,000 files: it holds a
+        // Main packet, a FileDesc and an IFSC packet for each file (about 400 bytes a file with its
+        // name), and 20 bytes for each of at most 32,768 slices (640 KiB).
+        const val INDEX_LIMIT = 2L * 1024 * 1024
 
         val CONTENT = setOf(Role.ARCHIVE, Role.VIDEO, Role.OTHER, Role.UNKNOWN)
         val SAMPLED = setOf(Role.ARCHIVE, Role.VIDEO)
