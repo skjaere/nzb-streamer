@@ -17,6 +17,7 @@ import io.micrometer.core.instrument.Tags
 import io.micrometer.core.instrument.Timer
 import io.skjaere.nntp.ArticleNotFoundException
 import io.skjaere.nntp.NntpClientPool
+import io.skjaere.nntp.NntpDispatchers
 import io.skjaere.nntp.NntpException
 import io.skjaere.nntp.StatResult
 import io.skjaere.nntp.YencArticle
@@ -158,10 +159,12 @@ class NntpStreamingService(
      */
     private data class PoolEntry(val config: NntpConfig, val pool: NntpClientPool, val name: String)
 
-    // The pools' connects (a blocking DNS lookup), keepalives, QUITs and drains run here, and the
-    // shared SelectorManager's loop (it blocks in select) on the same dispatcher: IO, not Default,
-    // whose few workers (one per core) are for CPU-bound work, which may hold them all.
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    // The pools' connects (a blocking DNS lookup), keepalives, QUITs and drains run here, each
+    // waiting for its server in its thread: on the NNTP client's own view of Dispatchers.IO, where
+    // they run in place and which IO's 64-thread limit doesn't count, so a stalled provider never
+    // keeps the process's other IO work waiting. Not Default, whose few workers (one per core) are
+    // for CPU-bound work, which may hold them all.
+    private val scope = CoroutineScope(SupervisorJob() + NntpDispatchers.IO)
     private val logger = LoggerFactory.getLogger(NntpStreamingService::class.java)
     private val pools = mutableListOf<PoolEntry>()
     private lateinit var selectorManager: SelectorManager

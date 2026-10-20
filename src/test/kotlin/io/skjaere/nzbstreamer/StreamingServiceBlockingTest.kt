@@ -20,7 +20,8 @@ import org.junit.jupiter.api.Test
 
 /**
  * What the streaming service must not hold up while it waits, or wait on: fetches from the other
- * pools while a pool is being removed, and its connections while Dispatchers.Default is busy.
+ * pools while a pool is being removed, and its connections while Dispatchers.Default or
+ * Dispatchers.IO is busy.
  */
 class StreamingServiceBlockingTest {
     private val servers = mutableListOf<FakeNntpServer>()
@@ -100,6 +101,37 @@ class StreamingServiceBlockingTest {
             } finally {
                 release.countDown()
                 cpuWork.cancel()
+            }
+        }
+    }
+
+    /**
+     * A connection's waits hold their threads, so its connects, drains and keepalives run on the
+     * NNTP client's own view of Dispatchers.IO: on IO itself, the 64 threads it has for the whole
+     * process, they waited while other work held them all, and held them from that work.
+     */
+    @Test
+    fun `a fetch connects and reads while every Dispatchers IO thread is busy`() = runBlocking<Unit> {
+        val provider = server()
+        service(listOf(config(provider))).use { service ->
+            // As many as IO runs at once (kotlinx.coroutines.io.parallelism, 64 by default), all held.
+            val threads = 64
+            val busy = CountDownLatch(threads)
+            val release = CountDownLatch(1)
+            val ioWork = CoroutineScope(Dispatchers.IO)
+            repeat(threads) {
+                ioWork.launch {
+                    busy.countDown()
+                    release.await()
+                }
+            }
+            try {
+                assertTrue(busy.await(10, TimeUnit.SECONDS), "IO's threads never all got busy")
+                val data = withTimeoutOrNull(3_000) { service.fetchSegment("x@test") }
+                assertContentEquals(articles["<x@test>"], data, "the fetch got nothing in 3 s while IO was busy")
+            } finally {
+                release.countDown()
+                ioWork.cancel()
             }
         }
     }
