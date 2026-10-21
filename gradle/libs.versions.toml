@@ -4,8 +4,7 @@ kotlinx-coroutines = "1.10.1"
 kotlinx-serialization = "1.8.1"
 junit = "5.11.4"
 slf4j = "2.0.16"
-logback = "1.5.16"
-testcontainers = "2.0.3"
+testcontainers = "2.0.5"
 resilience4j = "2.3.0"
 
 [libraries]
@@ -16,7 +15,6 @@ kotlinx-coroutines-core = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-c
 kotlinx-coroutines-test = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-test", version.ref = "kotlinx-coroutines" }
 kotlinx-serialization-json = { module = "org.jetbrains.kotlinx:kotlinx-serialization-json", version.ref = "kotlinx-serialization" }
 slf4j-api = { module = "org.slf4j:slf4j-api", version.ref = "slf4j" }
-logback-classic = { module = "ch.qos.logback:logback-classic", version.ref = "logback" }
 junit-jupiter = { module = "org.junit.jupiter:junit-jupiter", version.ref = "junit" }
 testcontainers = { module = "org.testcontainers:testcontainers", version.ref = "testcontainers" }
 kotlin-test = { module = "org.jetbrains.kotlin:kotlin-test", version.ref = "kotlin" }
@@ -27,5 +25,4 @@ resilience4j-micrometer = { module = "io.github.resilience4j:resilience4j-microm
 [plugins]
 kotlin-jvm = { id = "org.jetbrains.kotlin.jvm", version.ref = "kotlin" }
 kotlin-serialization = { id = "org.jetbrains.kotlin.plugin.serialization", version.ref = "kotlin" }
-kotlinx-kover = { id = "org.jetbrains.kotlinx.kover", version = "0.9.1" }
-jib = { id = "com.google.cloud.tools.jib", version = "3.4.5" }
+kotlinx-kover = { id = "org.jetbrains.kotlinx.kover", version = "0.9.11" }
