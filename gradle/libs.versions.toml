@@ -1,16 +1,19 @@
 [versions]
 kotlin = "2.3.21"
-kotlinx-coroutines = "1.10.1"
-kotlinx-serialization = "1.8.1"
+kotlinx-coroutines = "1.11.0"
+kotlinx-serialization = "1.11.0"
 junit = "5.11.4"
-slf4j = "2.0.16"
+slf4j = "2.0.20"
 testcontainers = "2.0.5"
 resilience4j = "2.3.0"
+# For the tests' platform only, kept at ktor-nntp-client's: Ktor itself comes with ktor-nntp-client.
+ktor = "3.5.2"
 
 [libraries]
 # Note: ktor itself is pulled in transitively via the api-scoped ktor-nntp-client
 # dependency (which depends on ktor-network and ktor-io). nzb-streamer doesn't use
 # any ktor-server or top-level ktor-client modules.
+ktor-bom = { module = "io.ktor:ktor-bom", version.ref = "ktor" }
 kotlinx-coroutines-core = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-core", version.ref = "kotlinx-coroutines" }
 kotlinx-coroutines-test = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-test", version.ref = "kotlinx-coroutines" }
 kotlinx-serialization-json = { module = "org.jetbrains.kotlinx:kotlinx-serialization-json", version.ref = "kotlinx-serialization" }

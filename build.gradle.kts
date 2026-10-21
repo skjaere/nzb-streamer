@@ -38,6 +38,9 @@ dependencies {
     testImplementation(libs.kotlinx.coroutines.test)
     testImplementation(libs.testcontainers)
     testImplementation("com.github.skjaere:mock-nntp-server:v0.2.0")
+    // The mock's release brings Ktor 3.4.0's client and server: lifted to ktor-nntp-client's Ktor, so the tests don't
+    // run them beside a newer ktor-io. Until the mock moves to that Ktor itself.
+    testImplementation(platform(libs.ktor.bom))
 }
 
 tasks.test {
