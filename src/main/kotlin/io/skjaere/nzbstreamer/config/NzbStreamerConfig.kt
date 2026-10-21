@@ -42,19 +42,22 @@ data class StreamingConfig(
      */
     val segmentFetchTimeoutMs: Long = 5_000L,
     /**
-     * Per-pool circuit breaker: number of *consecutive* failures (timeouts, IO errors,
-     * protocol/connection NntpExceptions — anything that wasn't a clean server 430, or a
-     * damaged copy of an article, see [crcMismatch])
-     * before the circuit opens and that pool is skipped for [circuitBreakerCooldownMs].
-     * A single success resets the counter. The breaker is inert when only one pool is
-     * configured — there'd be nowhere to fall back to and skipping it would just turn
-     * every request into a hard failure.
+     * Per-pool circuit breaker: when it opens, that pool is skipped for [circuitBreakerCooldownMs].
+     * It keeps the outcomes of the pool's last calls, twice this many, and opens once it has at
+     * least this many and half of them or more are failures (timeouts, IO errors,
+     * protocol/connection NntpExceptions, a rejected login). A clean server 430 and a damaged
+     * copy of an article (see [crcMismatch]) count neither way. So this many failures in a row
+     * open it from a fresh start, and a success in between doesn't reset it: it only lowers the
+     * share of failures. The breaker is inert when only one pool is configured — there'd be
+     * nowhere to fall back to and skipping it would just turn every request into a hard failure
+     * — and a call that finds every pool's breaker open tries them all anyway.
      */
     val circuitBreakerFailureThreshold: Int = 5,
     /**
-     * How long to skip a pool after its circuit opens. After this window elapses the
-     * circuit resets to closed and the next request tries the pool again; if it fails
-     * the threshold count starts over and the breaker can re-open.
+     * How long to skip a pool after its circuit opens. Then the breaker lets one trial call
+     * through (half-open), the pool still skipped for the others meanwhile: if the trial
+     * succeeds, the circuit closes and starts with no outcomes kept; if it fails, it opens
+     * again for as long.
      */
     val circuitBreakerCooldownMs: Long = 60_000L,
     /**
