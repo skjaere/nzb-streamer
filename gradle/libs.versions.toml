@@ -5,7 +5,7 @@ kotlinx-serialization = "1.11.0"
 junit = "5.11.4"
 slf4j = "2.0.20"
 testcontainers = "2.0.5"
-resilience4j = "2.3.0"
+resilience4j = "2.4.0"
 # For the tests' platform only, kept at ktor-nntp-client's: Ktor itself comes with ktor-nntp-client.
 ktor = "3.5.2"
 
@@ -22,7 +22,6 @@ junit-jupiter = { module = "org.junit.jupiter:junit-jupiter", version.ref = "jun
 testcontainers = { module = "org.testcontainers:testcontainers", version.ref = "testcontainers" }
 kotlin-test = { module = "org.jetbrains.kotlin:kotlin-test", version.ref = "kotlin" }
 resilience4j-circuitbreaker = { module = "io.github.resilience4j:resilience4j-circuitbreaker", version.ref = "resilience4j" }
-resilience4j-kotlin = { module = "io.github.resilience4j:resilience4j-kotlin", version.ref = "resilience4j" }
 resilience4j-micrometer = { module = "io.github.resilience4j:resilience4j-micrometer", version.ref = "resilience4j" }
 
 [plugins]
