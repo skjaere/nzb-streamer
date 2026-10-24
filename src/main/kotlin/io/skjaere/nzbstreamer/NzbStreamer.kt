@@ -4,6 +4,7 @@ import io.ktor.utils.io.*
 import io.skjaere.compressionutils.Par2FileNames
 import io.skjaere.compressionutils.Par2Parser
 import io.skjaere.compressionutils.SplitInfo
+import io.skjaere.nzbstreamer.config.MissingArticlePolicy
 import io.skjaere.nzbstreamer.config.NntpConfig
 import io.skjaere.nzbstreamer.config.PrepareConfig
 import io.skjaere.nzbstreamer.config.StreamingConfig
@@ -19,6 +20,7 @@ import io.skjaere.nzbstreamer.nzb.NzbParser
 import io.skjaere.nzbstreamer.queue.SegmentQueueService
 import io.skjaere.nzbstreamer.stream.ArchiveStreamingService
 import io.skjaere.nzbstreamer.stream.FileResolveResult
+import io.skjaere.nzbstreamer.stream.Gap
 import io.skjaere.nzbstreamer.stream.NamedSplits
 import io.skjaere.nzbstreamer.stream.NntpPriority
 import io.skjaere.nzbstreamer.stream.NntpStreamingService
@@ -116,9 +118,10 @@ class NzbStreamer private constructor(
         metadata: ExtractedMetadata,
         namedSplits: NamedSplits,
         range: LongRange? = null,
+        onGap: ((Gap) -> Unit)? = null,
         consume: suspend (ByteReadChannel) -> Unit
     ) {
-        archiveStreamingService.streamFile(metadata.orderedArchiveNzb, namedSplits, range, consume = consume)
+        archiveStreamingService.streamFile(metadata.orderedArchiveNzb, namedSplits, range, onGap, consume)
     }
 
     /**
@@ -133,9 +136,10 @@ class NzbStreamer private constructor(
     suspend fun launchStreamFile(
         metadata: ExtractedMetadata,
         namedSplits: NamedSplits,
-        range: LongRange? = null
+        range: LongRange? = null,
+        onGap: ((Gap) -> Unit)? = null,
     ): WriterJob {
-        return archiveStreamingService.launchStreamFile(metadata.orderedArchiveNzb, namedSplits, range)
+        return archiveStreamingService.launchStreamFile(metadata.orderedArchiveNzb, namedSplits, range, onGap)
     }
 
     fun resolveStreamableFiles(metadata: ExtractedMetadata): List<StreamableFile> {
@@ -193,9 +197,10 @@ class NzbStreamer private constructor(
         metadata: ExtractedMetadata,
         file: StreamableFile,
         range: LongRange? = null,
+        onGap: ((Gap) -> Unit)? = null,
         consume: suspend (ByteReadChannel) -> Unit
     ) {
-        archiveStreamingService.streamFile(metadata.orderedArchiveNzb, file, range, consume = consume)
+        archiveStreamingService.streamFile(metadata.orderedArchiveNzb, file, range, onGap = onGap, consume = consume)
     }
 
     suspend fun streamFile(
@@ -203,9 +208,10 @@ class NzbStreamer private constructor(
         file: StreamableFile,
         range: LongRange? = null,
         streamName: String? = null,
+        onGap: ((Gap) -> Unit)? = null,
         consume: suspend (ByteReadChannel) -> Unit
     ) {
-        archiveStreamingService.streamFile(nzbDocument, file, range, streamName, consume)
+        archiveStreamingService.streamFile(nzbDocument, file, range, streamName, onGap, consume)
     }
 
     /** Starts streaming [file]; see the [NamedSplits] overload for the writer's lifetime and failures. */
@@ -214,8 +220,9 @@ class NzbStreamer private constructor(
         file: StreamableFile,
         range: LongRange? = null,
         streamName: String? = null,
+        onGap: ((Gap) -> Unit)? = null,
     ): WriterJob {
-        return archiveStreamingService.launchStreamFile(metadata.orderedArchiveNzb, file, range, streamName)
+        return archiveStreamingService.launchStreamFile(metadata.orderedArchiveNzb, file, range, streamName, onGap)
     }
 
     /** Starts streaming [file]; see the [NamedSplits] overload for the writer's lifetime and failures. */
@@ -224,26 +231,29 @@ class NzbStreamer private constructor(
         file: StreamableFile,
         range: LongRange? = null,
         streamName: String? = null,
+        onGap: ((Gap) -> Unit)? = null,
     ): WriterJob {
-        return archiveStreamingService.launchStreamFile(nzbDocument, file, range, streamName)
+        return archiveStreamingService.launchStreamFile(nzbDocument, file, range, streamName, onGap)
     }
 
     suspend fun streamVolume(
         metadata: ExtractedMetadata,
         volumeIndex: Int,
+        onGap: ((Gap) -> Unit)? = null,
         consume: suspend (ByteReadChannel) -> Unit
     ) {
-        streamVolume(metadata.orderedArchiveNzb, volumeIndex, consume)
+        streamVolume(metadata.orderedArchiveNzb, volumeIndex, onGap, consume)
     }
 
     suspend fun streamVolume(
         nzb: NzbDocument,
         volumeIndex: Int,
+        onGap: ((Gap) -> Unit)? = null,
         consume: suspend (ByteReadChannel) -> Unit
     ) {
         val file = nzb.files[volumeIndex]
         val queue = SegmentQueueService.createFileQueue(file, volumeIndex, 0L)
-        streamingService.streamSegments(queue, name = "volume-$volumeIndex", consume = consume)
+        streamingService.streamSegments(queue, name = "volume-$volumeIndex", onGap = onGap, consume = consume)
     }
 
     fun addPool(config: NntpConfig) {
@@ -309,6 +319,13 @@ class NzbStreamer private constructor(
 
     fun getSegmentFetchTimeoutMs(): Long = streamingService.getSegmentFetchTimeoutMs()
 
+    /** See [io.skjaere.nzbstreamer.config.StreamingConfig.missingArticles]. Applies to streams opened from now on. */
+    fun setMissingArticles(value: MissingArticlePolicy) {
+        streamingService.setMissingArticles(value)
+    }
+
+    fun getMissingArticles(): MissingArticlePolicy = streamingService.getMissingArticles()
+
     override fun close() {
         streamingService.close()
     }
@@ -355,6 +372,8 @@ class NzbStreamer private constructor(
         var segmentCache: SegmentCache? = null
         /** See [NzbStreamer.fromConfig]'s closeSegmentCache. */
         var closeSegmentCache: Boolean = true
+        /** See [StreamingConfig.missingArticles]. */
+        var missingArticles: MissingArticlePolicy = MissingArticlePolicy.FAIL
 
         /** Add an NNTP pool. First pool added is the primary; subsequent pools are fill/fallback. */
         fun nntp(block: NntpBuilder.() -> Unit) {
@@ -372,6 +391,7 @@ class NzbStreamer private constructor(
                 readAheadSegments = readAheadSegments ?: (concurrency * 3),
                 readAheadBytes = readAheadBytes,
                 initialReadAheadSegments = initialReadAheadSegments,
+                missingArticles = missingArticles,
             )
             val prepareConfig = PrepareConfig(verifySegments = prepareBuilder.verifySegments)
             return create(poolBuilders.map { it.toConfig() }, streamingConfig, prepareConfig, segmentCache, closeSegmentCache)

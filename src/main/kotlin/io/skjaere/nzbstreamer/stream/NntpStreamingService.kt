@@ -25,6 +25,7 @@ import io.skjaere.nntp.YencCrcMismatchException
 import io.skjaere.nntp.YencDecodingException
 import io.skjaere.nntp.YencHeaders
 import io.skjaere.nzbstreamer.config.CrcMismatchPolicy
+import io.skjaere.nzbstreamer.config.MissingArticlePolicy
 import io.skjaere.nzbstreamer.config.NntpConfig
 import io.skjaere.nzbstreamer.config.StreamingConfig
 import io.skjaere.nzbstreamer.nzb.printable
@@ -286,6 +287,17 @@ class NntpStreamingService(
 
     fun getSegmentFetchTimeoutMs(): Long = currentSegmentFetchTimeoutMs
 
+    @Volatile
+    private var currentMissingArticles: MissingArticlePolicy = streamingConfig.missingArticles
+
+    /** See [StreamingConfig.missingArticles]. Applies to streams opened from now on. */
+    fun setMissingArticles(value: MissingArticlePolicy) {
+        currentMissingArticles = value
+        logger.info("Updated missing-article policy: {}", value)
+    }
+
+    fun getMissingArticles(): MissingArticlePolicy = currentMissingArticles
+
     private val initialConfigs = initialConfigs.toList()
 
     // Mutable streaming knobs. Read fresh on each new streamSegments call (via the
@@ -316,6 +328,9 @@ class NntpStreamingService(
     private val segmentsFallback = registry.counter("nzb.segments.fallback")
     // Segments (and prepare's first articles) no pool had a good copy of, used damaged (CrcMismatchPolicy.TOLERATE).
     private val segmentsCrcMismatchUsed = registry.counter("nzb.segments.crc_mismatch_used")
+    // Streamed segments no pool could give, zeros streamed in their place (MissingArticlePolicy.ZERO_FILL), and their bytes.
+    private val segmentsZeroFilled = registry.counter("nzb.segments.zero_filled")
+    private val segmentsZeroFilledBytes = registry.counter("nzb.segments.zero_filled.bytes")
     private val segmentCacheHits = registry.counter("nzb.segments.cache.hits")
     private val segmentCacheMisses = registry.counter("nzb.segments.cache.misses")
 
@@ -1237,6 +1252,14 @@ class NntpStreamingService(
      * pool has a good copy of, only damaged ones, is streamed damaged or fails with the
      * [YencCrcMismatchException], as [StreamingConfig.crcMismatch] says; one whose every copy has a
      * yEnc header that can't be read fails with a [YencDecodingException].
+     *
+     * Under [MissingArticlePolicy.ZERO_FILL] ([StreamingConfig.missingArticles]), a segment missing on
+     * every pool, or with only copies that can't be read, streams as zeros of its size instead when
+     * that size is exact ([SegmentQueueItem.exactSize]); anything else fails as above. [onGap] gets
+     * each stretch so filled, as offsets from the stream's first byte, once its download finds it
+     * (the read-ahead's too) and before its zeros are written. It is called from the downloads, at
+     * once from several threads: it must be quick and thread-safe. What it throws is logged, and the
+     * stream goes on.
      */
     suspend fun streamSegments(
         queue: Flow<SegmentQueueItem>,
@@ -1245,6 +1268,7 @@ class NntpStreamingService(
         name: String = "unknown",
         readAheadBytes: Long? = currentReadAheadBytes,
         initialReadAheadSegments: Int? = currentInitialReadAheadSegments,
+        onGap: ((Gap) -> Unit)? = null,
         consume: suspend (ByteReadChannel) -> Unit
     ) {
         val bitrate = acquireBitrateState(name)
@@ -1252,7 +1276,7 @@ class NntpStreamingService(
         val failure = java.util.concurrent.atomic.AtomicReference<Throwable?>()
         try {
             val early = coroutineScope {
-                val writerJob = launchStreamSegments(queue, concurrency, readAheadSegments, readAheadBytes, initialReadAheadSegments, bitrate, name) {
+                val writerJob = launchStreamSegments(queue, concurrency, readAheadSegments, readAheadBytes, initialReadAheadSegments, bitrate, name, onGap) {
                     failure.compareAndSet(null, it)
                 }
                 try {
@@ -1289,7 +1313,8 @@ class NntpStreamingService(
      * has. A failure (an article no provider has or the NZB doesn't list, a timeout) never fails
      * the caller's job: the writer writes everything in front of the failing segment, then closes
      * the channel with the failure as its cause ([ByteReadChannel.closedCause]). Ktor drops the
-     * bytes the reader hasn't taken yet when a channel closes with a cause.
+     * bytes the reader hasn't taken yet when a channel closes with a cause. Missing segments and
+     * [onGap] as in [streamSegments].
      */
     suspend fun launchStreamSegments(
         queue: Flow<SegmentQueueItem>,
@@ -1298,9 +1323,10 @@ class NntpStreamingService(
         name: String = "unknown",
         readAheadBytes: Long? = currentReadAheadBytes,
         initialReadAheadSegments: Int? = currentInitialReadAheadSegments,
+        onGap: ((Gap) -> Unit)? = null,
     ): WriterJob {
         val bitrate = acquireBitrateState(name)
-        val writerJob = launchStreamSegments(queue, concurrency, readAheadSegments, readAheadBytes, initialReadAheadSegments, bitrate, name)
+        val writerJob = launchStreamSegments(queue, concurrency, readAheadSegments, readAheadBytes, initialReadAheadSegments, bitrate, name, onGap)
         writerJob.job.invokeOnCompletion { releaseBitrateState(name) }
         return writerJob
     }
@@ -1319,8 +1345,10 @@ class NntpStreamingService(
         initialReadAheadSegments: Int?,
         bitrate: BitrateState,
         name: String,
+        onGap: ((Gap) -> Unit)?,
         onFailure: (Throwable) -> Unit = {},
     ): WriterJob {
+        val fill = currentMissingArticles == MissingArticlePolicy.ZERO_FILL
         val callerScope = CoroutineScope(currentCoroutineContext())
         return callerScope.writer(autoFlush = false) {
             // Once the channel is closed (by the reader, or below by a failed download that has
@@ -1364,6 +1392,9 @@ class NntpStreamingService(
                     }.toList()
                     val tToList = System.nanoTime()
                     if (items.isEmpty()) return@coroutineScope
+                    // Where each item's bytes start in the stream, as the layout places them: a gap is
+                    // reported where its zeros will go, before they are written.
+                    val streamOffsets = if (fill) items.runningFold(0L) { at, item -> at + (item.readEnd - item.readStart) } else null
 
                     val downloadSemaphore = Semaphore(concurrency)
                     // Segments downloaded or downloading that the channel hasn't taken yet, counted at
@@ -1397,7 +1428,7 @@ class NntpStreamingService(
                                 // Parts the NZB lists no article for: the writer fails there, after
                                 // everything in front of them, so nothing past them is fetched.
                                 item.gap?.let { gap ->
-                                    val unlisted: Deferred<ByteArray> = CompletableDeferred<ByteArray>().apply { completeExceptionally(gap.toException()) }
+                                    val unlisted: Deferred<Downloaded> = CompletableDeferred<Downloaded>().apply { completeExceptionally(gap.toException()) }
                                     send(item to unlisted)
                                     return@produce
                                 }
@@ -1410,7 +1441,11 @@ class NntpStreamingService(
                                 }
                                 val deferred = this@supervisorScope.async {
                                     try {
-                                        downloadSegment(item.segment.articleId)
+                                        Downloaded(downloadSegment(item.segment.articleId), zeros = false)
+                                    } catch (e: CancellationException) {
+                                        throw e
+                                    } catch (@Suppress("TooGenericExceptionCaught") e: Exception) {
+                                        streamOffsets?.let { zeroFill(item, e, it[index], name, onGap) } ?: throw e
                                     } finally {
                                         downloadSemaphore.release()
                                     }
@@ -1421,7 +1456,7 @@ class NntpStreamingService(
                             }
                         }.consumeEach { (item, deferred) ->
                             if (tFirstRecv == 0L) tFirstRecv = System.nanoTime()
-                            val data = try {
+                            val downloaded = try {
                                 deferred.await()
                             } catch (e: Throwable) {
                                 // Close the channel with it at once: the downloads still in flight
@@ -1431,6 +1466,7 @@ class NntpStreamingService(
                                 throw e
                             }
                             if (tFirstAwait == 0L) tFirstAwait = System.nanoTime()
+                            val data = downloaded.bytes
 
                             // Clamped as Longs: an item sized past 2 GiB would wrap as an Int.
                             val start = minOf(item.readStart, data.size.toLong()).toInt()
@@ -1441,7 +1477,8 @@ class NntpStreamingService(
                                 // Hand each segment to the reader as it's written, not once 1 MB
                                 // has piled up: what a failure further on would otherwise drop.
                                 channel.flush()
-                                bitrate.addBytes(written)
+                                // Zeros came from no provider: not the stream's rate.
+                                if (!downloaded.zeros) bitrate.addBytes(written)
                                 // One-shot startup trace on first successful write. Subsequent writes
                                 // are sustained-throughput and the bitrate gauge already covers them.
                                 if (tFirstAwait != 0L && firstArticleId != null) {
@@ -1471,6 +1508,46 @@ class NntpStreamingService(
                 throw e
             }
         }
+    }
+
+    /** A streamed segment's bytes, and whether they are zeros in place of an article no pool could give. */
+    private class Downloaded(val bytes: ByteArray, val zeros: Boolean)
+
+    /**
+     * The zeros to stream in [item]'s place, at [streamOffset] in the stream, under
+     * [MissingArticlePolicy.ZERO_FILL]: when [failure] says no pool can give it (every pool asked
+     * answered 430, or has only copies whose yEnc header can't be read; a damaged copy is
+     * [StreamingConfig.crcMismatch]'s to decide) and its size is exact. They are reported to [onGap]
+     * first, logged and counted. Null for any other failure, or a size the layout only guesses:
+     * the stream fails there, as under [MissingArticlePolicy.FAIL].
+     */
+    private fun zeroFill(item: SegmentQueueItem, failure: Exception, streamOffset: Long, name: String, onGap: ((Gap) -> Unit)?): Downloaded? {
+        val cause = when {
+            failure is ArticleNotFoundException -> Gap.Cause.Missing
+            failure is YencDecodingException && failure !is YencCrcMismatchException -> Gap.Cause.Malformed
+            else -> return null
+        }
+        if (!item.exactSize || item.segmentDecodedSize !in 1L..Int.MAX_VALUE) return null
+        val range = streamOffset until streamOffset + (item.readEnd - item.readStart)
+        logger.warn(
+            "Stream [{}]: segment <{}> {}; streaming {} zero bytes in its place (stream bytes {}-{}), not cached",
+            name, item.segment.articleId.printable(),
+            if (cause == Gap.Cause.Missing) "is missing on every pool" else "has no readable copy on any pool",
+            range.last - range.first + 1, range.first, range.last,
+        )
+        segmentsZeroFilled.increment()
+        segmentsZeroFilledBytes.increment((range.last - range.first + 1).toDouble())
+        if (onGap != null && !range.isEmpty()) {
+            try {
+                onGap(Gap(range, cause))
+            } catch (e: CancellationException) {
+                throw e
+            } catch (@Suppress("TooGenericExceptionCaught") e: Exception) {
+                // The listener's failure, not the stream's: the zeros still go in.
+                logger.warn("Stream [{}]: the gap listener failed on stream bytes {}-{}", name, range.first, range.last, e)
+            }
+        }
+        return Downloaded(ByteArray(item.segmentDecodedSize.toInt()), zeros = true)
     }
 
     /**

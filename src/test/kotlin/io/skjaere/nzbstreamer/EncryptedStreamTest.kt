@@ -13,13 +13,16 @@ import io.skjaere.compressionutils.SplitInfo
 import io.skjaere.nntp.ArticleNotFoundException
 import io.skjaere.nntp.NntpConnectionException
 import io.skjaere.nntp.YencHeaders
+import io.skjaere.nzbstreamer.config.MissingArticlePolicy
 import io.skjaere.nzbstreamer.config.NntpConfig
+import io.skjaere.nzbstreamer.config.StreamingConfig
 import io.skjaere.nzbstreamer.nzb.NzbDocument
 import io.skjaere.nzbstreamer.nzb.NzbFile
 import io.skjaere.nzbstreamer.nzb.NzbSegment
 import io.skjaere.nzbstreamer.queue.SegmentQueueService
 import io.skjaere.nzbstreamer.seekable.NntpSeekableInputStream
 import io.skjaere.nzbstreamer.stream.ArchiveStreamingService
+import io.skjaere.nzbstreamer.stream.Gap
 import io.skjaere.nzbstreamer.stream.NamedSplits
 import io.skjaere.nzbstreamer.stream.NntpStreamingService
 import io.skjaere.yenc.YencEncoder
@@ -483,5 +486,113 @@ class EncryptedStreamTest {
             stream.close()
             reader.join()
         }
+    }
+
+    // MissingArticlePolicy.ZERO_FILL: zeroed ciphertext decrypts to garbage, from the AES block holding its first byte to
+    // the end of the block after its last (CBC decrypts that one with the zeroed block as its IV). That is the gap
+    // reported, in the file's plaintext offsets, and every byte outside it decrypts as it should.
+
+    private fun tolerantService(server: FakeNntpServer) = NntpStreamingService(
+        listOf(NntpConfig("127.0.0.1", server.port, "", "", useTls = false, maxConnections = 4)),
+        StreamingConfig(missingArticles = MissingArticlePolicy.ZERO_FILL),
+    ).also { runBlocking { it.connect() } }
+
+    /**
+     * The plaintext of the data area article [missing] garbles: [blockZero] is where the chain's block 0 lies, [before]
+     * the plaintext ahead of the data area in the chain, [size] the data area's.
+     */
+    private fun garbled(missing: Int, blockZero: Long, before: Long, size: Int): LongRange {
+        val zeroed = missing.toLong() * segmentSize until (missing + 1L) * segmentSize
+        val first = Math.floorDiv(zeroed.first - blockZero, 16L).coerceAtLeast(0)
+        val last = Math.floorDiv(zeroed.last - blockZero, 16L)
+        return maxOf(0L, first * 16 - before) until minOf(size.toLong(), (last + 2) * 16 - before)
+    }
+
+    /** Streams [split] of [archive] whole (or from [from]) under ZERO_FILL, with [missing] missing. */
+    private suspend fun streamedWithGap(archive: ByteArray, split: SplitInfo, missing: Int, from: Long = 0): Pair<ByteArray, List<Gap>> {
+        val gaps = CopyOnWriteArrayList<Gap>()
+        var received = ByteArray(0)
+        tolerantService(server(missing, archive)).use { service ->
+            val range = if (from > 0) from until split.dataSize else null
+            ArchiveStreamingService(service).streamFile(
+                nzb(archive), NamedSplits(listOf(split), split.dataSize, "video.mkv"), range, onGap = { gaps += it },
+            ) { channel ->
+                val (bytes, cause) = channel.readToEnd()
+                assertEquals(null, cause, "the stream ended with: ${cause.chain()}")
+                received = bytes
+            }
+        }
+        return received to gaps.toList()
+    }
+
+    /** That [received] (the file from [from]) is [expected] outside [gap], and not inside it, at either end. */
+    private fun assertGarbledOnly(expected: ByteArray, received: ByteArray, gap: LongRange, from: Int = 0) {
+        assertEquals(expected.size - from, received.size)
+        val inGap = gap.first.toInt() - from..gap.last.toInt() - from
+        received.indices.filterNot { it in inGap }.forEach { i ->
+            if (received[i] != expected[i + from]) fail("byte ${i + from}, outside the gap $gap, garbled")
+        }
+        fun differs(at: IntRange) = at.any { received[it] != expected[it + from] }
+        assertTrue(differs(inGap.first until inGap.first + 16), "the gap's first block decrypted as it should")
+        assertTrue(differs(inGap.last - 15..inGap.last), "the gap's last block decrypted as it should")
+    }
+
+    @Test
+    fun `a missing article in an encrypted file is reported as the plaintext it garbles, blocks rounded out and one more`() = runBlocking<Unit> {
+        val missing = segmentOfPlaintext(20_000)
+        val blockZero = blockStart + 16L + blocks(headerSize.toInt())
+        val gap = garbled(missing, blockZero, before = 0, size = plaintext.size)
+        // The zeros start inside an AES block, so the gap starts before them.
+        assertTrue(gap.first + blockZero < missing.toLong() * segmentSize, "test setup: the zeros start on a block")
+
+        val (received, gaps) = streamedWithGap(archive, split, missing)
+        assertEquals(listOf(Gap(gap, Gap.Cause.Missing)), gaps)
+        assertGarbledOnly(plaintext, received, gap)
+
+        // A range of the file from before the gap: the gap in the file's offsets all the same.
+        val (ranged, rangedGaps) = streamedWithGap(archive, split, missing, from = 15_000)
+        assertEquals(listOf(Gap(gap, Gap.Cause.Missing)), rangedGaps)
+        assertGarbledOnly(plaintext, ranged, gap, from = 15_000)
+    }
+
+    @Test
+    fun `without a per-file IV the gap counts the header in the chain, at the block's start too`() = runBlocking<Unit> {
+        val iv = ByteArray(16) { 9 }
+        val legacy = ByteArray(blockStart) + iv + encrypt(ByteArray(headerSize.toInt()) { 5 } + plaintext, iv) +
+            ByteArray(12 * segmentSize) { 1 }
+        val legacySplit = split.copy(encryption = split.encryption!!.copy(dataAreaIv = null))
+        val blockZero = blockStart + 16L
+
+        val missing = segmentOf(blockStart + 16 + headerSize.toInt() + 20_000)
+        val gap = garbled(missing, blockZero, before = headerSize, size = plaintext.size)
+        val (received, gaps) = streamedWithGap(legacy, legacySplit, missing)
+        assertEquals(listOf(Gap(gap, Gap.Cause.Missing)), gaps)
+        assertGarbledOnly(plaintext, received, gap)
+
+        // The first article holds the block's start, the IV on disk with it: the gap is the data area's from its first byte.
+        val first = garbled(0, blockZero, before = headerSize, size = plaintext.size)
+        assertEquals(0L, first.first)
+        val (fromStart, startGaps) = streamedWithGap(legacy, legacySplit, missing = 0)
+        assertEquals(listOf(Gap(first, Gap.Cause.Missing)), startGaps)
+        assertGarbledOnly(plaintext, fromStart, first)
+    }
+
+    /** Splits are streamed one after another: a gap in a later one's chain is offset by those before, as trimmed. */
+    @Test
+    fun `the garbled plaintext of a split counts the splits streamed before it`() {
+        val enc = split.encryption!!
+        // Two volumes' blocks, the first streamed from 1000 bytes into its data area (a range of the file).
+        val first = SplitInfo(0, dataStartPosition = 100, dataSize = 4000, encryption = enc.copy(dataAreaPlaintextOffset = 1000))
+        val second = SplitInfo(1, dataStartPosition = 10_100, dataSize = 5000, encryption = enc)
+        val secondBlockZero = 10_100L + 16 + blocks(headerSize.toInt())
+        // Ciphertext 20..40 bytes into the second data area: its blocks 1 and 2, and block 3 decrypted with 2.
+        val gaps = ArchiveStreamingService.garbledPlaintext(listOf(first, second), secondBlockZero + 20..secondBlockZero + 40)
+        assertEquals(listOf(4000L + 16 until 4000L + 64), gaps)
+        // The header's ciphertext, ahead of a data area with its own IV, garbles none of it.
+        assertEquals(emptyList(), ArchiveStreamingService.garbledPlaintext(listOf(second), 10_116L..secondBlockZero - 1))
+        // The first split's data area before where it is streamed from: not streamed, so not reported.
+        val firstBlockZero = 100L + 16 + blocks(headerSize.toInt())
+        assertEquals(emptyList(), ArchiveStreamingService.garbledPlaintext(listOf(first), firstBlockZero..firstBlockZero + 900))
+        assertEquals(listOf(0L until 1040L - 1000), ArchiveStreamingService.garbledPlaintext(listOf(first), firstBlockZero + 990..firstBlockZero + 1010))
     }
 }

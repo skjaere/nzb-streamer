@@ -117,6 +117,8 @@ object SegmentQueueService {
             readStart = 0,
             readEnd = size,
             gap = gap,
+            // Each part where its number puts it, the size of a part or the file's rest: as exact as the layout.
+            exactSize = gap == null,
         )
         val listed = listedAt.zip(file.segments).mapIndexed { segmentIndex, (part, segment) ->
             item(part, minOf(partSize, fileSize - part * partSize), segment, segmentIndex)
@@ -152,8 +154,9 @@ object SegmentQueueService {
 
     /**
      * Every listed article of [file] in order, each a part of [partSize], and the last one the rest
-     * of the file: right when the NZB lists every part, and the best guess when the parts' sizes
-     * can't be told ([postedParts]).
+     * of the file: right when the NZB lists every part (the sizes are then exact,
+     * [SegmentQueueItem.exactSize]), and the best guess when the parts' sizes can't be told
+     * ([postedParts]), or the NZB lists more articles than the size takes.
      */
     private fun listedParts(
         file: NzbFile,
@@ -162,6 +165,7 @@ object SegmentQueueService {
         fileSize: Long,
         partSize: Long,
     ): List<SegmentQueueItem> {
+        val exact = partSize > 0 && file.segments.size.toLong() == (fileSize + partSize - 1) / partSize
         return file.segments.mapIndexed { segmentIndex, segment ->
             // Last segment may be larger OR smaller than partSize
             val decodedSize = if (segmentIndex < file.segments.size - 1) {
@@ -177,7 +181,8 @@ object SegmentQueueService {
                 segmentDecodedSize = decodedSize,
                 globalOffset = globalOffset,
                 readStart = 0,
-                readEnd = decodedSize
+                readEnd = decodedSize,
+                exactSize = exact,
             )
         }
     }

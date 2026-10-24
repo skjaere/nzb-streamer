@@ -111,6 +111,14 @@ data class StreamingConfig(
      * is written; one that starts in a segment's last MiB starts one more.
      */
     val initialReadAheadSegments: Int? = DEFAULT_INITIAL_READ_AHEAD_SEGMENTS,
+    /**
+     * What becomes of a streamed segment that no pool can give: every pool answered 430 for it (a
+     * pool its circuit breaker passed over asked too), or the copies there are can't be read (their
+     * yEnc header is malformed). The stream fails there, as a timeout or a dropped connection makes
+     * it ([MissingArticlePolicy.FAIL], the default), or zeros of the segment's size take its place
+     * and the stream goes on ([MissingArticlePolicy.ZERO_FILL]).
+     */
+    val missingArticles: MissingArticlePolicy = MissingArticlePolicy.FAIL,
 ) {
     init {
         // As NntpStreamingService.setReadAheadBytes: no bytes would stream a segment at a time.
@@ -137,6 +145,26 @@ enum class CrcMismatchPolicy {
 
     /** The segment fails with the mismatch ([io.skjaere.nntp.YencCrcMismatchException]), as with a timeout or a dropped connection. */
     STRICT,
+}
+
+/** What a streamed segment gets that no pool can give ([StreamingConfig.missingArticles]). */
+enum class MissingArticlePolicy {
+    /** The stream fails there, after every byte in front of it, with the segment's failure. */
+    FAIL,
+
+    /**
+     * Zeros of the segment's size take its place, so the bytes after it stay at their offsets, and
+     * the stream goes on. Only where that size is known exactly ([io.skjaere.nzbstreamer.queue.SegmentQueueItem.exactSize]:
+     * the NZB lists every part, or the parts it lacks can be placed), and only for the segments a
+     * stream downloads: what prepare reads (first articles, archive headers, PAR2 files), random
+     * access ([io.skjaere.nzbstreamer.stream.NntpStreamingService.fetchSegment]) and the
+     * availability check stay as strict as under [FAIL], and so do the parts an NZB lists no article
+     * for. Each stretch filled is reported to the stream's onGap listener as a
+     * [io.skjaere.nzbstreamer.stream.Gap] before its zeros reach the channel, logged and counted
+     * (nzb.segments.zero_filled, nzb.segments.zero_filled.bytes); zeros are never cached, so a later
+     * play asks the providers again.
+     */
+    ZERO_FILL,
 }
 
 data class PrepareConfig(

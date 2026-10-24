@@ -9,6 +9,11 @@ import io.skjaere.nzbstreamer.nzb.printable
  * file its NZB lists no article for. A gap's [segment] is a placeholder with no article id (its
  * number is the gap's first part) and its [segmentIndex] is -1; reading it fails with
  * [SegmentGap.toException].
+ *
+ * [exactSize]: whether [segmentDecodedSize] is known to be the article's decoded size, as the file's
+ * layout gives it (the posted parts placed by number, or an NZB that lists every part), and not a
+ * guess (the last listed article taking whatever is left). Only then may zeros stand in for it
+ * ([io.skjaere.nzbstreamer.config.MissingArticlePolicy.ZERO_FILL]).
  */
 data class SegmentQueueItem @JvmOverloads constructor(
     val segment: NzbSegment,
@@ -19,6 +24,7 @@ data class SegmentQueueItem @JvmOverloads constructor(
     val readStart: Long,
     val readEnd: Long,
     val gap: SegmentGap? = null,
+    val exactSize: Boolean = false,
 )
 
 /**

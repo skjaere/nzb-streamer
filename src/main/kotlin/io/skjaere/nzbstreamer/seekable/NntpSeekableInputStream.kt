@@ -9,6 +9,7 @@ import io.micrometer.core.instrument.Metrics
 import io.skjaere.compressionutils.SeekableInputStream
 import io.skjaere.nzbstreamer.nzb.NzbDocument
 import io.skjaere.nzbstreamer.queue.SegmentQueueService
+import io.skjaere.nzbstreamer.stream.Gap
 import io.skjaere.nzbstreamer.stream.NntpStreamingService
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
@@ -30,11 +31,17 @@ private const val FORWARD_THRESHOLD_BYTES = 102400L
  * download that fails makes [read] throw why: its failure itself (an
  * [io.skjaere.nntp.ArticleNotFoundException], say), as streaming a plain file does. Downloads never
  * go past [end] (the whole of [nzb] by default): reads there end the stream.
+ *
+ * Its downloads are a stream's ([NntpStreamingService.streamSegments]): under
+ * [io.skjaere.nzbstreamer.config.MissingArticlePolicy.ZERO_FILL], zeros stand in for an article no
+ * provider has, and [onGap] gets each stretch they fill as offsets in [nzb]'s files laid end to end.
+ * So it is for a file's data, never its headers: those are read strictly ([SegmentRandomAccessStream]).
  */
 class NntpSeekableInputStream @JvmOverloads constructor(
     private val nzb: NzbDocument,
     private val streamingService: NntpStreamingService,
     end: Long = Long.MAX_VALUE,
+    private val onGap: ((Gap) -> Unit)? = null,
 ) : SeekableInputStream {
     private val logger = LoggerFactory.getLogger(NntpSeekableInputStream::class.java)
     private val forwardThresholdBytes: Long = FORWARD_THRESHOLD_BYTES
@@ -120,7 +127,11 @@ class NntpSeekableInputStream @JvmOverloads constructor(
         // A child of the reading coroutine, so it's cancelled with it and its failures go to no
         // exception handler: they reach the reader through the channel.
         currentJob = CoroutineScope(currentCoroutineContext()).launch {
-            streamingService.streamSegments(queue, name = "seek") { channel ->
+            // The stream's gaps from where it opens.
+            val gaps = onGap?.let { listener ->
+                { gap: Gap -> listener(gap.copy(fileRange = gap.fileRange.first + position..gap.fileRange.last + position)) }
+            }
+            streamingService.streamSegments(queue, name = "seek", onGap = gaps) { channel ->
                 channelReady.complete(channel)
                 suspendCancellableCoroutine<Unit> { }
             }

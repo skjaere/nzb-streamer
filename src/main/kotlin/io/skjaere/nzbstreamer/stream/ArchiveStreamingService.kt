@@ -99,10 +99,19 @@ class ArchiveStreamingService(
         is TranslatedFileEntry -> entry.splitParts
     }
 
+    /**
+     * Streams the file (or [range] of it) to [consume]. Under
+     * [io.skjaere.nzbstreamer.config.MissingArticlePolicy.ZERO_FILL], [onGap] gets each stretch that
+     * zeros fill as offsets in the file (from its start, whatever [range] is), before they're read; in
+     * an encrypted file, the plaintext they garble: the zeroed ciphertext rounded out to whole AES
+     * blocks, and the block after (decrypted with it as its IV). See
+     * [NntpStreamingService.streamSegments] for when it is called.
+     */
     suspend fun streamFile(
         archiveNzb: NzbDocument,
         namedSplits: NamedSplits,
         range: LongRange? = null,
+        onGap: ((Gap) -> Unit)? = null,
         consume: suspend (ByteReadChannel) -> Unit
     ) {
         val effectiveSplits = if (range != null) {
@@ -119,7 +128,7 @@ class ArchiveStreamingService(
         )
 
         if (effectiveSplits.any { it.encryption != null }) {
-            return streamEncrypted(archiveNzb, effectiveSplits, namedSplits.name, consume)
+            return streamEncrypted(archiveNzb, effectiveSplits, namedSplits.name, range?.first ?: 0L, onGap, consume)
         }
 
         val combinedQueue = flow {
@@ -129,7 +138,10 @@ class ArchiveStreamingService(
                 ).collect { emit(it) }
             }
         }
-        streamingService.streamSegments(combinedQueue, name = namedSplits.name, initialReadAheadSegments = firstSegmentsFor(range), consume = consume)
+        streamingService.streamSegments(
+            combinedQueue, name = namedSplits.name, initialReadAheadSegments = firstSegmentsFor(range),
+            onGap = onGap?.from(range?.first ?: 0L), consume = consume,
+        )
     }
 
     /**
@@ -139,12 +151,13 @@ class ArchiveStreamingService(
      * the writer has. A failure (an article no provider has, a timeout) never fails the caller's
      * job: the channel closes with it as its cause ([ByteReadChannel.closedCause]) once everything
      * in front of it has been written. Ktor drops the bytes the reader hasn't taken yet when a
-     * channel closes with a cause.
+     * channel closes with a cause. [onGap] as in [streamFile].
      */
     suspend fun launchStreamFile(
         archiveNzb: NzbDocument,
         namedSplits: NamedSplits,
-        range: LongRange? = null
+        range: LongRange? = null,
+        onGap: ((Gap) -> Unit)? = null,
     ): WriterJob {
         val effectiveSplits = if (range != null) {
             adjustSplitsForRange(namedSplits.splits, range.first, range.last - range.first + 1)
@@ -153,7 +166,7 @@ class ArchiveStreamingService(
         }
 
         if (effectiveSplits.any { it.encryption != null }) {
-            return launchEncryptedFileWriter(archiveNzb, effectiveSplits, namedSplits.name)
+            return launchEncryptedFileWriter(archiveNzb, effectiveSplits, namedSplits.name, range?.first ?: 0L, onGap)
         }
 
         val combinedQueue = flow {
@@ -163,7 +176,15 @@ class ArchiveStreamingService(
                 ).collect { emit(it) }
             }
         }
-        return streamingService.launchStreamSegments(combinedQueue, name = namedSplits.name, initialReadAheadSegments = firstSegmentsFor(range))
+        return streamingService.launchStreamSegments(
+            combinedQueue, name = namedSplits.name, initialReadAheadSegments = firstSegmentsFor(range),
+            onGap = onGap?.from(range?.first ?: 0L),
+        )
+    }
+
+    /** This listener, for gaps a stream reports from its first byte, given them as offsets from [start]. */
+    private fun ((Gap) -> Unit).from(start: Long): (Gap) -> Unit = { gap ->
+        this(gap.copy(fileRange = gap.fileRange.first + start..gap.fileRange.last + start))
     }
 
     /**
@@ -189,11 +210,13 @@ class ArchiveStreamingService(
         archiveNzb: NzbDocument,
         splits: List<SplitInfo>,
         name: String,
+        fileStart: Long,
+        onGap: ((Gap) -> Unit)?,
         consume: suspend (ByteReadChannel) -> Unit,
     ) {
         val failure = AtomicReference<Throwable?>()
         val early = coroutineScope {
-            val writerJob = launchEncryptedFileWriter(archiveNzb, splits, name) { failure.compareAndSet(null, it) }
+            val writerJob = launchEncryptedFileWriter(archiveNzb, splits, name, fileStart, onGap) { failure.compareAndSet(null, it) }
             try {
                 consume(writerJob.channel)
                 // As in NntpStreamingService.streamSegments: what failed before consume returned is
@@ -216,12 +239,15 @@ class ArchiveStreamingService(
     /**
      * [onFailure] gets the writer's failure (not its cancellation) before the channel closes with it,
      * unless the reader has closed the channel first: a write to the closed channel then is not the
-     * stream failing.
+     * stream failing. [onGap] gets the plaintext that zeroed ciphertext garbles ([garbledPlaintext]),
+     * as offsets in the file, whose byte [fileStart] the stream starts at.
      */
     private suspend fun launchEncryptedFileWriter(
         archiveNzb: NzbDocument,
         splits: List<SplitInfo>,
         name: String,
+        fileStart: Long,
+        onGap: ((Gap) -> Unit)?,
         onFailure: (Throwable) -> Unit = {},
     ): WriterJob {
         val password = archiveNzb.password
@@ -232,7 +258,15 @@ class ArchiveStreamingService(
                 // A scoped coroutine: a failure in here is thrown to the writer, which closes the
                 // channel with it, instead of failing the caller's job.
                 coroutineScope {
-                    val seekableStream = NntpSeekableInputStream(archiveNzb, streamingService, end = splits.maxOf(::encryptedReadEnd))
+                    // The ciphertext's gaps come in the volumes' bytes; the reader wants the plaintext's.
+                    val cipherGaps = onGap?.let { listener ->
+                        { gap: Gap ->
+                            garbledPlaintext(splits, gap.fileRange).forEach { plaintext ->
+                                listener(Gap(plaintext.first + fileStart..plaintext.last + fileStart, gap.cause))
+                            }
+                        }
+                    }
+                    val seekableStream = NntpSeekableInputStream(archiveNzb, streamingService, end = splits.maxOf(::encryptedReadEnd), onGap = cipherGaps)
                     try {
                         for (split in splits) {
                             val enc = checkNotNull(split.encryption) {
@@ -279,6 +313,41 @@ class ArchiveStreamingService(
             fun ciphertext(plaintext: Long) = (plaintext + AES_BLOCK - 1) / AES_BLOCK * AES_BLOCK
             return split.dataStartPosition + AES_BLOCK + ciphertext(enc.plaintextHeaderSize) +
                 ciphertext(enc.dataAreaPlaintextOffset + split.dataSize)
+        }
+
+        /**
+         * The plaintext a zeroed stretch of ciphertext garbles, [ciphertext] in the volumes' bytes laid
+         * end to end, as offsets in the stream of [splits]' plaintext (each split's data area, one after
+         * another): per split, from the AES block holding its first zeroed byte to the end of the block
+         * after its last, which CBC decrypts with the zeroed block as its IV, within what the split
+         * streams. A data area with its own IV (dataAreaIv) chains from its first block; without one,
+         * header and data area are one chain from the IV on disk ahead of it, which the first block
+         * decrypts with.
+         */
+        internal fun garbledPlaintext(splits: List<SplitInfo>, ciphertext: LongRange): List<LongRange> {
+            var streamAt = 0L
+            return splits.mapNotNull { split ->
+                val enc = checkNotNull(split.encryption) { "garbledPlaintext of an unencrypted split: $split" }
+                val splitStart = streamAt
+                streamAt += split.dataSize
+                fun ciphertextOf(plaintext: Long) = (plaintext + AES_BLOCK - 1) / AES_BLOCK * AES_BLOCK
+                val ownIv = enc.dataAreaIv != null
+                // Where the chain's block 0 lies on disk, and the first block of ciphertext in the chain:
+                // the IV on disk (block -1) decrypts block 0 when the data area has no IV of its own.
+                val blockZero = split.dataStartPosition + AES_BLOCK + if (ownIv) ciphertextOf(enc.plaintextHeaderSize) else 0L
+                val firstBlock = (ciphertext.first - blockZero).floorDiv(AES_BLOCK.toLong()).coerceAtLeast(if (ownIv) 0L else -1L)
+                val lastBlock = (ciphertext.last - blockZero).floorDiv(AES_BLOCK.toLong())
+                if (lastBlock < firstBlock) return@mapNotNull null
+                // The chain's plaintext from the first garbled block to the end of the one after the last zeroed,
+                // as offsets in the data area (past the header, in one chain with it).
+                val before = if (ownIv) 0L else enc.plaintextHeaderSize
+                val from = firstBlock.coerceAtLeast(0L) * AES_BLOCK - before
+                val to = (lastBlock + 2) * AES_BLOCK - before
+                // Of that, what the split streams: its data area from dataAreaPlaintextOffset.
+                val start = maxOf(from, enc.dataAreaPlaintextOffset)
+                val end = minOf(to, enc.dataAreaPlaintextOffset + split.dataSize)
+                if (start >= end) null else splitStart + (start - enc.dataAreaPlaintextOffset) until splitStart + (end - enc.dataAreaPlaintextOffset)
+            }
         }
 
         private fun splitOverlapsRange(
@@ -428,10 +497,12 @@ class ArchiveStreamingService(
         file: StreamableFile,
         range: LongRange? = null,
         streamName: String? = null,
+        onGap: ((Gap) -> Unit)? = null,
         consume: suspend (ByteReadChannel) -> Unit
     ) {
+        // See the NamedSplits overload for onGap.
         val namedSplits = NamedSplits(file.toSplits(archiveNzb), file.totalSize, streamName ?: file.path)
-        streamFile(archiveNzb, namedSplits, range, consume = consume)
+        streamFile(archiveNzb, namedSplits, range, onGap, consume)
     }
 
     /** Starts streaming [file]; see the [NamedSplits] overload for the writer's lifetime and failures. */
@@ -440,8 +511,9 @@ class ArchiveStreamingService(
         file: StreamableFile,
         range: LongRange? = null,
         streamName: String? = null,
+        onGap: ((Gap) -> Unit)? = null,
     ): WriterJob {
         val namedSplits = NamedSplits(file.toSplits(archiveNzb), file.totalSize, streamName ?: file.path)
-        return launchStreamFile(archiveNzb, namedSplits, range)
+        return launchStreamFile(archiveNzb, namedSplits, range, onGap)
     }
 }
