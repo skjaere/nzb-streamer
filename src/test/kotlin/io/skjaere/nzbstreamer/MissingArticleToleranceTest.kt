@@ -3,6 +3,7 @@ package io.skjaere.nzbstreamer
 import io.github.resilience4j.circuitbreaker.CircuitBreakerRegistry
 import io.ktor.utils.io.ByteReadChannel
 import io.ktor.utils.io.readAvailable
+import io.ktor.utils.io.readByte
 import io.ktor.utils.io.readFully
 import io.ktor.utils.io.toByteArray
 import io.skjaere.compressionutils.generation.ArchiveGenerator
@@ -37,6 +38,7 @@ import kotlin.test.assertIs
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
@@ -291,6 +293,29 @@ class MissingArticleToleranceTest {
         }
     }
 
+    /**
+     * The reader learns of a stretch before it can read the first of its zeros, so it can stop there and never hand them
+     * on. The listener takes its time: were the zeros written before it was told, the reader would have the first of
+     * them by then, on another thread.
+     */
+    @Test
+    fun `a gap is reported before the first of its zeros can be read`() = runBlocking<Unit>(Dispatchers.Default) {
+        post(name, movie)
+        missing += id(name, 3)
+        streamer().use { streamer ->
+            val prepared = assertIs<PrepareResult.Success>(streamer.prepare(nzb()))
+            val gaps = CopyOnWriteArrayList<Gap>()
+            var known: List<Gap>? = null
+            val file = streamer.resolveStreamableFiles(prepared.metadata).single()
+            streamer.streamFile(prepared.metadata, file, onGap = { gap -> Thread.sleep(300); gaps += gap }) { channel ->
+                channel.readFully(ByteArray(partRange(3).first.toInt()))
+                assertEquals(0.toByte(), channel.readByte(), "the gap's first byte")
+                known = gaps.toList()
+            }
+            assertEquals(listOf(Gap(partRange(3), Gap.Cause.Missing)), known, "the gaps known as its first zero was read")
+        }
+    }
+
     @Test
     fun `an article no provider has a readable copy of streams as zeros, reported as malformed`() = runBlocking<Unit> {
         post(name, movie)
@@ -429,6 +454,26 @@ class MissingArticleToleranceTest {
                 runCatching { stream.read(ByteArray(16), 0, 16) }.exceptionOrNull()
             }
             assertTrue(read.chain().any { it is ArticleNotFoundException }, "read: $read")
+        }
+    }
+
+    /**
+     * A PAR2 index is read a segment at a time too: one that lacks an article past its first is gone without, as under
+     * FAIL, the release opening all the same. Its packets are never read on through zeros, which would end them early.
+     */
+    @Test
+    fun `a PAR2 index that lacks an article is read strictly, not through zeros`() = runBlocking<Unit> {
+        post(name, movie)
+        val index = buildPar2IndexFile(name, movie.size.toLong()).let { packet -> generateSequence { packet }.take(300).reduce(ByteArray::plus) }
+        check(index.size > 2 * partSize) { "test setup: the index's size" }
+        post("Movie.2020.par2", index)
+        missing += id("Movie.2020.par2", 2)
+        val provider = server()
+        streamer(providers = listOf(provider)).use { streamer ->
+            val enriched = assertIs<EnrichmentResult.Success>(streamer.enrich(nzb())).enrichedNzb
+            assertTrue(id("Movie.2020.par2", 2) in provider.bodiesRead, "the index's read didn't reach the missing article")
+            val par2 = enriched.files.single { it.yencHeaders?.name == "Movie.2020.par2" }
+            assertNull(par2.par2Data, "the index was read on past its missing article")
         }
     }
 
