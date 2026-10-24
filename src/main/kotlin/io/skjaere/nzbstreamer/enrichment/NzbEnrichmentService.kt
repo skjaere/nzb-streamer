@@ -9,6 +9,7 @@ import io.skjaere.nntp.NntpException
 import io.skjaere.nzbstreamer.nzb.NzbDocument
 import io.skjaere.nzbstreamer.nzb.NzbFile
 import io.skjaere.nzbstreamer.queue.SegmentQueueService
+import io.skjaere.nzbstreamer.stream.LackedWhereAskedException
 import io.skjaere.nzbstreamer.stream.NntpPriority
 import io.skjaere.nzbstreamer.stream.NntpStreamingService
 import kotlinx.coroutines.CancellationException
@@ -155,7 +156,7 @@ class NzbEnrichmentService(
         // names a volume no file holds, or doesn't name every volume the release has.
         val volumes = release.Volumes(nzb.files, named)
         val found = try {
-            val unknown = ConcurrentHashMap<Int, ArticleNotFoundException>()
+            val unknown = ConcurrentHashMap<Int, Exception>()
             fetchFirstArticles(nzb, volumes.toCheck) { i, e -> unknown[i] = e }
             val result = when (val outcome = volumes.found(unknown)) {
                 is ReleaseFiles.Found.Missing -> throw outcome.cause
@@ -263,13 +264,14 @@ class NzbEnrichmentService(
     /**
      * Fetches the first article of each file of [nzb] at [indices], at most enrichmentConcurrency at a
      * time, each passed to [fetched] whole, decoded, with its index. One that lacks it goes to
-     * [lacks], which may throw to fail them all.
+     * [lacks], which may throw to fail them all, with its cause: the 430, or where a pool its breaker
+     * passed over couldn't serve it once the others answered 430, that pool's failure (N93).
      */
     private suspend fun fetchFirstArticles(
         nzb: NzbDocument,
         indices: List<Int>,
         fetched: (Int, ByteArray) -> Unit = { _, _ -> },
-        lacks: (Int, ArticleNotFoundException) -> Unit,
+        lacks: (Int, Exception) -> Unit,
     ) {
         coroutineScope {
             indices.map { i ->
@@ -279,6 +281,10 @@ class NzbEnrichmentService(
                             enrichFile(nzb.files[i])?.let { fetched(i, it) }
                         } catch (e: ArticleNotFoundException) {
                             lacks(i, e)
+                        } catch (e: LackedWhereAskedException) {
+                            // Lacking, as it was before the pool passed over was asked; failing for want of that pool,
+                            // where the release needs it, rather than missing.
+                            lacks(i, e.failure)
                         }
                     }
                 }

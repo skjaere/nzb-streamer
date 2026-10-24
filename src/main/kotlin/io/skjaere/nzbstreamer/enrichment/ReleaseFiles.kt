@@ -248,7 +248,7 @@ internal class ReleaseFiles(private val files: List<NzbFile>) {
          * names does (NR-13). A volume known by its content alone that nothing places, beside
          * others the PAR2 data names, is [Found.Unplaced] too ([unplacedBesideNamed]).
          */
-        fun found(unknown: Map<Int, ArticleNotFoundException>): Found {
+        fun found(unknown: Map<Int, Exception>): Found {
             val hashes = hashes()
             val incomplete = mutableMapOf<Int, Exception>()
             val openedSets = opened(hashes, emptyMap())
@@ -441,7 +441,9 @@ internal class ReleaseFiles(private val files: List<NzbFile>) {
 
         /**
          * The release can't open whole: [cause] is an [ArticleNotFoundException], or an
-         * [ArchiveVolumeNotInNzbException] where no provider can supply what it lacks (NR-18).
+         * [ArchiveVolumeNotInNzbException] where no provider can supply what it lacks (NR-18), or
+         * where a provider its breaker passed over couldn't serve a first article the others lack,
+         * that provider's failure (N93).
          */
         data class Missing(val cause: Exception) : Found
         data class Unplaced(val name: String) : Found

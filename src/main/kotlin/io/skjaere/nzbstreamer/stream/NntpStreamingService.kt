@@ -593,7 +593,11 @@ class NntpStreamingService(
      *
      * A pool whose breaker passes it over was never asked (N93): when every pool asked lacks the
      * article or has only a bad copy of it, those passed over are asked once, their breakers aside,
-     * before the call fails on that.
+     * before the call fails on that. Where [block] fetches the article [articleId], each such ask has
+     * the time a segment's fetch has in all (twice the segment fetch timeout, as [fetchSegmentFromNntp]
+     * gives a pool), its running out a [SegmentTimeoutException]; and where every pool asked answered
+     * 430 and none passed over served it, the call fails with a [LackedWhereAskedException] around the
+     * last one's failure: no worse than before it was asked, for prepare.
      *
      * Throws the last fallback-triggering exception if every pool fails, except that a 430
      * never replaces another failure: a pool whose connection dropped may have the article.
@@ -601,6 +605,7 @@ class NntpStreamingService(
     @Suppress("TooGenericExceptionCaught")
     private suspend fun <T> withFallback(
         logPrefix: String,
+        articleId: String? = null,
         block: suspend (entry: PoolEntry) -> T
     ): T {
         val snapshot = poolLock.read { pools.toList() }
@@ -614,11 +619,11 @@ class NntpStreamingService(
         // (timeout, IO failure) instead of an opaque "no permits anywhere" miss.
         val effectiveBreakerActive = snapshot.size > 1 &&
             !snapshot.all { circuitBreakerFor(it).state == CircuitBreaker.State.OPEN }
-        var lastException: Throwable? = null
+        var lastException: Exception? = null
         // Whether a pool asked failed other than with a 430 or a bad copy: the call's failure is then the pool's, which
         // a pool passed over can't change.
         var poolFailed = false
-        fun record(e: Throwable) {
+        fun record(e: Exception) {
             if (e !is ArticleNotFoundException && e !is YencDecodingException) poolFailed = true
             if (e is ArticleNotFoundException && lastException.let { it != null && it !is ArticleNotFoundException }) return
             lastException = e
@@ -648,9 +653,15 @@ class NntpStreamingService(
                 "{} not served by the pools asked; asking the {} passed over by their breakers",
                 logPrefix, passedOver.size,
             )
+            // A 430 never replaces another failure, so every pool asked answered 430 when the last failure is one.
+            val lackedWhereAsked = lastException is ArticleNotFoundException
+            val ask = articleId?.let { id -> withinSegmentTime(id, logPrefix, block) } ?: block
             passedOver.firstNotNullOfOrNull { (index, entry) ->
-                tryOnePool(entry, breaker = null, index, snapshot.size, logPrefix, block, ::record)
+                tryOnePool(entry, breaker = null, index, snapshot.size, logPrefix, ask, ::record)
             }?.let { return it }
+            if (articleId != null && lackedWhereAsked && lastException !is ArticleNotFoundException) {
+                throw LackedWhereAskedException(lastException!!)
+            }
         }
         if (lastException != null) throw lastException!!
         // We get here when `effectiveBreakerActive` was true at preflight (so the breakers
@@ -683,6 +694,30 @@ class NntpStreamingService(
         ))
     }
 
+    /**
+     * [block], for the article [articleId], on a pool its breaker passed over: within the time a segment's fetch has in
+     * all, its connection's wait included (twice the segment fetch timeout), or a [SegmentTimeoutException]. That pool is
+     * known to be failing, so its one ask mustn't hold prepare for its connection's own timeouts.
+     */
+    private fun <T> withinSegmentTime(
+        articleId: String,
+        logPrefix: String,
+        block: suspend (entry: PoolEntry) -> T,
+    ): suspend (PoolEntry) -> T = { entry ->
+        val timeoutMs = currentSegmentFetchTimeoutMs
+        try {
+            withTimeout(timeoutMs.milliseconds * 2) { block(entry) }
+        } catch (e: TimeoutCancellationException) {
+            // This ask's own timeout only: a caller's timeout (or other cancellation) has cancelled this coroutine too,
+            // and goes on up as the caller's.
+            currentCoroutineContext().ensureActive()
+            throw SegmentTimeoutException(
+                articleId, timeoutMs,
+                "$logPrefix timed out after ${timeoutMs * 2}ms on ${entry.name}, a pool its breaker had passed over", e,
+            )
+        }
+    }
+
     @Suppress("TooGenericExceptionCaught", "LongParameterList")
     private suspend fun <T> tryOnePool(
         entry: PoolEntry,
@@ -691,7 +726,7 @@ class NntpStreamingService(
         totalPools: Int,
         logPrefix: String,
         block: suspend (entry: PoolEntry) -> T,
-        recordException: (Throwable) -> Unit,
+        recordException: (Exception) -> Unit,
     ): T? {
         val callStart = System.nanoTime()
         return try {
@@ -804,14 +839,16 @@ class NntpStreamingService(
      * [articleId]'s article whole, its yEnc headers and decoded bytes, from the first pool that has
      * it, at [priority]: prepare reads a file's name and size from its first article's. A damaged
      * copy (its CRC isn't its =yend line's) is tried on the next pool, and with no good copy on any
-     * it is used or is the failure, as [StreamingConfig.crcMismatch] says, as for a segment.
+     * it is used or is the failure, as [StreamingConfig.crcMismatch] says, as for a segment. Where
+     * every pool asked lacks it and a pool its breaker passed over, asked then, doesn't serve it, the
+     * failure is a [LackedWhereAskedException] ([withFallback]).
      */
     internal suspend fun fetchArticle(articleId: String, priority: NntpPriority): FetchedArticle {
         val shown = articleId.printable()
         // Pools whose copy of it is damaged, in the order tried, with the mismatch.
         val mismatched = mutableListOf<Pair<String, YencCrcMismatchException>>()
         return try {
-            val article = withFallback("Article <$shown>") { entry ->
+            val article = withFallback("Article <$shown>", articleId) { entry ->
                 try {
                     entry.pool.withClient(priority.value) { it.bodyYencBytes("<$articleId>") }
                 } catch (e: YencCrcMismatchException) {

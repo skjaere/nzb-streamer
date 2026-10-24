@@ -32,7 +32,8 @@ import org.junit.jupiter.api.Test
  * N93: a pool whose circuit breaker is open is passed over, so it was never asked. An article the pools that were asked
  * lack is therefore asked of it once (its breaker aside, within the segment timeout as any pool) before it is called
  * missing: an article is missing only when every pool answered 430. When the skipped pool fails instead, the article is
- * unavailable, not missing.
+ * unavailable, not missing. Prepare is then no worse off than before that pool was asked: a file the release opens
+ * without is left out, as for a 430, and one it needs fails as unavailable.
  */
 class SkippedPoolTest {
     private val servers = mutableListOf<FakeNntpServer>()
@@ -207,6 +208,82 @@ class SkippedPoolTest {
             val result = NzbEnrichmentService(service).enrich(nzb())
 
             assertIs<EnrichmentResult.Failure>(result, "got $result")
+        }
+    }
+
+    /** Prepare's ask of a pool passed over is bounded as a segment's is: one that never answers fails it as unavailable, soon. */
+    @Test
+    fun `a first article the passed-over pool never answers fails to prepare within the segment timeout, not as missing`() = runBlocking<Unit> {
+        val skipped = server(has = { true }, held = true)
+        val lacking = server(has = { false })
+        service(skipped, lacking, config = StreamingConfig(segmentFetchTimeoutMs = 300)).use { service ->
+            service.open(skipped)
+
+            val result = withTimeout(5_000) { NzbEnrichmentService(service).enrich(nzb()) }
+
+            val failure = assertIs<EnrichmentResult.Failure>(result, "got $result")
+            assertTrue(failure.cause.chain().any { it is SegmentTimeoutException }, "failed with: ${failure.cause}")
+        }
+    }
+
+    // A film and its PAR2 index, which the release opens without: asking the pool passed over for the index's first
+    // article, which the others lack, can only find it there; that pool failing leaves the index out, as before it was
+    // asked, rather than fail the release.
+
+    private val film = Random(10).nextBytes(16 * 1024)
+    private val index = Random(11).nextBytes(4 * 1024)
+
+    private fun posted(id: String): ByteArray? = when (id) {
+        "<film@test>" -> YencEncoder.encodeSinglePart(film, "Movie.2020.mkv").data
+        "<index@test>" -> YencEncoder.encodeSinglePart(index, "Movie.2020.par2").data
+        else -> null
+    }
+
+    /** A provider of the film and its index, but for what it [lacks]; [held]: its answers wait for the gate; [dropAfter]: as [server]'s. */
+    private fun provider(lacks: (String) -> Boolean = { false }, dropAfter: Int? = null, held: Boolean = false) = FakeNntpServer(
+        body = { id ->
+            if (held) gate.await(60, TimeUnit.SECONDS)
+            posted(id).takeUnless { lacks(id) }
+        },
+        dropAfter = { dropAfter },
+    ).also { servers += it }
+
+    private fun filmNzb() = NzbDocument(
+        listOf("Movie.2020.mkv" to film to "film@test", "Movie.2020.par2" to index to "index@test").map { (named, id) ->
+            val (name, data) = named
+            NzbFile(
+                poster = "test", date = 0, subject = "\"$name\" yEnc (1/1)", groups = listOf("alt.binaries.test"),
+                segments = listOf(NzbSegment(data.size.toLong(), 1, id)),
+            )
+        }
+    )
+
+    @Test
+    fun `a file the release opens without, whose first article the pools asked lack, is left out when the pool passed over fails`() = runBlocking<Unit> {
+        val skipped = provider(dropAfter = 2_000)
+        val lacking = provider(lacks = { it == "<index@test>" })
+        service(skipped, lacking).use { service ->
+            service.open(skipped)
+
+            val result = NzbEnrichmentService(service).enrich(filmNzb())
+
+            val success = assertIs<EnrichmentResult.Success>(result, "got $result")
+            assertEquals(listOf("Movie.2020.mkv"), success.enrichedNzb.files.map { it.yencHeaders?.name })
+            assertTrue("<index@test>" in skipped.bodiesRead, "the passed-over pool wasn't asked")
+        }
+    }
+
+    @Test
+    fun `a file the release opens without, whose first article the pools asked lack, is left out soon when the pool passed over never answers`() = runBlocking<Unit> {
+        val skipped = provider(held = true)
+        val lacking = provider(lacks = { it == "<index@test>" })
+        service(skipped, lacking, config = StreamingConfig(segmentFetchTimeoutMs = 300)).use { service ->
+            service.open(skipped)
+
+            val result = withTimeout(5_000) { NzbEnrichmentService(service).enrich(filmNzb()) }
+
+            val success = assertIs<EnrichmentResult.Success>(result, "got $result")
+            assertEquals(listOf("Movie.2020.mkv"), success.enrichedNzb.files.map { it.yencHeaders?.name })
         }
     }
 }
