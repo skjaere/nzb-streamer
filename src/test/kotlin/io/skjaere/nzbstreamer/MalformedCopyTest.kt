@@ -4,6 +4,7 @@ import io.github.resilience4j.circuitbreaker.CircuitBreaker
 import io.github.resilience4j.circuitbreaker.CircuitBreakerRegistry
 import io.ktor.utils.io.toByteArray
 import io.skjaere.nntp.ArticleNotFoundException
+import io.skjaere.nntp.NntpConnectionException
 import io.skjaere.nntp.YencDecodingException
 import io.skjaere.nntp.YencHeaders
 import io.skjaere.nzbstreamer.config.NntpConfig
@@ -161,6 +162,29 @@ class MalformedCopyTest {
             assertTrue("<seg0@test>" in fill.bodiesRead)
         }
     }
+
+    /**
+     * A provider whose connection dropped may have a good copy: that says more than another's malformed one, whichever
+     * pool comes first, as for a segment. The failure is then the provider's (the app rechecks its providers), not a
+     * corrupt release.
+     */
+    @Test
+    fun `a first article malformed on one pool and dropped on another fails to prepare with the dropped connection, in either order`() =
+        runBlocking<Unit> {
+            for (droppingFirst in listOf(true, false)) {
+                val bad = server { malformed(segments[it]) }
+                val dropping = FakeNntpServer(body = { id -> good(segments[id.segment()]) }, dropAfter = { 2_000 }).also { servers += it }
+                val pools = if (droppingFirst) arrayOf(dropping, bad) else arrayOf(bad, dropping)
+                service(*pools).use { service ->
+                    val result = NzbEnrichmentService(service).enrich(nzb())
+
+                    val order = if (droppingFirst) "dropping, malformed" else "malformed, dropping"
+                    val failure = assertIs<EnrichmentResult.Failure>(result, "$order: got $result")
+                    assertTrue(failure.cause.chain().none { it is YencDecodingException }, "$order: failed with ${failure.cause}")
+                    assertTrue(failure.cause.chain().any { it is NntpConnectionException }, "$order: failed with ${failure.cause}")
+                }
+            }
+        }
 
     @Test
     fun `a release whose first article no pool has a readable copy of fails to prepare as malformed`() = runBlocking<Unit> {

@@ -17,6 +17,7 @@ import io.skjaere.nzbstreamer.nzb.NzbSegment
 import io.skjaere.nzbstreamer.queue.SegmentQueueService
 import io.skjaere.nzbstreamer.stream.NntpStreamingService
 import io.skjaere.nzbstreamer.stream.SegmentCache
+import io.skjaere.nntp.NntpConnectionException
 import io.skjaere.nntp.YencCrcMismatchException
 import io.skjaere.nntp.YencHeaders
 import io.skjaere.yenc.RapidYenc
@@ -233,6 +234,24 @@ class CrcMismatchTest {
             assertIs<YencCrcMismatchException>(failure.cause)
         }
     }
+
+    /** STRICT: a provider whose connection dropped may have a good copy, which says more than another's damaged one, whichever comes first. */
+    @Test
+    fun `with crcMismatch STRICT a first article damaged on one pool and dropped on another fails to prepare with the dropped connection`() =
+        runBlocking<Unit> {
+            for (droppingFirst in listOf(true, false)) {
+                val bad = server(::damaged)
+                val dropping = FakeNntpServer(body = { id -> good(segments[id.segment()]) }, dropAfter = { 2_000 }).also { servers += it }
+                val pools = if (droppingFirst) arrayOf(dropping, bad) else arrayOf(bad, dropping)
+                service(*pools, config = StreamingConfig(crcMismatch = CrcMismatchPolicy.STRICT)).use { service ->
+                    val result = NzbEnrichmentService(service).enrich(nzb())
+
+                    val order = if (droppingFirst) "dropping, damaged" else "damaged, dropping"
+                    val failure = assertIs<EnrichmentResult.Failure>(result, "$order: got $result")
+                    assertTrue(generateSequence(failure.cause) { it.cause }.any { it is NntpConnectionException }, "$order: failed with ${failure.cause}")
+                }
+            }
+        }
 
     @Test
     fun `a first article damaged on one pool is prepared from the next, without counting against the first`(@TempDir tmp: Path) =

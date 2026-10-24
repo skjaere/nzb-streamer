@@ -599,8 +599,10 @@ class NntpStreamingService(
      * 430 and none passed over served it, the call fails with a [LackedWhereAskedException] around the
      * last one's failure: no worse than before it was asked, for prepare.
      *
-     * Throws the last fallback-triggering exception if every pool fails, except that a 430
-     * never replaces another failure: a pool whose connection dropped may have the article.
+     * Throws, if every pool fails, the failure that says most of the article, the last of those: a
+     * pool's own failure (its connection dropped, its login rejected: it may have a good copy), then
+     * a damaged copy, then one that can't be read, then a 430, as [fetchSegmentFromNntp] ranks them,
+     * so that which it is doesn't hang on the order the pools come in.
      */
     @Suppress("TooGenericExceptionCaught")
     private suspend fun <T> withFallback(
@@ -623,9 +625,17 @@ class NntpStreamingService(
         // Whether a pool asked failed other than with a 430 or a bad copy: the call's failure is then the pool's, which
         // a pool passed over can't change.
         var poolFailed = false
+        // How much a failure says of the article: a pool that failed may have a good copy, a damaged copy at least
+        // holds its bytes, one whose header can't be read doesn't, and a 430 says only that one pool lacks it.
+        fun rank(e: Exception) = when (e) {
+            is ArticleNotFoundException -> 0
+            is YencCrcMismatchException -> 2
+            is YencDecodingException -> 1
+            else -> 3
+        }
         fun record(e: Exception) {
             if (e !is ArticleNotFoundException && e !is YencDecodingException) poolFailed = true
-            if (e is ArticleNotFoundException && lastException.let { it != null && it !is ArticleNotFoundException }) return
+            if (lastException.let { it != null && rank(e) < rank(it) }) return
             lastException = e
         }
         var anyAttempted = false
@@ -653,7 +663,7 @@ class NntpStreamingService(
                 "{} not served by the pools asked; asking the {} passed over by their breakers",
                 logPrefix, passedOver.size,
             )
-            // A 430 never replaces another failure, so every pool asked answered 430 when the last failure is one.
+            // A 430 gives way to any other failure, so every pool asked answered 430 when the failure kept is one.
             val lackedWhereAsked = lastException is ArticleNotFoundException
             val ask = articleId?.let { id -> withinSegmentTime(id, logPrefix, block) } ?: block
             passedOver.firstNotNullOfOrNull { (index, entry) ->
