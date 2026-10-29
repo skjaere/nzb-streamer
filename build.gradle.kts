@@ -35,6 +35,7 @@ dependencies {
     testImplementation(libs.kotlin.test)
     testImplementation(libs.junit.jupiter)
     testImplementation(libs.kotlinx.coroutines.test)
+    testImplementation(libs.logback.classic)
     testImplementation(libs.testcontainers)
     testImplementation("com.github.skjaere:mock-nntp-server:v0.2.0")
     // The mock's release brings Ktor 3.4.0's client and server: lifted to ktor-nntp-client's Ktor, so the tests don't

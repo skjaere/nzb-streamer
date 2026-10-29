@@ -39,7 +39,8 @@ data class StreamingConfig(
      *
      * It runs from when the pool hands the fetch a connection: a fetch queued behind the
      * others for one isn't given less. The wait for a connection has as long again of its own,
-     * and a fetch on one pool, its retry on another connection included, twice this at most.
+     * and a fetch on one pool, its retries on other connections included (after one dropped, or
+     * [segmentTimeoutRetries]), twice this at most.
      */
     val segmentFetchTimeoutMs: Long = 5_000L,
     /**
@@ -126,6 +127,17 @@ data class StreamingConfig(
      * are the NNTP client's own.
      */
     val poolTuning: PoolTuning = PoolTuning(),
+    /**
+     * How many times a segment whose fetch ran out of [segmentFetchTimeoutMs] on a connection is
+     * fetched again on another connection of the same pool, within the time the fetch has on that
+     * pool in all (twice [segmentFetchTimeoutMs], the wait for a connection included): after a
+     * timeout that leaves room for one. A connection that died in use, or idle where no check
+     * found it ([PoolTuning.validateAfterIdleMs]), then costs one timeout, where the segment
+     * failed (and with one pool, the stream). Each timeout tried again is logged and counted as
+     * one the fetch failed with. A wait for a connection that runs out isn't tried again. With
+     * several pools the next one is asked once the retry has failed too. 0: never.
+     */
+    val segmentTimeoutRetries: Int = 0,
 ) {
     init {
         // As NntpStreamingService.setReadAheadBytes: no bytes would stream a segment at a time.
@@ -133,6 +145,7 @@ data class StreamingConfig(
         require(initialReadAheadSegments == null || initialReadAheadSegments > 0) {
             "initialReadAheadSegments must be > 0, got $initialReadAheadSegments"
         }
+        require(segmentTimeoutRetries >= 0) { "segmentTimeoutRetries must be >= 0, got $segmentTimeoutRetries" }
     }
 
     companion object {

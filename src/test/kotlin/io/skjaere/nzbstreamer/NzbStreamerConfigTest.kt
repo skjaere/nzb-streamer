@@ -170,6 +170,13 @@ class NzbStreamerConfigTest {
         )
     }
 
+    /** A config that says nothing of it (debridav's) fails a segment at its first timeout, as before. */
+    @Test
+    fun `a streaming config tries no timed-out segment again by default`() {
+        assertEquals(0, StreamingConfig().segmentTimeoutRetries)
+        assertFailsWith<IllegalArgumentException> { StreamingConfig(segmentTimeoutRetries = -1) }
+    }
+
     /** setReadAheadBytes refused a budget of no bytes, and a config took one: it streamed a segment at a time. */
     @Test
     fun `a streaming config refuses a read-ahead of no bytes`() {
