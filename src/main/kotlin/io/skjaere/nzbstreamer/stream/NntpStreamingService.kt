@@ -147,8 +147,9 @@ private fun headersKey(articleId: String) = "$articleId\u0000yenc-headers"
 internal class FetchedArticle(val article: YencArticle, val storable: Boolean)
 
 /**
- * How a segment's fetch on one pool went ([NntpStreamingService.withConnectionWithin]): how many tries it made, and how
- * many of them the pool handed a connection. A timeout's message says from them what ran out.
+ * How a segment's fetch on one pool went ([NntpStreamingService.withConnectionWithin]): how many tries it made, how
+ * many of them the pool handed a connection, and whether the last still held its own. A timeout's message says from
+ * them what ran out.
  */
 private class Tries {
     @Volatile
@@ -157,12 +158,22 @@ private class Tries {
     @Volatile
     var connected = 0
 
+    // Whether the last try held a connection: not once that one dropped, while the pool gets it another to fetch again
+    // on (its command retry). A try whose time runs out then was waiting for a connection, not on one.
+    @Volatile
+    var holding = false
+
     /** What ran out, in a timeout's words, given [timeoutMs] a try. Only a try that had a connection is tried again. */
-    fun ranOut(timeoutMs: Long): String = when {
-        connected == 0 -> "got no connection within ${timeoutMs}ms"
-        made == 1 -> "timed out after ${timeoutMs}ms"
-        connected == made -> "timed out after ${timeoutMs}ms and again on another connection"
-        else -> "timed out after ${timeoutMs}ms and got no other connection in time"
+    fun ranOut(timeoutMs: Long): String {
+        val lost = connected == made && !holding
+        return when {
+            connected == 0 -> "got no connection within ${timeoutMs}ms"
+            made == 1 && lost -> "lost its connection and got no other in time"
+            made == 1 -> "timed out after ${timeoutMs}ms"
+            lost -> "timed out after ${timeoutMs}ms, then lost the next connection and got no other in time"
+            connected == made -> "timed out after ${timeoutMs}ms and again on another connection"
+            else -> "timed out after ${timeoutMs}ms and got no other connection in time"
+        }
     }
 }
 
@@ -1996,12 +2007,21 @@ class NntpStreamingService(
                 // Completed once the pool has handed this try a connection: a timeout before that was the wait for one.
                 val connected = CompletableDeferred<Unit>()
                 tries.made++
+                tries.holding = false
                 try {
                     return coroutineScope {
                         val call = async {
                             pool.withClient(NntpPriority.STREAMING.value) { client ->
                                 if (connected.complete(Unit)) tries.connected++
-                                withTimeout(timeoutMs.milliseconds) { fetch(client) }
+                                tries.holding = true
+                                try {
+                                    withTimeout(timeoutMs.milliseconds) { fetch(client) }
+                                } catch (e: Throwable) {
+                                    // Cancelled: its time ran out on this connection (or the caller's did), so it
+                                    // still had one. Anything else lost it, and the pool may fetch again on another.
+                                    if (e !is CancellationException) tries.holding = false
+                                    throw e
+                                }
                             }
                         }
                         // A call that fails before it has a connection fails this scope, which ends the wait.

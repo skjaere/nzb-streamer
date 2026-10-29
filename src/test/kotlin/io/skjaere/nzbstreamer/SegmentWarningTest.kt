@@ -12,6 +12,7 @@ import io.skjaere.nzbstreamer.stream.SegmentTimeoutException
 import io.skjaere.yenc.YencEncoder
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertTrue
@@ -56,9 +57,14 @@ class SegmentWarningTest {
         login: (String, String) -> Boolean = { _, _ -> true },
     ) = FakeNntpServer(body = body, dropAfter = dropAfter, login = login).also { servers += it }
 
-    private fun service(vararg providers: FakeNntpServer, user: String = "") = NntpStreamingService(
-        providers.map { NntpConfig("127.0.0.1", it.port, user, user, useTls = false, maxConnections = 1) },
-        StreamingConfig(segmentFetchTimeoutMs = TIMEOUT_MS),
+    private fun service(
+        vararg providers: FakeNntpServer,
+        user: String = "",
+        connections: Int = 1,
+        config: StreamingConfig = StreamingConfig(segmentFetchTimeoutMs = TIMEOUT_MS),
+    ) = NntpStreamingService(
+        providers.map { NntpConfig("127.0.0.1", it.port, user, user, useTls = false, maxConnections = connections) },
+        config,
     ).also { runBlocking { it.connect() } }
 
     private fun warnings() = appender.list.toList().filter { it.level == Level.WARN }.map { it.formattedMessage }
@@ -103,6 +109,59 @@ class SegmentWarningTest {
             // Then the connection's own words.
             val expected = "Segment <a@test> NNTP error on pool[0] (127.0.0.1:${server.port}), no pool left to try — NntpConnectionLostException: "
             assertTrue(lines.single().startsWith(expected), lines.single())
+        }
+    }
+
+    /**
+     * A fetch whose connection dropped is fetched again by the pool on another, inside the same try. When no other came
+     * in time, the fetch had had a connection once, and said it timed out on one: a dead or slow connection, where the
+     * cause was getting none (the account at its limit, a login that never finished).
+     */
+    @Test
+    fun `a fetch whose connection dropped and got no other says so`() = runBlocking<Unit> {
+        // The first connection drops partway through the article, and the login of the one the pool opens in its place
+        // is never answered.
+        val logins = AtomicInteger()
+        val server = server(
+            dropAfter = { 100 },
+            login = { _, _ -> if (logins.getAndIncrement() > 0) gate.await(60, TimeUnit.SECONDS); true },
+        )
+        service(server, user = "user").use { service ->
+            val failure = assertFailsWith<SegmentTimeoutException> { service.fetchSegment("a@test") }
+
+            assertEquals(
+                listOf("Segment <a@test> lost its connection and got no other in time on all 1 pool(s)"),
+                warnings(),
+            )
+            assertEquals(
+                "Segment <a@test> lost its connection and got no other in time on pool[0] (127.0.0.1:${server.port})",
+                failure.message,
+            )
+        }
+    }
+
+    @Test
+    fun `a retry whose connection dropped and got no other says so`() = runBlocking<Unit> {
+        // The first BODY is never answered; the retry's connection drops partway through the article, and the login of
+        // the one the pool opens in its place is never answered.
+        val bodies = AtomicInteger()
+        val logins = AtomicInteger()
+        val server = server(
+            body = { if (bodies.incrementAndGet() == 1) gate.await(60, TimeUnit.SECONDS); article },
+            dropAfter = { if (bodies.get() == 2) 100 else null },
+            login = { _, _ -> if (logins.getAndIncrement() > 1) gate.await(60, TimeUnit.SECONDS); true },
+        )
+        val retrying = StreamingConfig(segmentFetchTimeoutMs = TIMEOUT_MS, segmentTimeoutRetries = 1)
+        service(server, user = "user", connections = 3, config = retrying).use { service ->
+            assertFailsWith<SegmentTimeoutException> { service.fetchSegment("a@test") }
+
+            assertEquals(
+                listOf(
+                    "Segment <a@test> timed out after ${TIMEOUT_MS}ms on pool[0] (127.0.0.1:${server.port}), trying another connection",
+                    "Segment <a@test> timed out after ${TIMEOUT_MS}ms, then lost the next connection and got no other in time on all 1 pool(s)",
+                ),
+                warnings(),
+            )
         }
     }
 
