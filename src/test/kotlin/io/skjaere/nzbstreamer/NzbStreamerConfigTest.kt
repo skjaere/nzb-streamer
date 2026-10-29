@@ -1,6 +1,7 @@
 package io.skjaere.nzbstreamer
 
 import io.skjaere.nzbstreamer.config.NntpConfig
+import io.skjaere.nzbstreamer.config.PoolTuning
 import io.skjaere.nzbstreamer.config.PrepareConfig
 import io.skjaere.nzbstreamer.config.SegmentCacheConfig
 import io.skjaere.nzbstreamer.config.StreamingConfig
@@ -155,6 +156,18 @@ class NzbStreamerConfigTest {
             config.toString(),
         )
         assertFalse("horse" in "$config")
+    }
+
+    /**
+     * Pools built from a config that says nothing of them (debridav's) keep the NNTP client's own timings: a DATE a
+     * minute to the connections idle that long, given 10 s to answer, and no check before a connection is lent.
+     */
+    @Test
+    fun `a streaming config's pool tuning is the NNTP client's own by default`() {
+        assertEquals(
+            PoolTuning(keepaliveIntervalMs = 60_000, keepaliveTimeoutMs = 10_000, validateAfterIdleMs = 0, validateTimeoutMs = 2_000),
+            StreamingConfig().poolTuning,
+        )
     }
 
     /** setReadAheadBytes refused a budget of no bytes, and a config took one: it streamed a segment at a time. */

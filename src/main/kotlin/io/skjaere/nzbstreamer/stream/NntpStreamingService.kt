@@ -479,6 +479,7 @@ class NntpStreamingService(
     }
 
     private fun newPool(config: NntpConfig, name: String): NntpClientPool {
+        val tuning = streamingConfig.poolTuning
         return NntpClientPool(
             host = config.host,
             port = config.port,
@@ -488,8 +489,12 @@ class NntpStreamingService(
             password = config.password.ifEmpty { null },
             maxConnections = config.maxConnections,
             scope = scope,
+            keepaliveIntervalMs = tuning.keepaliveIntervalMs,
             verifyHostname = config.verifyHostname,
-            name = name
+            name = name,
+            keepaliveTimeoutMs = tuning.keepaliveTimeoutMs,
+            validateAfterIdleMs = tuning.validateAfterIdleMs,
+            validateTimeoutMs = tuning.validateTimeoutMs,
         )
     }
 

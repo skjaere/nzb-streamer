@@ -1,5 +1,6 @@
 package io.skjaere.nzbstreamer.config
 
+import io.skjaere.nntp.NntpClientPool
 import io.skjaere.nzbstreamer.enrichment.NzbEnrichmentService
 import java.nio.file.Path
 
@@ -119,6 +120,12 @@ data class StreamingConfig(
      * and the stream goes on ([MissingArticlePolicy.ZERO_FILL]).
      */
     val missingArticles: MissingArticlePolicy = MissingArticlePolicy.FAIL,
+    /**
+     * How every pool keeps its idle connections alive and checks one before it lends it, a pool
+     * added later ([io.skjaere.nzbstreamer.stream.NntpStreamingService.addPool]) too. The defaults
+     * are the NNTP client's own.
+     */
+    val poolTuning: PoolTuning = PoolTuning(),
 ) {
     init {
         // As NntpStreamingService.setReadAheadBytes: no bytes would stream a segment at a time.
@@ -166,6 +173,32 @@ enum class MissingArticlePolicy {
      */
     ZERO_FILL,
 }
+
+/**
+ * How a pool keeps its idle connections alive and checks them ([StreamingConfig.poolTuning]): the
+ * [NntpClientPool] parameters of the same names. The defaults are the pool's own: a DATE every
+ * minute to the connections idle that long, given 10 s to answer, and no check before a
+ * connection is lent.
+ */
+data class PoolTuning(
+    /**
+     * How often the keepalive sends a DATE to the connections nobody used for this long. 0 or
+     * less: never, and then the idle connections aren't evicted nor the pool put to sleep either,
+     * which the same loop does at this pace.
+     */
+    val keepaliveIntervalMs: Long = NntpClientPool.DEFAULT_KEEPALIVE_INTERVAL_MS,
+    /** How long the keepalive's DATE may take before its connection is taken for dead. */
+    val keepaliveTimeoutMs: Long = NntpClientPool.KEEPALIVE_COMMAND_TIMEOUT_MS,
+    /**
+     * A connection nobody has used or checked for this long gets a DATE before it is lent; 0 or
+     * less: never. One a NAT, a VPN or the provider dropped while it sat idle then costs
+     * [validateTimeoutMs] and a connect, where a segment fetched on it would wait out the segment
+     * fetch timeout and fail.
+     */
+    val validateAfterIdleMs: Long = 0,
+    /** How long that DATE may take: with no answer in time, or one other than 111, the connection is dropped. */
+    val validateTimeoutMs: Long = NntpClientPool.DEFAULT_VALIDATE_TIMEOUT_MS,
+)
 
 data class PrepareConfig(
     val verifySegments: Boolean = false,
