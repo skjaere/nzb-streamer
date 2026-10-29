@@ -1888,17 +1888,19 @@ class NntpStreamingService(
             settled = true
             onFailure(timeout)
             countTimeout(poolName, timeoutMs)
+            // In the exception's words, so the log tells a wait for a connection that ran out from a fetch that
+            // timed out on one.
             if (index < poolCount - 1) {
                 logger.warn(
-                    "Segment <{}> timed out after {}ms on pool[{}] ({}:{}), trying pool[{}]",
-                    shown, timeoutMs,
+                    "Segment <{}> {} on pool[{}] ({}:{}), trying pool[{}]",
+                    shown, what,
                     index, entry.config.host, entry.config.port, index + 1
                 )
                 segmentsFallback.increment()
             } else {
                 logger.warn(
-                    "Segment <{}> timed out after {}ms on all {} pool(s)",
-                    shown, timeoutMs, poolCount
+                    "Segment <{}> {} on all {} pool(s)",
+                    shown, what, poolCount
                 )
             }
             null
@@ -1917,6 +1919,13 @@ class NntpStreamingService(
                     e::class.simpleName, e.message
                 )
                 segmentsFallback.increment()
+            } else {
+                // Logged with one pool too: a provider dropping its connections showed only at DEBUG.
+                logger.warn(
+                    "Segment <{}> NNTP error on pool[{}] ({}:{}), no pool left to try — {}: {}",
+                    shown, index, entry.config.host, entry.config.port,
+                    e::class.simpleName, e.message
+                )
             }
             null
         } catch (e: IOException) {
@@ -1934,6 +1943,12 @@ class NntpStreamingService(
                     e::class.simpleName, e.message
                 )
                 segmentsFallback.increment()
+            } else {
+                logger.warn(
+                    "Segment <{}> I/O error on pool[{}] ({}:{}), no pool left to try — {}: {}",
+                    shown, index, entry.config.host, entry.config.port,
+                    e::class.simpleName, e.message
+                )
             }
             null
         } finally {
