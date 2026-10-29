@@ -135,7 +135,11 @@ data class StreamingConfig(
      * found it ([PoolTuning.validateAfterIdleMs]), then costs one timeout, where the segment
      * failed (and with one pool, the stream). Each timeout tried again is logged and counted as
      * one the fetch failed with. A wait for a connection that runs out isn't tried again. With
-     * several pools the next one is asked once the retry has failed too. 0: never.
+     * several pools the next one is asked once the retry has failed too: a connection that died
+     * on the first doesn't send the segment to a backup, which may be paid by the gigabyte or lack
+     * the article, and the first's breaker hears a success. The price: a pool whose every fetch
+     * stalls holds a segment twice [segmentFetchTimeoutMs] before the next is asked, until its
+     * breaker opens. 0: never.
      */
     val segmentTimeoutRetries: Int = 0,
 ) {

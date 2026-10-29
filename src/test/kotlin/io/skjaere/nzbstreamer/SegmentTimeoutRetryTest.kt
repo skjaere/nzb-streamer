@@ -75,10 +75,14 @@ class SegmentTimeoutRetryTest {
         }).also { servers += it }
     }
 
-    private fun service(server: FakeNntpServer, streaming: StreamingConfig, connections: Int = 2) = NntpStreamingService(
-        listOf(NntpConfig("127.0.0.1", server.port, "", "", useTls = false, maxConnections = connections)),
-        streaming,
-    ).also { runBlocking { it.connect() } }
+    private fun service(server: FakeNntpServer, streaming: StreamingConfig, connections: Int = 2) =
+        service(listOf(server), streaming, connections)
+
+    private fun service(servers: List<FakeNntpServer>, streaming: StreamingConfig, connections: Int = 2) =
+        NntpStreamingService(
+            servers.map { NntpConfig("127.0.0.1", it.port, "", "", useTls = false, maxConnections = connections) },
+            streaming,
+        ).also { runBlocking { it.connect() } }
 
     private val retrying = StreamingConfig(segmentFetchTimeoutMs = TIMEOUT_MS, segmentTimeoutRetries = 1)
 
@@ -155,6 +159,42 @@ class SegmentTimeoutRetryTest {
             // Waiting again would have run to the fetch's whole time, twice the timeout.
             assertTrue(took >= TIMEOUT_MS.milliseconds && took < (2 * TIMEOUT_MS - 100).milliseconds, "failed after $took")
             assertTrue(failure.message!!.contains("got no connection within ${TIMEOUT_MS}ms"), failure.message)
+        }
+    }
+
+    /**
+     * With several pools the retry stays on the pool it timed out on, and the next is asked only once that has failed
+     * too: a connection that died in use on the first then costs one timeout and no fetch from a backup, which may be
+     * paid by the gigabyte or lack the article.
+     */
+    @Test
+    fun `with two pools a connection that died in use is tried again on its own pool, not the next`() = runBlocking<Unit> {
+        val first = server(held = { it == 0 })
+        val second = server(held = { false })
+        service(listOf(first, second), retrying).use { service ->
+            val started = TimeSource.Monotonic.markNow()
+            assertContentEquals(bytesOf("a"), service.fetchSegment("a@test"))
+            val took = started.elapsedNow()
+
+            assertTrue(took < 1_200.milliseconds, "took $took")
+            assertEquals(listOf("<a@test>", "<a@test>"), first.bodiesRead)
+            assertEquals(emptyList(), second.bodiesRead)
+        }
+    }
+
+    /** The price of the above: a pool whose every fetch stalls holds a segment twice the timeout before the next. */
+    @Test
+    fun `with two pools a pool whose fetches all stall is left for the next once its retry timed out too`() = runBlocking<Unit> {
+        val first = server(held = { true })
+        val second = server(held = { false })
+        service(listOf(first, second), retrying).use { service ->
+            val started = TimeSource.Monotonic.markNow()
+            assertContentEquals(bytesOf("a"), service.fetchSegment("a@test"))
+            val took = started.elapsedNow()
+
+            assertTrue(took >= (2 * TIMEOUT_MS).milliseconds && took < (2 * TIMEOUT_MS + 1_000).milliseconds, "took $took")
+            assertEquals(2, first.bodiesRead.size)
+            assertEquals(listOf("<a@test>"), second.bodiesRead)
         }
     }
 
