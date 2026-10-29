@@ -194,14 +194,15 @@ enum class MissingArticlePolicy {
 /**
  * How a pool keeps its idle connections alive and checks them ([StreamingConfig.poolTuning]): the
  * [NntpClientPool] parameters of the same names. The defaults are the pool's own: a DATE every
- * minute to the connections idle that long, given 10 s to answer, and no check before a
- * connection is lent.
+ * minute to the idle connections not used in the last 6 s, given 10 s to answer, and no check
+ * before a connection is lent.
  */
 data class PoolTuning(
     /**
-     * How often the keepalive sends a DATE to the connections nobody used for this long. 0 or
-     * less: never, and then the idle connections aren't evicted nor the pool put to sleep either,
-     * which the same loop does at this pace.
+     * How often the keepalive sends a DATE to the idle connections, all but those used in the last
+     * tenth of this, so none goes much over this without a command. 0 or less: never, and then the
+     * idle connections aren't evicted nor the pool put to sleep either, which the same loop does at
+     * this pace.
      */
     val keepaliveIntervalMs: Long = NntpClientPool.DEFAULT_KEEPALIVE_INTERVAL_MS,
     /** How long the keepalive's DATE may take before its connection is taken for dead. */
