@@ -92,8 +92,11 @@ object FilenameResolver {
      * holds a path separator is passed over, as the subject should name a single file, not a path.
      * Otherwise the name is read from the bare text: the piece that looks like a file name (a
      * name, a dot and a short extension) nearest before `yEnc`, or before the part counter
-     * such as `(1/50)` when `yEnc` is missing, else the first one after it. The bare text is cut
-     * at path separators, so that name holds none. Sizes such as `1.37GB` are never names.
+     * such as `(1/50)` when `yEnc` is missing, else the first one after it. A piece of a type a
+     * release holds (a video, an archive volume, a disc image, a `.bin`, a PAR2 file, an NFO, ...)
+     * goes before a nearer one of another type, such as a web address: in
+     * `Movie.2020.r00.bin - example.org - yEnc (1/50)` the name is `Movie.2020.r00.bin`. The bare
+     * text is cut at path separators, so that name holds none. Sizes such as `1.37GB` are never names.
      * Returns null when nothing qualifies, or when that piece is only the end of a name with
      * spaces (`Harbor Lights 2019.mkv`).
      */
