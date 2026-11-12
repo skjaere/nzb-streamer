@@ -588,6 +588,30 @@ class PrepareNeededFilesTest {
     }
 
     /**
+     * Such a set lacks its last volume when its PAR2 index, made over the names it was posted
+     * under, names one the release doesn't hold (x7f3k9q2.r02.bin): its names skip none, but the
+     * release doesn't open without it, and the cause's type says no provider can supply it.
+     */
+    @ParameterizedTest
+    @ValueSource(strings = ["x7f3k9q2", "Movie.2020"])
+    fun `a set posted wholly under another extension that lacks its last volume, which its PAR2 index names by a posted name, fails the release`(
+        base: String,
+    ) {
+        val named = volumes(base, "Movie.2020.mkv", bytes("movie", 200_000), ContainerType.RAR4)
+        assertEquals(4, named.size)
+        val posted = named.map { (name, data) -> "$name.bin" to data }
+        posted.filterNot { it.first == "$base.r02.bin" }.forEach { (name, data) -> post(name, data) }
+        post("$base.par2", buildPar2File(posted))
+
+        withStreamer { streamer, _ ->
+            val result = streamer.prepare(nzb())
+            val lacked = assertIs<PrepareResult.MissingArticles>(result, "prepare: $result")
+            assertTrue("$base.r02.bin" in lacked.message, lacked.message)
+            assertIs<ArchiveVolumeNotInNzbException>(lacked.cause)
+        }
+    }
+
+    /**
      * A season pack leaves out an episode whose set lacks a volume, the volume found posted under
      * another extension with it, also when that one was found by its yEnc name, which the
      * subjects don't give.

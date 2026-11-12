@@ -452,8 +452,11 @@ internal class ReleaseFiles(private val files: List<NzbFile>) {
          * nor one any of whose volumes the PAR2 data names by a volume's name, nor one whose RAR5
          * headers number each of its volumes: those place them. A set the PAR2 data names by the
          * names it was posted under (x7f3k9q2.r00.bin, an index made over those) is ordered by the
-         * names they give ([orderedBy]), so its places are checked as without PAR2 data. Null when
-         * there is none. A missing last volume isn't seen this way.
+         * names they give ([orderedBy]), so its places are checked as without PAR2 data. Such a set
+         * also lacks a volume the PAR2 data names into it by a name that gives one of its volumes
+         * ([VolumeNames.of]) when no file it opens holds it ([holds]): its last, which no gap
+         * shows (x7f3k9q2.r02.bin, not posted). Null when there is none. Without PAR2 data, a
+         * missing last volume isn't seen this way.
          */
         private fun skippingUnderAnotherExtension(
             hashes: Map<Int, String>,
@@ -471,12 +474,30 @@ internal class ReleaseFiles(private val files: List<NzbFile>) {
                     return@firstNotNullOfOrNull null
                 }
                 val places = set.map { VolumeNames.number(volumes.getValue(it)) ?: return@firstNotNullOfOrNull null }
-                val absent = (0..places.max()).firstOrNull { it !in places } ?: return@firstNotNullOfOrNull null
-                ArchiveVolumeNotInNzbException(
-                    "Archive volume ${absent + 1} of the set of '${nameOf(set.first())}' isn't in the NZB",
-                )
+                (0..places.max()).firstOrNull { it !in places }?.let { absent ->
+                    return@firstNotNullOfOrNull ArchiveVolumeNotInNzbException(
+                        "Archive volume ${absent + 1} of the set of '${nameOf(set.first())}' isn't in the NZB",
+                    )
+                }
+                val opening = kept + found.keys
+                descriptions.firstOrNull { d ->
+                    VolumeNames.of(d.filename)?.let(::stemOf) == stem && opening.none { holds(it, d, hashes) }
+                }?.let { d ->
+                    ArchiveVolumeNotInNzbException(
+                        "Archive volume '${d.filename.printable()}', which the PAR2 index names, isn't in the NZB",
+                    )
+                }
             }
         }
+
+        /**
+         * Whether file [i] is the one [d] describes: by a name it was posted under (its subject's or
+         * its yEnc name), or by its first 16 KB ([hashes]) and its length. A split 7z volume past the
+         * first has no signature, but is held by its name as well as by its content.
+         */
+        private fun holds(i: Int, d: Par2Parser.Par2FileDescription, hashes: Map<Int, String>): Boolean =
+            listOfNotNull(names[i], files[i].yencHeaders?.name).any { it.equals(d.filename, ignoreCase = true) } ||
+                hashes[i] == d.hash16kHex() && files[i].yencHeaders?.size == d.fileSize
 
         /** The name file [i] was posted under: its yEnc name, which the archive is ordered by, else its subject's. */
         private fun postedName(i: Int): String = files[i].yencHeaders?.name ?: names[i].orEmpty()
