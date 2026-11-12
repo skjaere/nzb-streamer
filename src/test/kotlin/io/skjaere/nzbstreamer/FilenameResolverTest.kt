@@ -326,6 +326,9 @@ class FilenameResolverTest {
             Arguments.of("Harbor.Lights.2019.mkv - 1.37GB - yEnc (1/50)", "Harbor.Lights.2019.mkv"),
             Arguments.of("Harbor.Lights.2019.mkv, 1.4 GB yEnc (1/50)", "Harbor.Lights.2019.mkv"),
             Arguments.of("Copper.Crown.S01E01.mkv (1/30) 734003200 bytes", "Copper.Crown.S01E01.mkv"),
+            // A number with a unit apart, or grouped by dots, is no name: a name has a letter.
+            Arguments.of("Harbor.Lights.2019.mkv - 1.234 GB - yEnc (1/50)", "Harbor.Lights.2019.mkv"),
+            Arguments.of("Harbor.Lights.2019.part01.rar - 734.003.200 bytes - yEnc (1/80)", "Harbor.Lights.2019.part01.rar"),
             Arguments.of("Show - [2/9] - Show.S01E02.mkv  700 MB (1/9)", "Show.S01E02.mkv"),
             Arguments.of("Harbor.Lights.2019.nfo Harbor.Lights.2019.mkv yEnc (1/50)", "Harbor.Lights.2019.mkv"),
             Arguments.of("Movie.2020.mkv yEnc (1/50) Movie.2020.nfo", "Movie.2020.mkv"),

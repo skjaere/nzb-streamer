@@ -182,7 +182,8 @@ object FilenameResolver {
 
     /**
      * The file name [piece] of [subject] holds, trimmed of punctuation, or null: it must have
-     * something before its last dot and an extension after it, and must not be a size.
+     * something before its last dot and an extension after it, must have a letter (`1.234` and
+     * `734.003.200` are numbers), and must not be a size.
      */
     private fun fileNameIn(subject: String, piece: IntRange): String? {
         var start = piece.first
@@ -191,7 +192,7 @@ object FilenameResolver {
         while (start < end && subject[start] in TRIMMED_AT_START) start++
         if (end - start > MAX_SUBJECT_NAME_LENGTH) return null
         val name = subject.substring(start, end)
-        if (isSize(name)) return null
+        if (isSize(name) || name.none { it.isLetter() }) return null
         val dot = name.lastIndexOf('.')
         if (dot < 0 || !isExtension(name.substring(dot + 1))) return null
         if ((0 until dot).none { name[it].isLetter() || isDigit(name[it]) }) return null
