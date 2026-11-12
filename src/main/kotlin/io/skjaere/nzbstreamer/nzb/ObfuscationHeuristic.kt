@@ -13,8 +13,10 @@ package io.skjaere.nzbstreamer.nzb
  * neutral or random ([kindOf]). An episode code, or a word with nothing random about it, means a
  * person named the file, whatever else the name holds. Without one, a single random token makes
  * the name random: a hash, a number of seven digits or more, letters and digits in three runs or
- * more, or case noise, where the case changes at more than half its letters or breaks a word's
- * shape again and again ([RandomCase]).
+ * more, or case noise. The case is noise where it changes four times or more and at more than
+ * half the token's letters (the change between its first two letters doesn't count), or where a
+ * token of eight letters or more breaks a word's shape twice or more ([RandomCase]). So a token
+ * as short as xYzWq isn't noise, though its case changes at every letter.
  */
 object ObfuscationHeuristic {
 
