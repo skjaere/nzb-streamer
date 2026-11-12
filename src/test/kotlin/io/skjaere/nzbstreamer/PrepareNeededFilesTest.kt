@@ -1004,6 +1004,87 @@ class PrepareNeededFilesTest {
     }
 
     /**
+     * A volume posted under another extension beside its set's named volumes, with a PAR2 index
+     * made over the names they were posted under (Movie.2020.r00.bin), is one of the set's: the
+     * index describes it by a name that gives its place, so it is fetched, and the release opens
+     * with it in that place.
+     */
+    @ParameterizedTest
+    @CsvSource("RAR4, Movie.2020.r00.bin", "RAR5, Movie.2020.part2.bin")
+    fun `a volume under another extension that a PAR2 index over the posted names describes opens with its set`(
+        type: ContainerType,
+        postedAs: String,
+    ) {
+        val payload = bytes("movie", 200_000)
+        val named = volumes("Movie.2020", "Movie.2020.mkv", payload, type)
+        assertEquals(4, named.size)
+        val posted = named.mapIndexed { v, (name, data) -> (if (v == 1) postedAs else name) to data }
+        posted.forEach { (name, data) -> post(name, data) }
+        post("Movie.2020.par2", buildPar2File(posted))
+
+        withStreamer { streamer, _ ->
+            val result = streamer.prepare(nzb())
+            val prepared = assertIs<PrepareResult.Success>(result, "prepare: $result")
+            assertEquals(named.map { it.first }, prepared.metadata.response.volumes)
+            assertContentEquals(payload, streamer.streamed(prepared))
+        }
+    }
+
+    /**
+     * Such a volume that lacks its first article fails the release: the set can't open whole. A
+     * provider may have it, so the cause doesn't say none can.
+     */
+    @ParameterizedTest
+    @CsvSource("RAR4, Movie.2020.r00.bin", "RAR5, Movie.2020.part2.bin")
+    fun `a volume under another extension that a PAR2 index over the posted names describes fails the release when it lacks its first article`(
+        type: ContainerType,
+        postedAs: String,
+    ) {
+        val named = volumes("Movie.2020", "Movie.2020.mkv", bytes("movie", 200_000), type)
+        assertEquals(4, named.size)
+        val posted = named.mapIndexed { v, (name, data) -> (if (v == 1) postedAs else name) to data }
+        posted.forEachIndexed { v, (name, data) -> if (v == 1) missing += post(name, data).first() else post(name, data) }
+        post("Movie.2020.par2", buildPar2File(posted))
+
+        withStreamer { streamer, _ ->
+            val result = streamer.prepare(nzb())
+            val lacked = assertIs<PrepareResult.MissingArticles>(result, "prepare: $result")
+            assertEquals(null, lacked.cause.firstCauseOfType<ArchiveVolumeNotInNzbException>(), "${lacked.cause}")
+        }
+    }
+
+    /**
+     * In a season pack whose episodes each have a PAR2 index over the names they were posted
+     * under, an episode whose volume posted under another extension lacks its first article is
+     * left out, as one whose named volume lacks it is.
+     */
+    @ParameterizedTest
+    @ValueSource(strings = ["RAR4", "RAR5"])
+    fun `a season pack leaves out an episode whose volume under another extension, described by a posted name, lacks its first article`(
+        type: ContainerType,
+    ) {
+        val episodes = (1..3).associate { e -> "Show.S01E0$e" to bytes("episode $e", 150_000) }
+        episodes.forEach { (base, data) ->
+            val named = volumes(base, "$base.mkv", data, type)
+            assertEquals(3, named.size)
+            // Show.S01E0N.r00.bin (RAR4) or Show.S01E0N.part2.bin (RAR5).
+            val posted = named.mapIndexed { v, (name, volume) -> (if (v == 1) "${name.removeSuffix(".rar")}.bin" else name) to volume }
+            posted.forEachIndexed { v, (name, volume) ->
+                if (base == "Show.S01E02" && v == 1) missing += post(name, volume).first() else post(name, volume)
+            }
+            post("$base.par2", buildPar2File(posted))
+        }
+
+        withStreamer { streamer, _ ->
+            val result = streamer.prepare(nzb())
+            val prepared = assertIs<PrepareResult.Success>(result, "prepare: $result")
+            assertEquals(listOf("Show.S01E01.mkv", "Show.S01E03.mkv"), streamer.resolveStreamableFiles(prepared.metadata).map { it.path })
+            episodes.filterKeys { it != "Show.S01E02" }
+                .forEach { (base, data) -> assertContentEquals(data, streamer.streamed(prepared, "$base.mkv"), base) }
+        }
+    }
+
+    /**
      * A RAR volume starts with its archive's signature: without PAR2 data, a file named like the
      * volume a set's names skip that isn't an archive doesn't stand in for it. A 7z volume
      * past the first has none, so its name alone counts.

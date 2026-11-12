@@ -207,7 +207,10 @@ internal class ReleaseFiles(private val files: List<NzbFile>) {
      * holds (by that name or those 16 KB and length), or doesn't name a volume the release has
      * (there is no index, or not that set's), [toCheck] lists the files of [mayHideVolume] to fetch:
      * one the PAR2 data names a volume is one, and, where it doesn't name them all, one that starts
-     * with an archive's signature is too.
+     * with an archive's signature is too. An index made over the names a set was posted under names
+     * a volume posted under another extension by that name (Movie.2020.r00.bin beside
+     * Movie.2020.rar and Movie.2020.r01), which gives the volume ([VolumeNames.of]): the file
+     * posted under it is fetched, and found as that volume ([unheld]).
      */
     inner class Volumes(private val files: List<NzbFile>, private val kept: List<Int>) {
         private val descriptions = VolumeNames.descriptions(kept.map { files[it] })
@@ -229,7 +232,7 @@ internal class ReleaseFiles(private val files: List<NzbFile>) {
 
         /**
          * Once [toCheck] are fetched, those [unknown] (lacking their first article) left: the volumes
-         * among them, each by the name that places it in its archive (the PAR2 data's, or its own but
+         * among them, each by the name that places it in its archive (the PAR2 data's or its own, but
          * for the extension it was posted under), and the sets that lack a volume the PAR2 data
          * names, by one of their files with the cause. [Found.Missing] when the release can't open
          * whole: a set that lacks a volume isn't an episode's, or a file whose content was to tell
@@ -282,7 +285,7 @@ internal class ReleaseFiles(private val files: List<NzbFile>) {
             for (i in toCheck.filterNot { it in unknown }) {
                 val named = describedAs(i, hashes)
                 val volume = when {
-                    named != null -> named.takeIf { it in unheld }
+                    named != null -> VolumeNames.of(named)?.takeIf { it in unheld }
                     byContent && VolumeNames.isArchive(files[i].first16kb) -> {
                         val placed = VolumeNames.of(files[i].yencHeaders?.name ?: names[i]!!) ?: return Found.Unplaced(nameOf(i))
                         when {
@@ -295,13 +298,15 @@ internal class ReleaseFiles(private val files: List<NzbFile>) {
                 }
                 if (volume != null && held.add(volume.lowercase())) found[i] = volume
             }
-            for (volume in unheld(opened(hashes, found), hashes)) {
+            for ((volume, described) in unheld(opened(hashes, found), hashes)) {
                 // With no file that may be it lacking its first article, no provider can supply it.
                 val cause = if (unknown.isEmpty()) {
-                    ArchiveVolumeNotInNzbException("Archive volume '${volume.printable()}', which the PAR2 index names, isn't in the NZB")
+                    ArchiveVolumeNotInNzbException(
+                        "Archive volume '${described.printable()}', which the PAR2 index names, isn't in the NZB",
+                    )
                 } else {
                     ArticleNotFoundException(
-                        "Archive volume '${volume.printable()}', which the PAR2 index names, isn't in the NZB " +
+                        "Archive volume '${described.printable()}', which the PAR2 index names, isn't in the NZB " +
                             "or lacks its first article",
                     )
                 }
@@ -560,15 +565,25 @@ internal class ReleaseFiles(private val files: List<NzbFile>) {
 
         /**
          * The volumes the PAR2 data names of the sets [opened] that no file holds, by name or by
-         * first 16 KB and length.
+         * first 16 KB and length: each by its volume name, to the name the PAR2 data gives it. That
+         * is the volume's own name, or, for an index made over the names a set was posted under, one
+         * under another extension that gives it ([VolumeNames.of]): Movie.2020.r00.bin gives
+         * Movie.2020.r00. Any file of the release holds a volume by its own name, which only a
+         * volume goes by. Only a file of [kept] holds one by a name under another extension: a file
+         * of [mayHideVolume] goes by it before it is fetched, and holds it once its first 16 KB do.
          */
-        private fun unheld(opened: Set<String>, hashes: Map<Int, String>): List<String> {
+        private fun unheld(opened: Set<String>, hashes: Map<Int, String>): Map<String, String> {
             val named = names.mapNotNull { it?.lowercase() }.toSet()
             val fetched = hashes.mapNotNull { (i, hash) -> files[i].yencHeaders?.let { hash to it.size } }.toSet()
-            return descriptions.filter { d ->
-                VolumeNames.isVolume(d.filename) && stemOf(d.filename) in opened &&
-                    d.filename.lowercase() !in named && (d.hash16kHex() to d.fileSize) !in fetched
-            }.map { it.filename }.distinct()
+            return descriptions.mapNotNull { d ->
+                val volume = VolumeNames.of(d.filename)?.takeIf { stemOf(it) in opened } ?: return@mapNotNull null
+                val heldByName = if (VolumeNames.isVolume(d.filename)) {
+                    d.filename.lowercase() in named
+                } else {
+                    kept.any { holds(it, d, hashes) }
+                }
+                (volume to d.filename).takeUnless { heldByName || (d.hash16kHex() to d.fileSize) in fetched }
+            }.distinctBy { it.first }.toMap()
         }
     }
 
