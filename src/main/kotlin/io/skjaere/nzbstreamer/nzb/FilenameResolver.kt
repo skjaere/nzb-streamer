@@ -62,7 +62,7 @@ object FilenameResolver {
     // By convention the file name comes right before this word, in any case.
     private const val SUBJECT_KEYWORD = "yenc"
 
-    // File systems cap a name at 255 bytes.
+    // File systems cap a name at 255 bytes, so it has 255 characters at most: a longer piece is no name.
     private const val MAX_SUBJECT_NAME_LENGTH = 255
 
     // A piece such as `1.37GB` or `700MB` is a size, never a name.
@@ -86,24 +86,21 @@ object FilenameResolver {
     /**
      * Extract a filename from an NZB `<file subject="...">` line.
      *
-     * The first quoted string wins when it is a bare name: posters are meant to quote it.
+     * The first quoted string wins when it is a bare name: posters are meant to quote it. One that
+     * holds a path separator is passed over, as the subject should name a single file, not a path.
      * Otherwise the name is read from the bare text: the piece that looks like a file name (a
      * name, a dot and a short extension) nearest before `yEnc`, or before the part counter
-     * such as `(1/50)` when `yEnc` is missing, else the first one after it. Sizes such as
-     * `1.37GB` are never names. Returns null when nothing qualifies, when that piece is only the
-     * end of a name with spaces (`Harbor Lights 2019.mkv`), or when the name found holds a path
-     * separator (the subject should reference a single file, not a path).
+     * such as `(1/50)` when `yEnc` is missing, else the first one after it. The bare text is cut
+     * at path separators, so that name holds none. Sizes such as `1.37GB` are never names.
+     * Returns null when nothing qualifies, or when that piece is only the end of a name with
+     * spaces (`Harbor Lights 2019.mkv`).
      */
     fun extractSubjectFilename(subject: String): String? {
         val quoted = QUOTED_FILENAME.find(subject)?.groupValues?.get(1)
         if (!quoted.isNullOrBlank() && !quoted.contains('/') && !quoted.contains('\\')) {
             return quoted
         }
-        val unquoted = unquotedFilename(subject)
-        if (!unquoted.isNullOrBlank() && !unquoted.contains('/') && !unquoted.contains('\\')) {
-            return unquoted
-        }
-        return null
+        return unquotedFilename(subject)
     }
 
     /**

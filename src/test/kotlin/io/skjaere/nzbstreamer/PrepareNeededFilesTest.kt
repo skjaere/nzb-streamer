@@ -435,6 +435,50 @@ class PrepareNeededFilesTest {
     }
 
     /**
+     * A release that is one RAR4 set posted wholly under another extension, under one random name
+     * and with no PAR2 data, opens by the names its volumes give without that extension
+     * (x7f3k9q2.rar, .r00, .r01, ...): no volume of another set lies beside them. So does such a
+     * set of one volume.
+     */
+    @ParameterizedTest
+    @CsvSource("200000, 4", "30000, 1")
+    fun `a set posted wholly under another extension under one random name opens by its names`(size: Int, count: Int) {
+        val payload = bytes("movie", size)
+        val named = volumes("x7f3k9q2", "Movie.2020.mkv", payload, ContainerType.RAR4)
+        assertEquals(count, named.size, "volumes: ${named.map { it.first }}")
+        named.forEach { (name, data) -> post("$name.bin", data) }
+
+        withStreamer { streamer, _ ->
+            val result = streamer.prepare(nzb())
+            val prepared = assertIs<PrepareResult.Success>(result, "prepare: $result")
+            assertEquals(named.map { it.first }, prepared.metadata.response.volumes)
+            assertContentEquals(payload, streamer.streamed(prepared))
+        }
+    }
+
+    /**
+     * Two RAR4 sets, each posted wholly under another extension under a random name of its own and
+     * with no PAR2 data, open as two archives by the names their volumes give: every volume has
+     * others of its set beside it.
+     */
+    @Test
+    fun `two sets each posted wholly under another extension under a random name open by their names`() {
+        val episodes = mapOf("x7f3k9q2" to "Show.S01E01", "y8g4m2p7" to "Show.S01E02")
+            .mapValues { (_, base) -> base to bytes(base, 150_000) }
+        episodes.forEach { (posted, episode) ->
+            val (base, data) = episode
+            volumes(posted, "$base.mkv", data, ContainerType.RAR4).forEach { (name, volume) -> post("$name.bin", volume) }
+        }
+
+        withStreamer { streamer, _ ->
+            val result = streamer.prepare(nzb())
+            val prepared = assertIs<PrepareResult.Success>(result, "prepare: $result")
+            assertEquals(listOf("Show.S01E01.mkv", "Show.S01E02.mkv"), streamer.resolveStreamableFiles(prepared.metadata).map { it.path })
+            episodes.values.forEach { (base, data) -> assertContentEquals(data, streamer.streamed(prepared, "$base.mkv"), base) }
+        }
+    }
+
+    /**
      * A season pack leaves out an episode whose set lacks a volume, the volume found posted under
      * another extension with it, also when that one was found by its yEnc name, which the
      * subjects don't give.

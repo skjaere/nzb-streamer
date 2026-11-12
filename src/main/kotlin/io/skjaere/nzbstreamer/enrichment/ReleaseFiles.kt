@@ -248,8 +248,9 @@ internal class ReleaseFiles(private val files: List<NzbFile>) {
          * A set whose volumes skip one ([skipping]) lacks it as one that lacks a volume the PAR2 data
          * names does. A volume known by its content alone that nothing places, beside
          * others the PAR2 data names, is [Found.Unplaced] too ([unplacedBesideNamed]), and so is one
-         * that only its own name places, in a set of its own, where every set the release opens is
-         * named obfuscated ([placedByItsNameAlone]).
+         * that only its own name places, in a set of its own beside a volume of another set, where
+         * every set the release opens is named obfuscated ([placedByItsNameAlone]). A release that is
+         * one set, or one volume, posted under another extension opens by the names it gives.
          */
         fun found(unknown: Map<Int, Exception>): Found {
             val hashes = hashes()
@@ -318,7 +319,7 @@ internal class ReleaseFiles(private val files: List<NzbFile>) {
          * set's name: its biggest volume's. A set's are of a size, but for its last.
          */
         private fun volumeSizes(hashes: Map<Int, String>): Map<String, Long> = kept
-            .filter { roles[it] == Role.ARCHIVE || roles[it] == Role.UNKNOWN && VolumeNames.isArchive(files[it].first16kb) }
+            .filter(::isArchiveVolume)
             .groupBy { stemOf(par2Name(it, hashes) ?: files[it].yencHeaders?.name ?: names[it].orEmpty()) }
             .mapValues { (_, set) -> set.maxOf(sizes::get) }
 
@@ -353,23 +354,32 @@ internal class ReleaseFiles(private val files: List<NzbFile>) {
 
         /**
          * Of the kept files that are archive volumes by their content alone, one placed by nothing
-         * but its own name (without the extension it was posted under), in a set no other file's
-         * name goes by, while every volume the release opens is named obfuscated ([obfuscatedOnly]).
-         * Its name may be as obfuscated as theirs, so the place it gives can't be trusted:
-         * x7f3k9q2.r00.bin beside a8f7d6e5.rar and c07e4f1a.rar would be ordered after them,
-         * whichever volume it is. Null when there is none. One the PAR2 data names is placed by
-         * that name, and a RAR5 volume whose headers number it by them ([Rar5Parser.volumeNumber]).
+         * but its own name (without the extension it was posted under), in a set no other kept file
+         * gives, beside a kept volume of another set, while every volume the release opens is named
+         * obfuscated ([obfuscatedOnly]). Its name may be as obfuscated as theirs, so the place it
+         * gives can't be trusted: x7f3k9q2.r00.bin beside a8f7d6e5.rar and c07e4f1a.rar would be
+         * ordered after them, whichever volume it is. A file's sets are those its names give as
+         * volume names ([VolumeNames.of]): x7f3k9q2.rar.bin, x7f3k9q2.r00.bin and x7f3k9q2.r01.bin
+         * make one, so a release that is one set, or one volume, posted under another extension
+         * opens by its names. Null when there is none. One the PAR2 data names is placed by that
+         * name, and a RAR5 volume whose headers number it by them ([Rar5Parser.volumeNumber]).
          */
         private fun placedByItsNameAlone(hashes: Map<Int, String>): Int? {
             if (!obfuscatedOnly(hashes)) return null
+            // The sets each kept file's names give: its PAR2 name or subject name, and its yEnc name.
+            val setsOf = kept.associateWith { j ->
+                listOfNotNull(par2Name(j, hashes) ?: names[j], files[j].yencHeaders?.name)
+                    .mapNotNull(VolumeNames::of).map(::stemOf).toSet()
+            }
             return kept.firstOrNull { i ->
                 val placed = (files[i].yencHeaders?.name ?: names[i])?.let(VolumeNames::of)
                 placed != null && roles[i] == Role.UNKNOWN && VolumeNames.isArchive(files[i].first16kb) &&
                     par2Name(i, hashes)?.let(VolumeNames::isVolume) != true &&
                     files[i].first16kb?.let(Rar5Parser::volumeNumber) == null &&
-                    kept.none { j ->
-                        j != i && listOfNotNull(par2Name(j, hashes) ?: names[j], files[j].yencHeaders?.name)
-                            .any { VolumeNames.isVolume(it) && stemOf(it) == stemOf(placed) }
+                    stemOf(placed).let { set ->
+                        val others = kept.filter { it != i }
+                        others.none { set in setsOf.getValue(it) } &&
+                            others.any { isArchiveVolume(it) && setsOf.getValue(it).any { other -> other != set } }
                     }
             }
         }
@@ -437,12 +447,16 @@ internal class ReleaseFiles(private val files: List<NzbFile>) {
             (kept.flatMap { listOfNotNull(par2Name(it, hashes) ?: names[it], files[it].yencHeaders?.name) } + found.values)
                 .filter(VolumeNames::isVolume).map(::stemOf).toSet()
 
+        /** Whether file [i] is an archive volume: by its name, or, where its name tells nothing, by its content. */
+        private fun isArchiveVolume(i: Int): Boolean =
+            roles[i] == Role.ARCHIVE || roles[i] == Role.UNKNOWN && VolumeNames.isArchive(files[i].first16kb)
+
         /**
          * Whether every archive volume of [kept] is named obfuscated by every name it goes by (or
          * goes by none that is a volume's): a volume of the release's may then go by a name of its own.
          */
         private fun obfuscatedOnly(hashes: Map<Int, String>): Boolean = kept
-            .filter { roles[it] == Role.ARCHIVE || roles[it] == Role.UNKNOWN && VolumeNames.isArchive(files[it].first16kb) }
+            .filter(::isArchiveVolume)
             .none { i ->
                 listOfNotNull(names[i], files[i].yencHeaders?.name, par2Name(i, hashes))
                     .any { VolumeNames.isVolume(it) && !isObfuscatedSet(it) }
