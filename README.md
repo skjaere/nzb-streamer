@@ -10,7 +10,7 @@ A Kotlin library for streaming binary content from Usenet via NNTP, driven by NZ
 
 - **NZB parsing** — XML to Kotlin data classes
 - **Concurrent NNTP streaming** — configurable connection pool with ordered output
-- **Transparent yEnc decoding** — via [ktor-nntp-client](https://github.com/skjaere/ktor-usenet-client)
+- **Transparent yEnc decoding** — via [ktor-nntp-client](https://github.com/skjaere/ktor-nntp-client)
 - **Archive metadata extraction** — RAR4/5 and 7-Zip file listings via [kotlin-compression-utils](https://github.com/skjaere/kotlin-compression-utils)
 - **Seekable streams over NNTP** — random-access interface for archive parsers with smart forward-seek optimization
 - **PAR2 support** — volume ordering from recovery set metadata
@@ -22,11 +22,12 @@ A Kotlin library for streaming binary content from Usenet via NNTP, driven by NZ
 
 ```kotlin
 repositories {
+    mavenCentral()
     maven("https://jitpack.io")
 }
 
 dependencies {
-    implementation("io.skjaere:nzb-streamer:<version>")
+    implementation("com.github.skjaere:nzb-streamer:<version>")
 }
 ```
 
@@ -132,7 +133,7 @@ streamer.close()
 
 | Dependency | Role |
 |---|---|
-| [ktor-nntp-client](https://github.com/skjaere/ktor-usenet-client) | NNTP protocol client with yEnc decoding |
+| [ktor-nntp-client](https://github.com/skjaere/ktor-nntp-client) | NNTP protocol client with yEnc decoding |
 | [kotlin-compression-utils](https://github.com/skjaere/kotlin-compression-utils) | RAR/7-Zip archive parsing |
 | kotlinx-coroutines | Concurrent streaming |
 | kotlinx-serialization-json | JSON metadata responses |
