@@ -45,36 +45,43 @@ val streamer = NzbStreamer {
         username = "user"
         password = "pass"
         useTls = true
-        concurrency = 4
+        maxConnections = 8
     }
-    seek {
-        forwardThresholdBytes = 102_400L
-    }
+    concurrency = 4
 }
 ```
+
+Each `nntp {}` block adds a server: the first is the primary, the others fill in what it lacks. `NzbStreamer.fromConfig(...)` builds a client from `NntpConfig`, `StreamingConfig` and `PrepareConfig` instead.
 
 ### Prepare an NZB
 
-`prepare` parses the NZB, connects to NNTP to fetch yEnc headers and archive signatures, then extracts the full file listing:
+`prepare` parses the NZB, connects to NNTP to fetch yEnc headers and archive signatures, then extracts the full file listing. It returns a `PrepareResult`:
 
 ```kotlin
-val metadata = streamer.prepare(File("download.nzb").readBytes())
+val metadata = when (val result = streamer.prepare(File("download.nzb").readBytes())) {
+    is PrepareResult.Success -> result.metadata
+    is PrepareResult.MissingArticles -> error("Articles missing: ${result.message}")
+    is PrepareResult.Encrypted -> error("A password is needed: ${result.message}")
+    is PrepareResult.UnsupportedArchive -> error("Unsupported archive: ${result.message}")
+    is PrepareResult.Failure -> error("Prepare failed: ${result.message}")
+}
 
 println("Volumes: ${metadata.response.volumes}")
 println("Obfuscated: ${metadata.response.obfuscated}")
-for (entry in metadata.response.entries) {
-    println("  ${entry.path}  (${entry.size} bytes)")
+for (file in streamer.resolveStreamableFiles(metadata)) {
+    println("  ${file.path}  (${file.totalSize} bytes)")
 }
 ```
+
+`prepare(bytes, passwordOverride = "...")` opens an encrypted release whose NZB doesn't hold its password.
 
 ### Stream a file from the archive
 
 ```kotlin
-val result = streamer.resolveFile(metadata, "movie.mkv")
-when (result) {
-    is FileResolveResult.Ok -> {
-        streamer.streamFile(metadata, result.splits) { channel ->
-            // channel is a ByteReadChannel — write to disk, pipe to HTTP response, etc.
+when (val result = streamer.resolveFile(metadata, "Movie.2020.mkv")) {
+    is FileResolveResult.Streamable -> {
+        streamer.streamFile(metadata, result.namedSplits) { channel ->
+            // channel is a ByteReadChannel: write it to disk, pipe it to an HTTP response, etc.
         }
     }
     is FileResolveResult.NotFound -> println("File not found")
@@ -86,8 +93,9 @@ when (result) {
 ### Stream with a byte range
 
 ```kotlin
-val range = 0L..1_048_575L  // first 1 MB
-streamer.streamFile(metadata, splits, range) { channel ->
+val file = streamer.resolveStreamableFiles(metadata).first()
+val range = 0L..1_048_575L  // the first MiB
+streamer.streamFile(metadata, file, range) { channel ->
     // partial content
 }
 ```
@@ -110,7 +118,7 @@ streamer.close()
 
 | Class | Description |
 |---|---|
-| `NzbStreamer` | Main entry point — prepare, resolve, stream |
+| `NzbStreamer` | Main entry point: prepare, resolve, stream |
 | `NzbParser` | Parse NZB XML into `NzbDocument` |
 | `NzbEnrichmentService` | Fetch yEnc headers and archive signatures from NNTP |
 | `ArchiveMetadataService` | Extract file listings from RAR/7-Zip volumes |
@@ -124,10 +132,12 @@ streamer.close()
 | Type | Description |
 |---|---|
 | `NzbDocument` / `NzbFile` / `NzbSegment` | Parsed NZB structure |
+| `PrepareResult` | Sealed type: `Success` (with the metadata), `MissingArticles`, `Encrypted`, `UnsupportedArchive`, `Failure` |
 | `ExtractedMetadata` | Enriched NZB + archive file entries + JSON-serializable response |
 | `NzbMetadataResponse` | Serializable archive metadata (volumes, entries, obfuscation status) |
-| `FileResolveResult` | Sealed type: `Ok`, `NotFound`, `IsDirectory`, `Compressed` |
-| `NntpConfig` / `SeekConfig` | Configuration data classes |
+| `StreamableFile` | A file the release lists, with its path and size, to stream |
+| `FileResolveResult` | Sealed type: `Streamable` (with the file's `NamedSplits`), `NotFound`, `IsDirectory`, `Compressed` |
+| `NntpConfig` / `StreamingConfig` / `PrepareConfig` | Configuration data classes |
 
 ## Dependencies
 
