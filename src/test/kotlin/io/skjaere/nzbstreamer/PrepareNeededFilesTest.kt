@@ -435,6 +435,35 @@ class PrepareNeededFilesTest {
     }
 
     /**
+     * Beside volumes obfuscated one by one, with no PAR2 data, RAR4 volumes posted under another
+     * extension that share a random name don't place themselves: the name is as obfuscated as the
+     * others', and a volume alone in its set may be any volume of the archive. Nothing tells where
+     * the group goes, so the release fails rather than open in a guessed order, whether the group
+     * holds the first volume or not and wherever the NZB lists it.
+     */
+    @ParameterizedTest
+    @CsvSource(
+        "a8f7d6e5.rar x7f3k9q2.r00.bin x7f3k9q2.r01.bin d2b5a9c4.rar, 0123, x7f3k9q2.r00.bin",
+        "x7f3k9q2.rar.bin x7f3k9q2.r00.bin c07e4f1a.rar d2b5a9c4.rar, 2301, x7f3k9q2.rar.bin",
+    )
+    fun `volumes that share a random name under another extension beside volumes obfuscated one by one fail a release without PAR2 data`(
+        posted: String,
+        order: String,
+        unplaced: String,
+    ) {
+        val named = volumes("Movie.2020", "Movie.2020.mkv", bytes("movie", 200_000), ContainerType.RAR4)
+        assertEquals(4, named.size)
+        val postedAs = posted.split(" ")
+        order.map { it.digitToInt() }.forEach { v -> post(postedAs[v], named[v].second) }
+
+        withStreamer { streamer, _ ->
+            val result = streamer.prepare(nzb())
+            val failure = assertIs<PrepareResult.Failure>(result, "prepare: $result")
+            assertEquals(unplaced, assertIs<UnplacedArchiveVolumeException>(failure.cause).volume)
+        }
+    }
+
+    /**
      * A release that is one RAR4 set posted wholly under another extension, under one random name
      * and with no PAR2 data, opens by the names its volumes give without that extension
      * (x7f3k9q2.rar, .r00, .r01, ...): no volume of another set lies beside them. So does such a
