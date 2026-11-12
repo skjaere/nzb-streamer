@@ -53,34 +53,171 @@ object FilenameResolver {
 
     private val QUOTED_FILENAME = Regex("\"([^\"]+)\"")
 
-    // SABnzbd's fallback when the filename isn't in quotes — looks for a word-ish run
-    // ending in .EXT where EXT is 2-4 alphanumeric chars. Permissive enough to handle
-    // the variety of subject formats seen on Usenet.
-    // https://github.com/sabnzbd/sabnzbd/blob/b6b0d10367fd4960bad73edd1d3812cafa7fc002/sabnzbd/nzbstuff.py#L106
-    private val FALLBACK_FILENAME = Regex(
-        "\\b([\\w\\-+()' .,]+(?:\\[[\\w\\-/+()' .,]*][\\w\\-+()' .,]*)*\\.[A-Za-z0-9]{2,4})\\b"
-    )
+    // An unquoted subject is cut into pieces at white space, control characters and these.
+    private const val PIECE_SEPARATORS = "\"/\\:|[](){}<>"
+
+    // Trimmed from a piece's end, and from its start, before it is read as a file name.
+    private const val TRIMMED_AT_END = ".,;!?"
+    private const val TRIMMED_AT_START = ",;!?"
+
+    // By convention the file name comes right before this word, in any case.
+    private const val SUBJECT_KEYWORD = "yenc"
+
+    // File systems cap a name at 255 bytes.
+    private const val MAX_SUBJECT_NAME_LENGTH = 255
+
+    // A piece such as `1.37GB` or `700MB` is a size, never a name.
+    private val SIZE_UNITS = setOf("b", "kb", "mb", "gb", "tb", "kib", "mib", "gib", "tib", "bytes")
 
     /**
      * Extract a filename from an NZB `<file subject="...">` line.
      *
-     * Tries the most-common `"filename.ext"` quoted form first, then falls back to a
-     * loose regex matching any word ending in a 2-4 char extension. Returns null if
-     * neither matches or the match isn't a bare filename (any extracted token containing
-     * a path separator is rejected — the subject should reference a single file, not
-     * a path).
+     * The first quoted string wins when it is a bare name: posters are meant to quote it.
+     * Otherwise the name is read from the bare text: the piece that looks like a file name (a
+     * name, a dot and a short extension) nearest before `yEnc`, or before the part counter
+     * such as `(1/50)` when `yEnc` is missing, else the first one after it. Sizes such as
+     * `1.37GB` are never names. Returns null when nothing qualifies, or when the name found
+     * holds a path separator (the subject should reference a single file, not a path).
      */
     fun extractSubjectFilename(subject: String): String? {
         val quoted = QUOTED_FILENAME.find(subject)?.groupValues?.get(1)
         if (!quoted.isNullOrBlank() && !quoted.contains('/') && !quoted.contains('\\')) {
             return quoted
         }
-        val fallback = FALLBACK_FILENAME.find(subject)?.groupValues?.get(1)
-        if (!fallback.isNullOrBlank() && !fallback.contains('/') && !fallback.contains('\\')) {
-            return fallback
+        val unquoted = unquotedFilename(subject)
+        if (!unquoted.isNullOrBlank() && !unquoted.contains('/') && !unquoted.contains('\\')) {
+            return unquoted
         }
         return null
     }
+
+    /**
+     * The file name in a subject that doesn't quote it, or null. The subject is cut into pieces
+     * at separators and split at its anchor: the first `yEnc`, else the last part counter, else
+     * nothing. The name is the last file name piece before the anchor, else the first after it.
+     */
+    private fun unquotedFilename(subject: String): String? {
+        val pieces = piecesOf(subject)
+        val keyword = pieces.indexOfFirst { asciiEqualsIgnoreCase(subject, it, SUBJECT_KEYWORD) }
+        val head: List<IntRange>
+        val tail: List<IntRange>
+        if (keyword >= 0) {
+            head = pieces.subList(0, keyword)
+            tail = pieces.subList(keyword + 1, pieces.size)
+        } else {
+            val counter = lastPartCounter(subject)
+            head = if (counter == null) pieces else pieces.filter { it.last < counter.first }
+            tail = if (counter == null) emptyList() else pieces.filter { it.first > counter.last }
+        }
+        return head.asReversed().firstNotNullOfOrNull { fileNameIn(subject, it) }
+            ?: tail.firstNotNullOfOrNull { fileNameIn(subject, it) }
+    }
+
+    /** Where each run of characters between separators lies in [subject]. */
+    private fun piecesOf(subject: String): List<IntRange> {
+        val pieces = ArrayList<IntRange>()
+        var start = -1
+        for (i in subject.indices) {
+            val c = subject[i]
+            if (c.isWhitespace() || c.isISOControl() || c in PIECE_SEPARATORS) {
+                if (start >= 0) pieces += start until i
+                start = -1
+            } else if (start < 0) {
+                start = i
+            }
+        }
+        if (start >= 0) pieces += start until subject.length
+        return pieces
+    }
+
+    /** Where the last part counter, such as `(1/50)` or `( 1 / 50 )`, lies in [subject], or null. */
+    private fun lastPartCounter(subject: String): IntRange? {
+        var found: IntRange? = null
+        var open = subject.indexOf('(')
+        while (open >= 0) {
+            val close = partCounterClose(subject, open)
+            if (close >= 0) found = open..close
+            open = subject.indexOf('(', open + 1)
+        }
+        return found
+    }
+
+    /** The index of the `)` that closes a part counter opened at [open], or -1. */
+    private fun partCounterClose(subject: String, open: Int): Int {
+        var i = skipSpaces(subject, open + 1)
+        val part = i
+        i = digitsEnd(subject, i)
+        if (i == part) return -1
+        i = skipSpaces(subject, i)
+        if (i >= subject.length || subject[i] != '/') return -1
+        i = skipSpaces(subject, i + 1)
+        val parts = i
+        i = digitsEnd(subject, i)
+        if (i == parts) return -1
+        i = skipSpaces(subject, i)
+        return if (i < subject.length && subject[i] == ')') i else -1
+    }
+
+    /**
+     * The file name [piece] of [subject] holds, trimmed of punctuation, or null: it must have
+     * something before its last dot and an extension after it, and must not be a size.
+     */
+    private fun fileNameIn(subject: String, piece: IntRange): String? {
+        var start = piece.first
+        var end = piece.last + 1
+        while (end > start && subject[end - 1] in TRIMMED_AT_END) end--
+        while (start < end && subject[start] in TRIMMED_AT_START) start++
+        if (end - start > MAX_SUBJECT_NAME_LENGTH) return null
+        val name = subject.substring(start, end)
+        if (isSize(name)) return null
+        val dot = name.lastIndexOf('.')
+        if (dot < 0 || !isExtension(name.substring(dot + 1))) return null
+        if ((0 until dot).none { name[it].isLetter() || isDigit(name[it]) }) return null
+        return name
+    }
+
+    /** `mkv`, `r00`, `7z`, `par2`: 2 to 4 ASCII letters or digits with a letter. Or `001`, a split part. */
+    private fun isExtension(extension: String): Boolean {
+        val letters = extension.count { it in 'a'..'z' || it in 'A'..'Z' }
+        val digits = extension.count(::isDigit)
+        if (letters + digits != extension.length) return false
+        return (extension.length in 2..4 && letters > 0) || (extension.length == 3 && digits == 3)
+    }
+
+    /** `1.37GB`, `700MB`, `1,4GiB`, `734003200bytes`: digits, maybe a fraction, then a unit. */
+    private fun isSize(piece: String): Boolean {
+        var i = digitsEnd(piece, 0)
+        if (i == 0) return false
+        if (i < piece.length && (piece[i] == '.' || piece[i] == ',')) {
+            val fraction = digitsEnd(piece, i + 1)
+            if (fraction > i + 1) i = fraction
+        }
+        val unit = piece.substring(i)
+        return SIZE_UNITS.any { asciiEqualsIgnoreCase(unit, unit.indices, it) }
+    }
+
+    /** Whether [range] of [text] is [lowerCaseWord], ignoring the case of ASCII letters. */
+    private fun asciiEqualsIgnoreCase(text: String, range: IntRange, lowerCaseWord: String): Boolean {
+        if (range.last - range.first + 1 != lowerCaseWord.length) return false
+        return lowerCaseWord.indices.all { i ->
+            val c = text[range.first + i]
+            (if (c in 'A'..'Z') c + ('a' - 'A') else c) == lowerCaseWord[i]
+        }
+    }
+
+    private fun skipSpaces(text: String, from: Int): Int {
+        var i = from
+        while (i < text.length && text[i] == ' ') i++
+        return i
+    }
+
+    private fun digitsEnd(text: String, from: Int): Int {
+        var i = from
+        while (i < text.length && isDigit(text[i])) i++
+        return i
+    }
+
+    private fun isDigit(c: Char): Boolean = c in '0'..'9'
 
     /**
      * Index a par2 byte blob by the MD5-of-first-16KB of each described file. The keys

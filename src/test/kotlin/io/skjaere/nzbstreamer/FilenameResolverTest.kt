@@ -3,7 +3,9 @@ package io.skjaere.nzbstreamer
 import io.skjaere.nzbstreamer.nzb.FilenameResolver
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.params.ParameterizedTest
+import org.junit.jupiter.params.provider.Arguments
 import org.junit.jupiter.params.provider.CsvSource
+import org.junit.jupiter.params.provider.MethodSource
 import org.junit.jupiter.params.provider.ValueSource
 import kotlin.test.assertEquals
 import kotlin.test.assertNull
@@ -19,13 +21,16 @@ class FilenameResolverTest {
         "'[01/15] \"Release.Name.2024.1080p.mkv\" yEnc (1/100)', Release.Name.2024.1080p.mkv",
         // Just the quoted name, no surrounding tokens.
         "'\"Release.Name.mkv\"', Release.Name.mkv",
+        "'[01/15] \"Harbor.Lights.2019.mkv\" yEnc (1/100)', Harbor.Lights.2019.mkv",
+        // A quoted name is kept as it is, extension or not.
+        "'\"Tg4LmW9qZr2K\" yEnc (1/9)', Tg4LmW9qZr2K",
     )
     fun `quoted filename in subject is preferred`(subject: String, expected: String) {
         assertEquals(expected, FilenameResolver.extractSubjectFilename(subject))
     }
 
     @Test
-    fun `subject with no quotes falls back to SABnzbd regex`() {
+    fun `subject with no quotes names the file before yEnc`() {
         val subject = "Release.Name.r00 - yEnc (1/100)"
         assertEquals("Release.Name.r00", FilenameResolver.extractSubjectFilename(subject))
     }
@@ -37,16 +42,15 @@ class FilenameResolverTest {
 
     @Test
     fun `quoted path-like value is rejected but fallback may still find the basename`() {
-        // If the quoted match contains a path separator we refuse it (better than
-        // surfacing half a path). But the SABnzbd fallback regex doesn't traverse `/`
-        // so it can still recover the bare basename — that's a feature, not a bug.
-        // Forward slash: fallback recovers `name.mkv`.
+        // A quoted value holding a path separator is refused (better than surfacing
+        // half a path). The unquoted rule splits the subject at separators, so it still
+        // finds the bare name after the last one.
+        // Forward slash.
         assertEquals(
             "name.mkv",
             FilenameResolver.extractSubjectFilename("[1/8] \"some/path/name.mkv\" yEnc")
         )
-        // Backslash: SABnzbd's fallback regex uses `\w` which doesn't match `\` either,
-        // so we also recover the basename.
+        // Backslash.
         assertEquals(
             "name.mkv",
             FilenameResolver.extractSubjectFilename("[1/8] \"some\\path\\name.mkv\" yEnc")
@@ -55,9 +59,38 @@ class FilenameResolverTest {
 
     @Test
     fun `subject with only a path returns null`() {
-        // No bare filename anywhere — both the quoted and fallback regexes refuse to
-        // produce a value containing a separator, so the result is null.
+        // No bare filename anywhere: the quoted value holds a separator, and no piece
+        // between the separators has an extension, so the result is null.
         assertNull(FilenameResolver.extractSubjectFilename("\"only/a/path/no/file/at/end\""))
+    }
+
+    @ParameterizedTest
+    @MethodSource("unquotedSubjects")
+    fun `an unquoted subject names the file nearest yEnc or its part counter`(subject: String, expected: String) {
+        assertEquals(expected, FilenameResolver.extractSubjectFilename(subject), subject)
+    }
+
+    @ParameterizedTest
+    @ValueSource(
+        strings = [
+            "Harbor.Lights.2019.1080p yEnc (1/50)",
+            "Movie.2020 yEnc (1/50)",
+            "Harbor.Lights.(2019).mkv yEnc (1/9)",
+            "a8f3c1b2e9d4 yEnc (1/50)",
+            "1.37GB yEnc (1/1)",
+            ".mkv yEnc (1/2)",
+            "\"only/a/path/no/file/at/end\"",
+            "just some random subject text",
+            "test file (1/1)",
+            "test file",
+            "test",
+            "s",
+            "file1",
+            "file\r\nINFO forged line",
+        ]
+    )
+    fun `an unquoted subject without a file name piece names nothing`(subject: String) {
+        assertNull(FilenameResolver.extractSubjectFilename(subject), subject)
     }
 
     // --- bestFilename: priority order --------------------------------------------------
@@ -253,4 +286,39 @@ class FilenameResolverTest {
 
     // Full ObfuscationHeuristic corpus lives in ObfuscationHeuristicTest — no parity
     // smoke tests here now that both files are in the same module.
+
+    companion object {
+        @JvmStatic
+        fun unquotedSubjects(): List<Arguments> = listOf(
+            Arguments.of("Harbor.Lights.2019.1080p.mkv yEnc (1/50)", "Harbor.Lights.2019.1080p.mkv"),
+            Arguments.of("[01/15] - Harbor.Lights.2019.part01.rar yEnc (1/80) 52428800", "Harbor.Lights.2019.part01.rar"),
+            Arguments.of("Copper Crown [04/12] - Copper.Crown.S01E04.part3.rar (12/90)", "Copper.Crown.S01E04.part3.rar"),
+            Arguments.of("Copper.Crown.S01E02.720p.mkv (1/30)", "Copper.Crown.S01E02.720p.mkv"),
+            Arguments.of("(1/30) Copper.Crown.S01E02.mkv", "Copper.Crown.S01E02.mkv"),
+            Arguments.of("yEnc (1/5) Harbor.Lights.mkv", "Harbor.Lights.mkv"),
+            Arguments.of("Harbor.Lights.mkv yEnc(1/50)", "Harbor.Lights.mkv"),
+            Arguments.of("[1/5]Harbor.Lights.mkv yEnc (1/9)", "Harbor.Lights.mkv"),
+            Arguments.of("HARBOR.LIGHTS.2019.MKV YENC (1/50)", "HARBOR.LIGHTS.2019.MKV"),
+            Arguments.of("Movie.2020.7z.001 yEnc (1/40)", "Movie.2020.7z.001"),
+            Arguments.of("[1/5] Harbor.Lights.2019.mkv.002 yEnc (3/60)", "Harbor.Lights.2019.mkv.002"),
+            Arguments.of("Show.S01E03.vol00+01.par2 yEnc (1/4)", "Show.S01E03.vol00+01.par2"),
+            Arguments.of("Movie.2020.1080p.WEB-GROUP.mkv yEnc (1/50)", "Movie.2020.1080p.WEB-GROUP.mkv"),
+            Arguments.of("Harbor.Lights.2019.mkv - 1.37GB - yEnc (1/50)", "Harbor.Lights.2019.mkv"),
+            Arguments.of("Harbor.Lights.2019.mkv, 1.4 GB yEnc (1/50)", "Harbor.Lights.2019.mkv"),
+            Arguments.of("Copper.Crown.S01E01.mkv (1/30) 734003200 bytes", "Copper.Crown.S01E01.mkv"),
+            Arguments.of("Show - [2/9] - Show.S01E02.mkv  700 MB (1/9)", "Show.S01E02.mkv"),
+            Arguments.of("Harbor.Lights.2019.nfo Harbor.Lights.2019.mkv yEnc (1/50)", "Harbor.Lights.2019.mkv"),
+            Arguments.of("Movie.2020.mkv yEnc (1/50) Movie.2020.nfo", "Movie.2020.mkv"),
+            Arguments.of("[3/7] - Copper.Crown.S02E05.mkv. yEnc (1/50)", "Copper.Crown.S02E05.mkv"),
+            Arguments.of("Re: Harbor.Lights.nfo", "Harbor.Lights.nfo"),
+            Arguments.of("C:\\Posts\\Harbor.Lights.mkv yEnc (1/2)", "Harbor.Lights.mkv"),
+            // One quote only: no quoted name, so the unquoted rule reads past the quote.
+            Arguments.of("\"Harbor.Lights.mkv yEnc (1/50)", "Harbor.Lights.mkv"),
+            Arguments.of("data.bin", "data.bin"),
+            Arguments.of("release.part01.rar", "release.part01.rar"),
+            Arguments.of("release.part1.rar", "release.part1.rar"),
+            // Unquoted, nothing marks where a name with spaces starts.
+            Arguments.of("Harbor Lights 2019.mkv yEnc (1/50)", "2019.mkv"),
+        )
+    }
 }

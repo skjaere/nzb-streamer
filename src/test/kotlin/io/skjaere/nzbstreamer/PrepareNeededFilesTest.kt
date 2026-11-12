@@ -393,10 +393,11 @@ class PrepareNeededFilesTest {
      * Beside volumes obfuscated one by one, with no PAR2 data, a volume posted under another
      * extension whose name places it in a set of its own may be one of theirs, under a name of its
      * own as theirs are: nothing tells where it goes, so the release fails rather than open
-     * without it (NR-14).
+     * without it (NR-14). A random name under another extension isn't one of its own: it tells
+     * nothing, so the file is fetched as a possible volume of theirs.
      */
     @ParameterizedTest
-    @CsvSource("RAR5, x7f3k9q2.part2.avi", "RAR4, x7f3k9q2.r00.bin")
+    @CsvSource("RAR5, x7f3k9q2.part2.avi", "RAR4, Harbor.Lights.r00.bin")
     fun `a volume under a name of its own beside volumes obfuscated one by one fails a release without PAR2 data`(
         type: ContainerType,
         postedAs: String,
