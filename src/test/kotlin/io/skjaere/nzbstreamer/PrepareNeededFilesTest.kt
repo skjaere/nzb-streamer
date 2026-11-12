@@ -633,6 +633,99 @@ class PrepareNeededFilesTest {
     }
 
     /**
+     * A PAR2 index made over another packing's volumes, as many or more, names volumes of a
+     * readable set's name but describes none of its files. The set, posted wholly under another
+     * extension, opens by the names its files give when those skip no volume: the index doesn't
+     * fail it.
+     */
+    @ParameterizedTest
+    @ValueSource(ints = [200_000, 330_000])
+    fun `a PAR2 index that describes none of a readable set's files doesn't fail the set its names give whole`(packed: Int) {
+        val payload = bytes("movie", 200_000)
+        val named = volumes("Movie.2020", "Movie.2020.mkv", payload, ContainerType.RAR4)
+        assertEquals(4, named.size)
+        named.forEach { (name, data) -> post("$name.bin", data) }
+        val another = volumes("Movie.2020", "Movie.2020.mkv", bytes("another packing", packed), ContainerType.RAR4)
+        assertEquals(packed > 200_000, another.size > 4, "volumes: ${another.map { it.first }}")
+        post("Movie.2020.par2", buildPar2File(another))
+
+        withStreamer { streamer, _ ->
+            val result = streamer.prepare(nzb())
+            val prepared = assertIs<PrepareResult.Success>(result, "prepare: $result")
+            assertEquals(named.map { it.first }, prepared.metadata.response.volumes)
+            assertContentEquals(payload, streamer.streamed(prepared))
+        }
+    }
+
+    /**
+     * Where the set is named obfuscated, its name tells nothing, so such an index counts: a volume
+     * it names by the set's name that no file holds fails the set. The set lacks its last volume,
+     * which no gap in its names shows, and the release doesn't open.
+     */
+    @Test
+    fun `a PAR2 index that describes none of an obfuscated set's files fails the set when it lacks its last volume`() {
+        val named = volumes("x7f3k9q2", "Movie.2020.mkv", bytes("movie", 200_000), ContainerType.RAR4)
+        assertEquals(4, named.size)
+        named.forEach { (name, data) -> if (name != "x7f3k9q2.r02") post("$name.bin", data) }
+        post("x7f3k9q2.par2", buildPar2File(volumes("x7f3k9q2", "Movie.2020.mkv", bytes("another packing", 200_000), ContainerType.RAR4)))
+
+        withStreamer { streamer, _ ->
+            val result = streamer.prepare(nzb())
+            val lacked = assertIs<PrepareResult.MissingArticles>(result, "prepare: $result")
+            assertIs<ArchiveVolumeNotInNzbException>(lacked.cause)
+        }
+    }
+
+    /**
+     * A season pack posted wholly under another extension, each episode with a PAR2 index over
+     * the names it was posted under, fails when an episode lacks its last volume, which its index
+     * names (Show.S01E02.r01.bin, Show.S01E02.part3.rar.bin). No gap in its names or its RAR5
+     * headers shows it, and no provider can supply it, which the cause's type says.
+     */
+    @ParameterizedTest
+    @ValueSource(strings = ["RAR4", "RAR5"])
+    fun `a season pack posted wholly under another extension fails when an episode lacks its last volume, which its PAR2 index names by a posted name`(
+        type: ContainerType,
+    ) {
+        (1..3).map { e -> "Show.S01E0$e" to bytes("episode $e", 150_000) }.forEach { (base, data) ->
+            val named = volumes(base, "$base.mkv", data, type)
+            assertEquals(3, named.size)
+            val posted = named.map { (name, volume) -> "$name.bin" to volume }
+            posted.forEachIndexed { v, (name, volume) -> if (base != "Show.S01E02" || v != 2) post(name, volume) }
+            post("$base.par2", buildPar2File(posted))
+        }
+        val last = if (type == ContainerType.RAR4) "Show.S01E02.r01.bin" else "Show.S01E02.part3.rar.bin"
+
+        withStreamer { streamer, _ ->
+            val result = streamer.prepare(nzb())
+            val lacked = assertIs<PrepareResult.MissingArticles>(result, "prepare: $result")
+            assertTrue(last in lacked.message, lacked.message)
+            assertIs<ArchiveVolumeNotInNzbException>(lacked.cause)
+        }
+    }
+
+    /**
+     * A RAR5 set posted wholly under another extension, under a random name, opens in the order its
+     * headers give beside a PAR2 index made over another packing's volumes, which names volumes of
+     * its name but describes none of its files.
+     */
+    @Test
+    fun `a RAR5 set posted wholly under another extension opens beside a PAR2 index of another packing`() {
+        val payload = bytes("movie", 200_000)
+        val named = volumes("x7f3k9q2", "Movie.2020.mkv", payload, ContainerType.RAR5)
+        assertEquals(4, named.size)
+        named.forEach { (name, data) -> post("$name.bin", data) }
+        post("x7f3k9q2.par2", buildPar2File(volumes("x7f3k9q2", "Movie.2020.mkv", bytes("another packing", 200_000), ContainerType.RAR5)))
+
+        withStreamer { streamer, _ ->
+            val result = streamer.prepare(nzb())
+            val prepared = assertIs<PrepareResult.Success>(result, "prepare: $result")
+            assertEquals(named.map { it.first }, prepared.metadata.response.volumes)
+            assertContentEquals(payload, streamer.streamed(prepared))
+        }
+    }
+
+    /**
      * A season pack leaves out an episode whose set lacks a volume, the volume found posted under
      * another extension with it, also when that one was found by its yEnc name, which the
      * subjects don't give.

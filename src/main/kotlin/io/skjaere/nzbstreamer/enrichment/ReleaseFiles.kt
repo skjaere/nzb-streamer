@@ -447,22 +447,29 @@ internal class ReleaseFiles(private val files: List<NzbFile>) {
 
         /**
          * The cause for a set that volumes posted under another extension make by the names they
-         * are ordered by (their names without that extension, [VolumeNames.of]) whose places skip a
-         * volume or don't start at its first: x7f3k9q2.rar.bin, x7f3k9q2.r01.bin and
-         * x7f3k9q2.r02.bin lack x7f3k9q2.r00, and a lone x7f3k9q2.r00.bin lacks x7f3k9q2.rar. The
-         * volumes are the files of [kept] that are archives by their names or their content, and
-         * those of [found] (found among the others, by the name that places them). A set counts
-         * when it holds two volumes or more, or every volume the release holds: a volume alone in
-         * its set beside others is ordered with them, not by its name. Not a set [skipping] checks,
-         * nor one any of whose volumes the PAR2 data names by a volume's name, nor one whose RAR5
-         * headers number each of its volumes: those place them. A volume's name the PAR2 data gives
-         * none of the set's files places none of them (an index made over another packing's). A set
-         * the PAR2 data names by the names it was posted under (x7f3k9q2.r00.bin, an index made
-         * over those) is ordered by the names they give ([orderedBy]), so its places are checked as
-         * without PAR2 data. Such a set also lacks a volume the PAR2 data names into it by a name
-         * that gives one of its volumes ([VolumeNames.of]) when no file it opens holds it
-         * ([holds]): its last, which no gap shows (x7f3k9q2.r02.bin, not posted). Null when there
-         * is none. Without PAR2 data, a missing last volume isn't seen this way.
+         * are ordered by (their names without that extension, [VolumeNames.of]) when it lacks a
+         * volume. The volumes are the files of [kept] that are archives by their names or their
+         * content, and those of [found] (found among the others, by the name that places them). A
+         * set counts when it holds two volumes or more, or every volume the release holds: a volume
+         * alone in its set beside others is ordered with them, not by its name. Not a set
+         * [skipping] checks, nor one any of whose volumes the PAR2 data names by a volume's name:
+         * that name places them, and [unheld] tells what such a set lacks.
+         *
+         * A set lacks a volume when its places skip one or don't start at its first:
+         * x7f3k9q2.rar.bin, x7f3k9q2.r01.bin and x7f3k9q2.r02.bin lack x7f3k9q2.r00, and a lone
+         * x7f3k9q2.r00.bin lacks x7f3k9q2.rar. A set whose RAR5 headers number each of its volumes
+         * is ordered by them, and [ArchiveService] fails one whose headers skip a volume, so its
+         * places aren't checked here.
+         *
+         * A set also lacks a volume the PAR2 data names into it by a name that gives one of its
+         * volumes ([VolumeNames.of]) when no file it opens holds it ([holds]): its last, which no
+         * gap shows (x7f3k9q2.r02.bin, not posted, in an index made over the names the set was
+         * posted under). The PAR2 data counts so when it describes one of the set's files. It
+         * counts too for a set named obfuscated that has no RAR5 headers: its name tells nothing,
+         * so an index that names volumes of it may be its own. An index made over another
+         * packing's, which describes none of the files, doesn't fail a set with a readable name,
+         * nor a RAR5 set: those open by their names, or their headers. Null when there is none.
+         * Without PAR2 data that counts, a missing last volume isn't seen this way.
          */
         private fun skippingUnderAnotherExtension(
             hashes: Map<Int, String>,
@@ -473,17 +480,22 @@ internal class ReleaseFiles(private val files: List<NzbFile>) {
             val checked = sets.filterNot { isObfuscatedSet(names[it.first()]!!) }.flatMap(::stemsOf).toSet()
             return volumes.keys.groupBy { stemOf(volumes.getValue(it)) }.firstNotNullOfOrNull { (stem, set) ->
                 val posted = set.any { volumes.getValue(it) != postedName(it) }
-                val placed = set.any { par2Name(it, hashes)?.let(VolumeNames::isVolume) == true } ||
-                    set.all { files[it].first16kb?.let(Rar5Parser::volumeNumber) != null }
-                if (!posted || placed || stem in checked || set.size < 2 && set.size < volumes.size) {
+                val named = set.any { par2Name(it, hashes)?.let(VolumeNames::isVolume) == true }
+                if (!posted || named || stem in checked || set.size < 2 && set.size < volumes.size) {
                     return@firstNotNullOfOrNull null
                 }
-                val places = set.map { VolumeNames.number(volumes.getValue(it)) ?: return@firstNotNullOfOrNull null }
-                (0..places.max()).firstOrNull { it !in places }?.let { absent ->
-                    return@firstNotNullOfOrNull ArchiveVolumeNotInNzbException(
-                        "Archive volume ${absent + 1} of the set of '${nameOf(set.first())}' isn't in the NZB",
-                    )
+                val byHeaders = set.all { files[it].first16kb?.let(Rar5Parser::volumeNumber) != null }
+                if (!byHeaders) {
+                    val places = set.map { VolumeNames.number(volumes.getValue(it)) ?: return@firstNotNullOfOrNull null }
+                    (0..places.max()).firstOrNull { it !in places }?.let { absent ->
+                        return@firstNotNullOfOrNull ArchiveVolumeNotInNzbException(
+                            "Archive volume ${absent + 1} of the set of '${nameOf(set.first())}' isn't in the NZB",
+                        )
+                    }
                 }
+                val counts = descriptions.any { d -> set.any { holds(it, d, hashes) } } ||
+                    !byHeaders && isObfuscatedSet(volumes.getValue(set.first()))
+                if (!counts) return@firstNotNullOfOrNull null
                 val opening = kept + found.keys
                 descriptions.firstOrNull { d ->
                     VolumeNames.of(d.filename)?.let(::stemOf) == stem && opening.none { holds(it, d, hashes) }
