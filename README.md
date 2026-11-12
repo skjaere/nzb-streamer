@@ -30,7 +30,7 @@ dependencies {
 }
 ```
 
-Requires **Java 17+** and **Kotlin 2.3+**.
+Requires **Java 17+** and **Kotlin 2.3+**, from the first release made from the current code. Releases up to v0.10.0 need Java 25+.
 
 ## Usage
 
