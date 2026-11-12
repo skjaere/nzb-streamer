@@ -93,6 +93,26 @@ class FilenameResolverTest {
         assertNull(FilenameResolver.extractSubjectFilename(subject), subject)
     }
 
+    /**
+     * Unquoted, nothing marks where a name with spaces starts: the piece before yEnc joined to a
+     * word by a single space is only the end of it, so the subject names nothing.
+     */
+    @ParameterizedTest
+    @ValueSource(strings = ["Harbor Lights 2019.mkv yEnc (1/50)", "Copper Crown S01E02.mkv yEnc (1/30)", "yEnc (1/5) Harbor Lights.mkv"])
+    fun `an unquoted name with spaces names nothing`(subject: String) {
+        assertNull(FilenameResolver.extractSubjectFilename(subject), subject)
+    }
+
+    @Test
+    fun `the full yEnc name wins over an unquoted subject that holds a name with spaces`() {
+        val best = FilenameResolver.bestFilename(
+            yencName = "Harbor Lights 2019.mkv",
+            subject = "Harbor Lights 2019.mkv yEnc (1/50)",
+            par2Filename = null,
+        )
+        assertEquals("Harbor Lights 2019.mkv", best)
+    }
+
     // --- bestFilename: priority order --------------------------------------------------
 
     @Test
@@ -317,8 +337,8 @@ class FilenameResolverTest {
             Arguments.of("data.bin", "data.bin"),
             Arguments.of("release.part01.rar", "release.part01.rar"),
             Arguments.of("release.part1.rar", "release.part1.rar"),
-            // Unquoted, nothing marks where a name with spaces starts.
-            Arguments.of("Harbor Lights 2019.mkv yEnc (1/50)", "2019.mkv"),
+            // A count is no part of the name after it.
+            Arguments.of("01/50 Harbor.Lights.mkv yEnc (1/50)", "Harbor.Lights.mkv"),
         )
     }
 }

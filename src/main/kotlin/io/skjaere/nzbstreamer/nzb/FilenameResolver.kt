@@ -75,8 +75,9 @@ object FilenameResolver {
      * Otherwise the name is read from the bare text: the piece that looks like a file name (a
      * name, a dot and a short extension) nearest before `yEnc`, or before the part counter
      * such as `(1/50)` when `yEnc` is missing, else the first one after it. Sizes such as
-     * `1.37GB` are never names. Returns null when nothing qualifies, or when the name found
-     * holds a path separator (the subject should reference a single file, not a path).
+     * `1.37GB` are never names. Returns null when nothing qualifies, when that piece is only the
+     * end of a name with spaces (`Harbor Lights 2019.mkv`), or when the name found holds a path
+     * separator (the subject should reference a single file, not a path).
      */
     fun extractSubjectFilename(subject: String): String? {
         val quoted = QUOTED_FILENAME.find(subject)?.groupValues?.get(1)
@@ -93,7 +94,8 @@ object FilenameResolver {
     /**
      * The file name in a subject that doesn't quote it, or null. The subject is cut into pieces
      * at separators and split at its anchor: the first `yEnc`, else the last part counter, else
-     * nothing. The name is the last file name piece before the anchor, else the first after it.
+     * nothing. The name is the last file name piece before the anchor, else the first after it,
+     * unless that piece is joined to a word before it ([nameUnlessJoined]).
      */
     private fun unquotedFilename(subject: String): String? {
         val pieces = piecesOf(subject)
@@ -108,9 +110,30 @@ object FilenameResolver {
             head = if (counter == null) pieces else pieces.filter { it.last < counter.first }
             tail = if (counter == null) emptyList() else pieces.filter { it.first > counter.last }
         }
-        return head.asReversed().firstNotNullOfOrNull { fileNameIn(subject, it) }
-            ?: tail.firstNotNullOfOrNull { fileNameIn(subject, it) }
+        head.indices.reversed().firstOrNull { fileNameIn(subject, head[it]) != null }
+            ?.let { return nameUnlessJoined(subject, head, it) }
+        return tail.indices.firstOrNull { fileNameIn(subject, tail[it]) != null }
+            ?.let { nameUnlessJoined(subject, tail, it) }
     }
+
+    /**
+     * The file name piece [at] of [pieces] holds, or null when a single space joins it to a word
+     * right before it: in `Harbor Lights 2019.mkv` the name starts earlier, and nothing marks
+     * where. A name after ` - ` stands, as a poster's text often comes before one so, though in
+     * `Copper Crown - S01E02 - Harbor.mkv` it is only the end of the name.
+     */
+    private fun nameUnlessJoined(subject: String, pieces: List<IntRange>, at: Int): String? {
+        val piece = pieces[at]
+        val before = pieces.getOrNull(at - 1)
+        val joined = before != null && before.last == piece.first - 2 && subject[piece.first - 1] == ' ' &&
+            isWord(subject, before)
+        return if (joined) null else fileNameIn(subject, piece)
+    }
+
+    /** Whether [piece] of [subject] is letters and digits only, and not the count of a counter (the 50 of 01/50). */
+    private fun isWord(subject: String, piece: IntRange): Boolean =
+        piece.all { subject[it].isLetter() || isDigit(subject[it]) } &&
+            (piece.any { subject[it].isLetter() } || subject.getOrNull(piece.first - 1) != '/')
 
     /** Where each run of characters between separators lies in [subject]. */
     private fun piecesOf(subject: String): List<IntRange> {
