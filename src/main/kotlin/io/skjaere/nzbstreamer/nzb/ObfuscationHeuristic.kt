@@ -165,7 +165,7 @@ object ObfuscationHeuristic {
      * Whether the case changes between neighbouring letters often enough to be noise. The first
      * pair isn't counted, so an initial capital (or a lower-case first letter) doesn't add one.
      */
-    private fun isCaseNoise(token: String): Boolean {
+    private fun hasFrequentCaseChanges(token: String): Boolean {
         var changes = 0
         for (i in 2 until token.length) {
             val a = token[i - 1]
@@ -204,4 +204,7 @@ object ObfuscationHeuristic {
     private fun isAsciiLetterOrDigit(c: Char): Boolean = c in 'a'..'z' || c in 'A'..'Z' || isDigit(c)
 
     private fun isHexDigit(c: Char): Boolean = isDigit(c) || c in 'a'..'f' || c in 'A'..'F'
+
+    // Case noise: the case changes often, or breaks a word's shape where no word does (RandomCase).
+    private fun isCaseNoise(token: String): Boolean = hasFrequentCaseChanges(token) || RandomCase.isRandom(token)
 }
