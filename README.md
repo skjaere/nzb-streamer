@@ -152,4 +152,11 @@ streamer.close()
 
 ## License
 
-See [LICENSE](LICENSE).
+This repository's own code is under the [PolyForm Noncommercial License 1.0.0](LICENSE.md) (SPDX `PolyForm-Noncommercial-1.0.0`): it is free for any non-commercial use, and commercial use needs the author's permission.
+
+These files keep their own licence:
+
+- The Gradle wrapper (`gradlew`, `gradlew.bat` and `gradle/wrapper/`): Apache License 2.0 (SPDX `Apache-2.0`).
+- Parts of `src/main/kotlin/io/skjaere/nzbstreamer/nzb/FilenameResolver.kt`, its filename priority weights and its list of important file types, come from [nzbdav](https://github.com/nzbdav-dev/nzbdav) and keep its MIT licence (SPDX `MIT`).
+
+Third-party notices are in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

@@ -26,8 +26,7 @@ import java.security.MessageDigest
  *
  * Highest priority wins. Ties broken by source-rank (par2 first).
  *
- * Reference:
- *   https://github.com/nzbdav-dev/nzbdav/blob/main/nzbdav/backend/Queue/DeobfuscationSteps/3.GetFileInfos/GetFileInfosStep.cs
+ * The weights and [IMPORTANT_FILE_EXTENSIONS] come from nzbdav (MIT licence; see THIRD_PARTY_NOTICES.md).
  */
 object FilenameResolver {
 
@@ -45,7 +44,7 @@ object FilenameResolver {
     private const val YENC_PRIORITY = 1
 
     // Video and archive containers that we care about ending up visible to clients.
-    // Matches nzbdav's IsImportantFileType (https://github.com/nzbdav-dev/nzbdav/...).
+    // Matches nzbdav's IsImportantFileType.
     private val IMPORTANT_FILE_EXTENSIONS = setOf(
         "mkv", "mp4", "avi", "mov", "wmv", "flv", "m4v", "mpg", "mpeg", "ts", "webm",
         "rar", "zip", "7z", "tar", "gz",
