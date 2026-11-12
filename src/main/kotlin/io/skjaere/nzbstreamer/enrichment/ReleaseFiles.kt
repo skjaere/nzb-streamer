@@ -455,13 +455,14 @@ internal class ReleaseFiles(private val files: List<NzbFile>) {
          * when it holds two volumes or more, or every volume the release holds: a volume alone in
          * its set beside others is ordered with them, not by its name. Not a set [skipping] checks,
          * nor one any of whose volumes the PAR2 data names by a volume's name, nor one whose RAR5
-         * headers number each of its volumes: those place them. A set the PAR2 data names by the
-         * names it was posted under (x7f3k9q2.r00.bin, an index made over those) is ordered by the
-         * names they give ([orderedBy]), so its places are checked as without PAR2 data. Such a set
-         * also lacks a volume the PAR2 data names into it by a name that gives one of its volumes
-         * ([VolumeNames.of]) when no file it opens holds it ([holds]): its last, which no gap
-         * shows (x7f3k9q2.r02.bin, not posted). Null when there is none. Without PAR2 data, a
-         * missing last volume isn't seen this way.
+         * headers number each of its volumes: those place them. A volume's name the PAR2 data gives
+         * none of the set's files places none of them (an index made over another packing's). A set
+         * the PAR2 data names by the names it was posted under (x7f3k9q2.r00.bin, an index made
+         * over those) is ordered by the names they give ([orderedBy]), so its places are checked as
+         * without PAR2 data. Such a set also lacks a volume the PAR2 data names into it by a name
+         * that gives one of its volumes ([VolumeNames.of]) when no file it opens holds it
+         * ([holds]): its last, which no gap shows (x7f3k9q2.r02.bin, not posted). Null when there
+         * is none. Without PAR2 data, a missing last volume isn't seen this way.
          */
         private fun skippingUnderAnotherExtension(
             hashes: Map<Int, String>,
@@ -473,7 +474,6 @@ internal class ReleaseFiles(private val files: List<NzbFile>) {
             return volumes.keys.groupBy { stemOf(volumes.getValue(it)) }.firstNotNullOfOrNull { (stem, set) ->
                 val posted = set.any { volumes.getValue(it) != postedName(it) }
                 val placed = set.any { par2Name(it, hashes)?.let(VolumeNames::isVolume) == true } ||
-                    descriptions.any { VolumeNames.isVolume(it.filename) && stemOf(it.filename) == stem } ||
                     set.all { files[it].first16kb?.let(Rar5Parser::volumeNumber) != null }
                 if (!posted || placed || stem in checked || set.size < 2 && set.size < volumes.size) {
                     return@firstNotNullOfOrNull null

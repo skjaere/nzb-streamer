@@ -612,6 +612,27 @@ class PrepareNeededFilesTest {
     }
 
     /**
+     * A PAR2 index that names volumes of a set's name by their volume names, but describes none of
+     * the files posted (it was made over another packing's), places none of them: the set, posted
+     * wholly under another extension, is ordered by the names its files give, so a volume those
+     * skip is one it lacks.
+     */
+    @Test
+    fun `a PAR2 index that describes none of a set's files doesn't hide a volume its names skip`() {
+        val named = volumes("x7f3k9q2", "Movie.2020.mkv", bytes("movie", 200_000), ContainerType.RAR4)
+        assertEquals(4, named.size)
+        named.forEachIndexed { v, (name, data) -> if (v != 1) post("$name.bin", data) }
+        post("x7f3k9q2.par2", buildPar2File(volumes("x7f3k9q2", "Movie.2020.mkv", bytes("another packing", 200_000), ContainerType.RAR4)))
+
+        withStreamer { streamer, _ ->
+            val result = streamer.prepare(nzb())
+            val lacked = assertIs<PrepareResult.MissingArticles>(result, "prepare: $result")
+            assertTrue("volume 2 " in lacked.message, lacked.message)
+            assertIs<ArchiveVolumeNotInNzbException>(lacked.cause)
+        }
+    }
+
+    /**
      * A season pack leaves out an episode whose set lacks a volume, the volume found posted under
      * another extension with it, also when that one was found by its yEnc name, which the
      * subjects don't give.
