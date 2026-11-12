@@ -68,7 +68,7 @@ class PoolTuningTest {
         yencHeaders = YencHeaders(line = 128, size = segments.size.toLong() * segmentSize, name = "data.bin", partEnd = segmentSize.toLong()),
     )
 
-    /** Starts streaming [file] from a session coroutine, as the app does. */
+    /** Starts streaming [file] from a session coroutine, as an Android app does. */
     private suspend fun start(service: NntpStreamingService): WriterJob {
         val writer = CompletableDeferred<WriterJob>()
         sessions.launch {

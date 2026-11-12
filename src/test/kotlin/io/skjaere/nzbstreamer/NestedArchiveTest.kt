@@ -23,16 +23,19 @@ import kotlin.test.assertIs
 import kotlin.test.assertTrue
 
 /**
- * Tests nested archive support using the real double-archive example at doublerar/:
- * 11 split 7z volumes (Copy method) containing 52 old-style RAR volumes (.rar + .r00-.r50)
- * plus proof.jpg, sample.mkv, .nfo, and .sfv. Skipped where that local fixture is missing; the
+ * Tests nested archive support using a real double archive: 11 split 7z volumes (Copy method)
+ * containing 52 old-style RAR volumes (.rar + .r00-.r50) plus proof.jpg, sample.mkv, .nfo, and
+ * .sfv. The folder holding the 7z volumes comes from the system property [DIR_PROPERTY] or the
+ * environment variable [DIR_VARIABLE]; the tests are skipped when neither is set. The
  * nested-archive tests that need no fixture are in [GeneratedNestedArchiveTest],
  * [ChunkedNestedSeekableInputStreamTest] and, over NNTP, [NestedArchivePrepareIntegrationTest].
  */
 class NestedArchiveTest {
 
     companion object {
-        private val archiveDir = File("/path/to/nzb-streamer-utils/doublerar")
+        const val DIR_PROPERTY = "nzbstreamer.doubleArchiveDir"
+        const val DIR_VARIABLE = "NZB_STREAMER_DOUBLE_ARCHIVE_DIR"
+
         private lateinit var outerVolumes: List<File>
         private lateinit var outerVolumeMetadata: List<VolumeMetaData>
         private lateinit var outerEntries: List<ArchiveFileEntry>
@@ -40,11 +43,15 @@ class NestedArchiveTest {
         @JvmStatic
         @BeforeAll
         fun setup() {
-            assumeTrue(archiveDir.exists(), "Test archive not available at ${archiveDir.absolutePath}")
+            val dir = System.getProperty(DIR_PROPERTY) ?: System.getenv(DIR_VARIABLE)
+            assumeTrue(dir != null, "Set $DIR_PROPERTY or $DIR_VARIABLE to the double archive's folder to run these")
+            val archiveDir = File(dir!!)
+            check(archiveDir.isDirectory) { "No folder at ${archiveDir.absolutePath}" }
 
             outerVolumes = archiveDir.listFiles()!!
                 .filter { it.name.matches(Regex(""".*\.7z\.\d{3}$""")) }
                 .sortedBy { it.name }
+            check(outerVolumes.isNotEmpty()) { "No 7z volumes (name.7z.001, ...) in ${archiveDir.absolutePath}" }
 
             outerVolumeMetadata = outerVolumes.map {
                 VolumeMetaData(filename = it.name, size = it.length())

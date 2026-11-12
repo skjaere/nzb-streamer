@@ -27,7 +27,7 @@ import kotlin.test.assertTrue
  * volumes, or its videos and other content when it has no archive), and a file it doesn't need
  * (a PAR2 file, an NFO, an SFV, a sample, another episode's files) that lacks its first article
  * doesn't fail the release. A needed file that lacks it still does. A volume posted under another
- * extension is still one of its archive's, and an archive that lacks one doesn't open (N52).
+ * extension is still one of its archive's, and an archive that lacks one doesn't open.
  */
 class PrepareNeededFilesTest {
     private val articles = mutableMapOf<String, ByteArray>()
@@ -193,7 +193,7 @@ class PrepareNeededFilesTest {
         }
     }
 
-    /** Each episode's RAR4 set (.rar, .r00, ...) is opened from its own volumes, none from another's (NR-2). */
+    /** Each episode's RAR4 set (.rar, .r00, ...) is opened from its own volumes, none from another's. */
     @Test
     fun `a RAR4 season pack lists every episode and streams each whole`() {
         val episodes = (1..3).associate { e -> "Show.S01E0$e" to bytes("episode $e", 150_000) }
@@ -206,7 +206,7 @@ class PrepareNeededFilesTest {
         }
     }
 
-    /** A subtitle archive posted after the film's RAR4 set is no volume of it (NR-2). */
+    /** A subtitle archive posted after the film's RAR4 set is no volume of it. */
     @Test
     fun `a RAR4 film with a subtitle archive posted after it streams whole`() {
         val payload = bytes("movie", 200_000)
@@ -221,7 +221,7 @@ class PrepareNeededFilesTest {
 
     /**
      * Volumes obfuscated one by one ("a8f7d6e5.rar", "b91c2d3e.rar", ...) don't group into a set,
-     * yet are one archive: none stands in for another (library issue N36).
+     * yet are one archive: none stands in for another.
      */
     @ParameterizedTest
     @ValueSource(strings = ["rar", "7z"])
@@ -240,7 +240,7 @@ class PrepareNeededFilesTest {
 
     /**
      * A release without a PAR2 index names its obfuscated volumes from a recovery volume: prepare
-     * fetches the smallest (library issue N36).
+     * fetches the smallest.
      */
     @Test
     fun `a recovery volume names obfuscated volumes when the release has no PAR2 index`() {
@@ -319,7 +319,7 @@ class PrepareNeededFilesTest {
     /**
      * A volume posted under another extension than its archive's is one of its volumes all the
      * same: the PAR2 index names it by its first 16 KB or, without one, it starts with the archive's
-     * signature and its name but for that extension gives its place (library issue N52).
+     * signature and its name but for that extension gives its place.
      */
     @ParameterizedTest
     @CsvSource(
@@ -346,7 +346,7 @@ class PrepareNeededFilesTest {
      * Without a PAR2 index, a file posted under another extension that starts with an archive's
      * signature joins the release's archive only when its name places it in a set the release
      * opens: the volume of another archive (here the first of an extra's two, the second not
-     * posted) is none of the film's, which opens without it (NR-14).
+     * posted) is none of the film's, which opens without it.
      */
     @ParameterizedTest
     @ValueSource(strings = ["RAR4", "RAR5"])
@@ -366,7 +366,7 @@ class PrepareNeededFilesTest {
     /**
      * The volumes are ordered by the names their yEnc headers give, which an indexer that rewrites
      * subjects (either way) leaves as posted: without a PAR2 index, a volume posted under another
-     * extension joins the set those names make, by its own yEnc name, whatever the subjects say (NR-14).
+     * extension joins the set those names make, by its own yEnc name, whatever the subjects say.
      */
     @ParameterizedTest
     @CsvSource("RAR5, Movie.2020, abc123", "RAR4, Movie.2020, abc123", "RAR5, abc123, Movie.2020", "RAR4, abc123, Movie.2020")
@@ -393,7 +393,7 @@ class PrepareNeededFilesTest {
      * Beside volumes obfuscated one by one, with no PAR2 data, a volume posted under another
      * extension whose name places it in a set of its own may be one of theirs, under a name of its
      * own as theirs are: nothing tells where it goes, so the release fails rather than open
-     * without it (NR-14). A random name under another extension isn't one of its own: it tells
+     * without it. A random name under another extension isn't one of its own: it tells
      * nothing, so the file is fetched as a possible volume of theirs.
      */
     @ParameterizedTest
@@ -415,7 +415,7 @@ class PrepareNeededFilesTest {
     /**
      * A season pack leaves out an episode whose set lacks a volume, the volume found posted under
      * another extension with it, also when that one was found by its yEnc name, which the
-     * subjects don't give (NR-14).
+     * subjects don't give.
      */
     @Test
     fun `a season pack leaves out an episode that lacks a volume, with one found by its yEnc name`() {
@@ -441,7 +441,7 @@ class PrepareNeededFilesTest {
 
     /**
      * Without a PAR2 index nothing tells where such a volume goes: the release isn't opened in a
-     * guessed order (N52). It is broken as posted, which its cause's type says (NR-18).
+     * guessed order. It is broken as posted, which its cause's type says.
      */
     @Test
     fun `a volume posted under a name that doesn't give its place fails a release without a PAR2 index`() {
@@ -458,7 +458,7 @@ class PrepareNeededFilesTest {
     /**
      * A 7z set's volume past the first has no signature: without a PAR2 index its content can't
      * tell it is one. The set lacks it, and its end header lies past the end of what it holds, so
-     * the release fails rather than opening without it (N52), as a malformed archive (NR-20).
+     * the release fails rather than opening without it, as a malformed archive.
      */
     @Test
     fun `a 7z volume posted under another extension fails a release without a PAR2 index`() {
@@ -473,8 +473,8 @@ class PrepareNeededFilesTest {
 
     /**
      * A volume the PAR2 index names that the release doesn't hold, or holds under a name prepare
-     * doesn't fetch (an NFO's): the archive can't open whole (N52). No provider can supply it, which
-     * its cause's type says (NR-18).
+     * doesn't fetch (an NFO's): the archive can't open whole. No provider can supply it, which
+     * its cause's type says.
      */
     @ParameterizedTest
     @ValueSource(strings = ["", "Movie.2020.part2.nfo"])
@@ -493,7 +493,7 @@ class PrepareNeededFilesTest {
         }
     }
 
-    /** A provider may have its first article: it isn't a volume the NZB doesn't hold (NR-18). */
+    /** A provider may have its first article: it isn't a volume the NZB doesn't hold. */
     @ParameterizedTest
     @ValueSource(booleans = [true, false])
     fun `a volume posted under another extension that lacks its first article fails the release`(withIndex: Boolean) {
@@ -511,7 +511,7 @@ class PrepareNeededFilesTest {
      * Without PAR2 data the files beside the archive are fetched to tell by their content whether
      * one is a volume posted under another extension. One that lacks its first article fails the
      * release only when it may be a volume: a set's volumes but its last are as big as its biggest,
-     * so a proof picture, a subtitle or a featurette bigger than any volume can't be one (NR-3).
+     * so a proof picture, a subtitle or a featurette bigger than any volume can't be one.
      */
     @ParameterizedTest
     @ValueSource(strings = ["Movie.2020.Proof.jpg", "Movie.2020.eng.srt", "Movie.2020.Featurette.mkv"])
@@ -531,7 +531,7 @@ class PrepareNeededFilesTest {
     /**
      * In a season pack whose sets open on their own, a file beside them that lacks its first
      * article and may be a volume leaves out only the set its name places it in, and one that can't
-     * be a volume nothing; one that may be a volume whose name places it nowhere fails the pack (NR-16).
+     * be a volume nothing; one that may be a volume whose name places it nowhere fails the pack.
      */
     @ParameterizedTest
     @CsvSource(
@@ -562,7 +562,7 @@ class PrepareNeededFilesTest {
     /**
      * Without PAR2 data, a file beside the archive that lacks its first article and whose name
      * places it in a set the release opens is that set's volume, whatever its size: a set's last
-     * volume is smaller than the rest. The release doesn't open without it (NR-3).
+     * volume is smaller than the rest. The release doesn't open without it.
      */
     @ParameterizedTest
     @CsvSource("RAR5, Movie.2020.part4.bin", "RAR4, Movie.2020.r02.bin")
@@ -580,7 +580,7 @@ class PrepareNeededFilesTest {
         }
     }
 
-    /** As a middle one, an episode's last volume posted under another extension that lacks its first article leaves out only that episode (NR-3). */
+    /** As a middle one, an episode's last volume posted under another extension that lacks its first article leaves out only that episode. */
     @ParameterizedTest
     @ValueSource(strings = ["RAR5", "RAR4"])
     fun `a season pack leaves out an episode whose last volume, posted under another extension, lacks its first article`(type: ContainerType) {
@@ -603,8 +603,8 @@ class PrepareNeededFilesTest {
 
     /**
      * A lacking file beside the archive whose name places it where the release holds a volume (a
-     * repost of one) or in another archive (an extra's, as one held is, NR-14) is none of the
-     * volumes the release lacks, whatever its size: it fails nothing (NR-3).
+     * repost of one) or in another archive (an extra's, as one held is) is none of the
+     * volumes the release lacks, whatever its size: it fails nothing.
      */
     @ParameterizedTest
     @ValueSource(strings = ["Movie.2020.part4.bin", "Extras.part1.bin"])
@@ -626,8 +626,8 @@ class PrepareNeededFilesTest {
 
     /**
      * Each episode has its PAR2 index: the second's names the volume of its set posted under another
-     * extension (N52). An index made over the season's folder names each file with its path in it,
-     * matched by the name it ends in (NR-11).
+     * extension. An index made over the season's folder names each file with its path in it,
+     * matched by the name it ends in.
      */
     @ParameterizedTest
     @ValueSource(strings = ["", "Show.S01/", "Show.S01\\"])
@@ -647,7 +647,7 @@ class PrepareNeededFilesTest {
 
     /**
      * As another episode's set that lacks a first article, one that lacks a volume its PAR2 index
-     * names is left out (N52), also where the index names it with its path in the season's folder (NR-11).
+     * names is left out, also where the index names it with its path in the season's folder.
      */
     @ParameterizedTest
     @ValueSource(strings = ["", "Show.S01/", "Show.S01\\"])
@@ -667,7 +667,7 @@ class PrepareNeededFilesTest {
     }
 
     /**
-     * Guards for N52: ordinary releases open as before, and prepare fetches no file beside their
+     * Guards for volumes posted under another extension: ordinary releases open as before, and prepare fetches no file beside their
      * volumes when their PAR2 index names every volume. Without one, a video or other file beside
      * the archive is fetched to tell by its content that it isn't a volume.
      */
@@ -678,7 +678,7 @@ class PrepareNeededFilesTest {
         val named = volumes("Movie.2020", "Movie.2020.mkv", payload, type)
         named.forEach { (name, data) -> post(name, data) }
         if (withIndex) post("Movie.2020.par2", buildPar2File(named))
-        // Without an index, the recovery volume is fetched in its place (N36).
+        // Without an index, the recovery volume is fetched in its place.
         val unneeded = listOf("Movie.2020.nfo", "Movie.2020.sfv", "Movie.2020-sample.mkv") +
             listOfNotNull("Movie.2020.vol00+01.par2".takeIf { withIndex })
         (unneeded + "Movie.2020.vol00+01.par2").distinct().forEach { name -> post(name, bytes(name, 1_000)) }
@@ -694,7 +694,7 @@ class PrepareNeededFilesTest {
         }
     }
 
-    /** Guard for N52: volumes obfuscated one by one, named by the PAR2 index by their first 16 KB, open as before. */
+    /** Guard for volumes posted under another extension: volumes obfuscated one by one, named by the PAR2 index by their first 16 KB, open as before. */
     @ParameterizedTest
     @ValueSource(strings = ["", ".rar"])
     fun `volumes obfuscated one by one open with a PAR2 index`(extension: String) {
@@ -712,7 +712,7 @@ class PrepareNeededFilesTest {
     /**
      * Volumes obfuscated one by one under names that keep their extension (a8f7d6e5.rar, each a
      * first volume's name) are placed by the names the PAR2 index gives them, in whatever order the
-     * NZB lists them, and so is one found posted under another extension (NR-1).
+     * NZB lists them, and so is one found posted under another extension.
      */
     @ParameterizedTest
     @CsvSource("true, false", "true, true", "false, true")
@@ -732,7 +732,7 @@ class PrepareNeededFilesTest {
 
     /**
      * RAR5 volumes posted under names that give no place, with no PAR2 data to name them, open in
-     * the order their main archive headers give, whatever order the NZB lists them in (NR-21).
+     * the order their main archive headers give, whatever order the NZB lists them in.
      */
     @ParameterizedTest
     @CsvSource("reversed, ''", "shuffled, ''", "reversed, .rar", "shuffled, .rar")
@@ -749,7 +749,7 @@ class PrepareNeededFilesTest {
         }
     }
 
-    /** Their headers show such a set lacks a volume the NZB doesn't hold: it doesn't open without it (NR-21). */
+    /** Their headers show such a set lacks a volume the NZB doesn't hold: it doesn't open without it. */
     @ParameterizedTest
     @ValueSource(ints = [0, 1])
     fun `a set posted under names that give no place that lacks a volume fails the release`(absent: Int) {
@@ -765,8 +765,8 @@ class PrepareNeededFilesTest {
     /**
      * Without PAR2 data to name its volumes, a set ordered by its names (or by its RAR5 headers)
      * whose volumes skip one, or don't start at its first, lacks one the NZB doesn't hold: the
-     * release doesn't open without it (NR-13). A missing last volume can't be seen this way. The
-     * cause's type says no provider can supply it (NR-18).
+     * release doesn't open without it. A missing last volume can't be seen this way. The
+     * cause's type says no provider can supply it.
      */
     @ParameterizedTest
     @CsvSource("RAR4, 2", "RAR4, 0", "SEVENZIP, 1", "SEVENZIP, 0", "RAR5, 1", "RAR5, 0")
@@ -786,7 +786,7 @@ class PrepareNeededFilesTest {
     /**
      * A volume the PAR2 index names into a set, posted under a name that tells nothing or obfuscated
      * by itself beside the set's named volumes, is one of the set's: its volumes don't skip it, by
-     * their RAR5 headers or otherwise, and the release opens in the order the index gives (NR-13).
+     * their RAR5 headers or otherwise, and the release opens in the order the index gives.
      */
     @ParameterizedTest
     @CsvSource("RAR5, x7f3k9q2", "RAR5, a8f7d6e5.rar", "RAR4, x7f3k9q2", "RAR4, a8f7d6e5.rar")
@@ -806,7 +806,7 @@ class PrepareNeededFilesTest {
 
     /**
      * A RAR volume starts with its archive's signature: without PAR2 data, a file named like the
-     * volume a set's names skip that isn't an archive doesn't stand in for it (NR-13). A 7z volume
+     * volume a set's names skip that isn't an archive doesn't stand in for it. A 7z volume
      * past the first has none, so its name alone counts.
      */
     @Test
@@ -822,7 +822,7 @@ class PrepareNeededFilesTest {
         }
     }
 
-    /** As one that lacks a first article, another episode's set whose volumes skip one is left out (NR-13). */
+    /** As one that lacks a first article, another episode's set whose volumes skip one is left out. */
     @ParameterizedTest
     @ValueSource(strings = ["RAR4", "RAR5"])
     fun `a season pack leaves out an episode whose volumes skip one`(type: ContainerType) {
@@ -842,7 +842,7 @@ class PrepareNeededFilesTest {
 
     /**
      * A recovery volume's file descriptions often follow its recovery block, past its first 16 KB:
-     * it is read as it streams, its block skipped, until they are (library issue N53).
+     * it is read as it streams, its block skipped, until they are.
      */
     @Test
     fun `a recovery volume whose file descriptions follow its recovery block names obfuscated volumes`() {
@@ -858,7 +858,7 @@ class PrepareNeededFilesTest {
         }
     }
 
-    /** A PAR2 index that lacks an article names nothing: the smallest recovery volume does in its place (N53). */
+    /** A PAR2 index that lacks an article names nothing: the smallest recovery volume does in its place. */
     @ParameterizedTest
     @ValueSource(ints = [0, 1])
     fun `a recovery volume names obfuscated volumes when the PAR2 index lacks an article`(lacking: Int) {
@@ -882,7 +882,7 @@ class PrepareNeededFilesTest {
      * descriptions and their slices' checksums, by file id) evenly between its slices: a volume of
      * three, the smallest when the volumes are sized alike, names some files after its first slice
      * and the rest after its second. It is read past a slice until its descriptions cover every
-     * file its Main packet lists, so every obfuscated volume is named, and in its place (NR-4, NR-6).
+     * file its Main packet lists, so every obfuscated volume is named, and in its place.
      */
     @ParameterizedTest
     @ValueSource(strings = ["RAR4", "RAR5"])
@@ -905,7 +905,7 @@ class PrepareNeededFilesTest {
     /**
      * Obfuscated volumes the PAR2 data names beside one it doesn't: ordered by those names, the
      * unnamed one would follow them wherever it goes. Without RAR5 headers to place it, the release
-     * fails rather than open out of order; RAR5 volumes open in the order their headers give (NR-4).
+     * fails rather than open out of order; RAR5 volumes open in the order their headers give.
      */
     @ParameterizedTest
     @ValueSource(strings = ["RAR4", "RAR5"])
@@ -928,7 +928,7 @@ class PrepareNeededFilesTest {
 
     /**
      * A recovery volume that names its files before its recovery block is read no further than
-     * them: its block, which can be tens of MB, is neither held nor downloaded (N53).
+     * them: its block, which can be tens of MB, is neither held nor downloaded.
      */
     @Test
     fun `a recovery volume is read no further than its file descriptions`() {
@@ -948,7 +948,7 @@ class PrepareNeededFilesTest {
     /**
      * A recovery volume whose block, ahead of its file descriptions, is bigger than prepare reads of
      * a PAR2 file is read from past it: the block's length is in the first 16 KB, so its articles are
-     * never fetched, and it names the volumes however big it is (NR-7).
+     * never fetched, and it names the volumes however big it is.
      */
     @Test
     fun `a recovery volume whose block is bigger than prepare reads names the volumes, its block not fetched`() {
@@ -966,7 +966,7 @@ class PrepareNeededFilesTest {
     /**
      * The recovery volume standing in for the PAR2 index is read from past its block, so an article
      * of the block that no provider has, or whose answer the connection drops in, doesn't keep it
-     * from naming the volumes, nor fails prepare (NR-7).
+     * from naming the volumes, nor fails prepare.
      */
     @Test
     fun `a recovery volume's block isn't fetched, so an article of it no provider has doesn't lose its names`() {
@@ -990,7 +990,7 @@ class PrepareNeededFilesTest {
      * article names nothing (and the next-smallest is read), but one whose read fails any other way
      * (here the connection drops every time in the article with its descriptions, or in its first,
      * fetched because the index lacks its own) fails prepare, which may be tried again, rather than
-     * open the volumes its names were to order in the order the NZB lists them (NR-7).
+     * open the volumes its names were to order in the order the NZB lists them.
      */
     @ParameterizedTest
     @ValueSource(booleans = [false, true])
@@ -1011,7 +1011,7 @@ class PrepareNeededFilesTest {
 
     /**
      * A PAR2 file whose yEnc headers give it more bytes than its articles hold is read to where they
-     * end, and no further: a read that gets nothing past where it starts isn't made again (NR-7).
+     * end, and no further: a read that gets nothing past where it starts isn't made again.
      */
     @Test
     fun `a PAR2 index that holds fewer bytes than its size claims isn't read again and again`() {
@@ -1041,7 +1041,7 @@ class PrepareNeededFilesTest {
     /**
      * An index's file descriptions that cover every file its Main packet lists are kept whatever
      * fails past them: here an article of its slices' checksums, which follow them, that no provider
-     * has, or whose answer the connection drops in (NR-7, as NR-15 for a recovery volume).
+     * has, or whose answer the connection drops in, as for a recovery volume.
      */
     @ParameterizedTest
     @ValueSource(booleans = [false, true])
@@ -1068,7 +1068,7 @@ class PrepareNeededFilesTest {
     /**
      * A recovery volume read until its file descriptions are whole is read no further, and what
      * fails past them changes nothing, whenever it fails: here its block's first article, which no
-     * provider has, is answered before the one its descriptions end in (NR-15).
+     * provider has, is answered before the one its descriptions end in.
      */
     @Test
     fun `a recovery volume's descriptions are kept whatever fails past them`() {
@@ -1095,7 +1095,7 @@ class PrepareNeededFilesTest {
      * A recovery volume stands in for the PAR2 index of its own set: the smallest of those named
      * like it, the next-smallest when that names nothing, for a set whose index names nothing or
      * that has none. Another set's index (a sample's), which names only its own files, doesn't stand
-     * in for it, nor does another set's smaller recovery volume (NR-5).
+     * in for it, nor does another set's smaller recovery volume.
      */
     @ParameterizedTest
     @ValueSource(strings = ["its index lacking beside a sample's", "no index beside a sample's", "no index, its smallest volume lacking"])
@@ -1125,7 +1125,7 @@ class PrepareNeededFilesTest {
     /**
      * A PAR2 index over more than about a thousand files starts with a Main packet that lists them
      * all, past its first 16 KB: it is read all the same, as far as prepare reads a PAR2 file, and
-     * names the volumes without a recovery volume read in its place (NR-9).
+     * names the volumes without a recovery volume read in its place.
      */
     @ParameterizedTest
     @ValueSource(booleans = [false, true])
@@ -1151,7 +1151,7 @@ class PrepareNeededFilesTest {
      * Recovery volumes posted under names that keep only their extension ('<hash>.par2') are named
      * like indexes, but start with their recovery slices: as before, they are read only when their
      * first 16 KB name files, so their blocks aren't fetched past their first article, while the
-     * index beside them names the volumes (NR-9).
+     * index beside them names the volumes.
      */
     @Test
     fun `recovery volumes posted under an index's name are read no further than their first article`() {
@@ -1173,8 +1173,7 @@ class PrepareNeededFilesTest {
 
     /**
      * A release of files posted under their names, with no archive, needs no names from the PAR2
-     * data: no recovery volume is read in place of its index when that lacks its first article
-     * (NR-10).
+     * data: no recovery volume is read in place of its index when that lacks its first article.
      */
     @Test
     fun `a release of files posted under their names reads no recovery volume in place of its index`() {
@@ -1198,7 +1197,7 @@ class PrepareNeededFilesTest {
      * The recovery volume read in place of the PAR2 index is read from the first article fetched of
      * it, whole, not that article fetched again: here its descriptions follow its block in that
      * article, past its first 16 KB. So with it fetched with the rest (no index) and after them (an
-     * index that lacks its first article) (NR-10).
+     * index that lacks its first article).
      */
     @ParameterizedTest
     @ValueSource(booleans = [false, true])
@@ -1220,7 +1219,7 @@ class PrepareNeededFilesTest {
     /**
      * A recovery volume posted under a name that tells nothing is fetched (it may be a volume) and,
      * naming its files first, passes for an index: it too is read no further than its file
-     * descriptions (N53).
+     * descriptions.
      */
     @Test
     fun `an obfuscated recovery volume is read no further than its file descriptions`() {
@@ -1239,7 +1238,7 @@ class PrepareNeededFilesTest {
 
     /**
      * Whether a PAR2 file names files is told from its first 16 KB without taking a packet's length
-     * on trust: a recovery block's is its size, which can be tens of MB, here 2 GB (N53).
+     * on trust: a recovery block's is its size, which can be tens of MB, here 2 GB.
      */
     @Test
     fun `a PAR2 packet's length isn't allocated before it is read`() {
@@ -1260,7 +1259,7 @@ class PrepareNeededFilesTest {
      * An obfuscated post names none of its files in its subjects, so any of them may be a volume,
      * the content or a PAR2 file. Prepare reads the PAR2 index from the files no bigger than one can
      * be, then fetches the first articles of the bigger ones it may describe: not those of its
-     * recovery volumes, as big as any other's (16 of 3.84 MB for one remux, library issue N99), so
+     * recovery volumes, as big as any other's (16 of 3.84 MB for one remux), so
      * one of them that lacks its first article doesn't fail the release either.
      */
     @ParameterizedTest
@@ -1292,7 +1291,7 @@ class PrepareNeededFilesTest {
     /**
      * Recovery volumes posted under an index's name ('<hash>.par2') may each be the index, as far as
      * their names tell: those bigger than an index can be are fetched only when the index beside
-     * them names nothing (N99).
+     * them names nothing.
      */
     @Test
     fun `recovery volumes posted under an index's name aren't fetched once the index names the files`() {
@@ -1313,7 +1312,7 @@ class PrepareNeededFilesTest {
     /**
      * A file of an obfuscated post that its PAR2 data doesn't describe is still fetched when it is
      * of the size of what it does (here an episode of a season pack posted without its index), so
-     * the release still lists it; the other episode's recovery volume isn't fetched (N99).
+     * the release still lists it; the other episode's recovery volume isn't fetched.
      */
     @Test
     fun `an episode an obfuscated season pack's PAR2 data doesn't describe is still listed`() {
@@ -1336,8 +1335,7 @@ class PrepareNeededFilesTest {
 
     /**
      * Where the PAR2 index lacks its first article, a recovery volume posted under a name that tells
-     * nothing, as big as any, is fetched and read in its place as before: it names the volumes
-     * (N36, N99).
+     * nothing, as big as any, is fetched and read in its place as before: it names the volumes.
      */
     @Test
     fun `an obfuscated recovery volume names the volumes when the PAR2 index lacks its first article`() {

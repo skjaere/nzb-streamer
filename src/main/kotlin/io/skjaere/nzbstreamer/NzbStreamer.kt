@@ -158,9 +158,9 @@ class NzbStreamer private constructor(
         // on-wire yenc header name. The par2 index is built once per NZB (par2 bytes
         // can be on any file in the doc, normally only one slot has them). prepare keeps the
         // PAR2 files out of the doc, though: the name their data gives a file is the one it
-        // lists the file under in the response's volumes, where that isn't its yEnc name
-        // (library issue N54). Either names a file by its first 16 KB and its length, and
-        // none that start alike and are as long (NR-8); and no name is given two files.
+        // lists the file under in the response's volumes, where that isn't its yEnc name.
+        // Either names a file by its first 16 KB and its length, and none that start alike
+        // and are as long; and no name is given two files.
         val files = metadata.orderedArchiveNzb.files
         val volumes = metadata.response.volumes
         val par2Names = Par2FileNames.parse(files.firstOrNull { it.par2Data != null }?.par2Data)

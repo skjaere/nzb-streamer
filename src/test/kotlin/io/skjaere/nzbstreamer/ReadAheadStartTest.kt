@@ -43,7 +43,7 @@ import org.junit.jupiter.api.Test
  * until its reader has taken the first one's bytes, then the whole read-ahead. A player's first
  * open and the track probe read a few KB and close or seek: each queued the whole read-ahead, a
  * dozen 3.84 MB segments of a 4K remux, and a probe allocated 68-284 MB in under a second on an
- * emulator. A Plex scan through debridav opens many streams that read a few KB each. A file's
+ * emulator. A media server's library scan over WebDAV opens many streams that read a few KB each. A file's
  * stream opened further on, a seek, gets its whole read-ahead at once.
  */
 class ReadAheadStartTest {
@@ -83,7 +83,7 @@ class ReadAheadStartTest {
             .also { runBlocking { it.connect() } }
     }
 
-    /** Starts streaming [queue] from a session coroutine, as the app does: four at once, six read ahead. */
+    /** Starts streaming [queue] from a session coroutine, as an Android app does: four at once, six read ahead. */
     private suspend fun start(service: NntpStreamingService, queue: Flow<SegmentQueueItem> = SegmentQueueService.createFileQueue(file, 0, 0L)): WriterJob {
         val writer = CompletableDeferred<WriterJob>()
         sessions.launch {
@@ -144,7 +144,7 @@ class ReadAheadStartTest {
         }
     }
 
-    /** Starts streaming [range] of the file from a session coroutine, as the app does: the service's four at once, six read ahead. */
+    /** Starts streaming [range] of the file from a session coroutine, as an Android app does: the service's four at once, six read ahead. */
     private suspend fun startFile(service: NntpStreamingService, range: LongRange): WriterJob {
         val size = whole.size.toLong()
         val writer = CompletableDeferred<WriterJob>()

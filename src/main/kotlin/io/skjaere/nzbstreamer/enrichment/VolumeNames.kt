@@ -7,9 +7,8 @@ import io.skjaere.compressionutils.Par2Parser
 import io.skjaere.nzbstreamer.nzb.NzbFile
 
 /**
- * What tells that a file is an archive volume, and which, beyond the name it was posted under
- * (library issue N52): the PAR2 data, which names each file by the MD5 of its first 16 KB and its
- * length, and its content, which starts with an archive's signature (every RAR volume's does, a 7z
+ * What tells that a file is an archive volume, and which, beyond the name it was posted under:
+ * the PAR2 data, which names each file by the MD5 of its first 16 KB and its length, and its content, which starts with an archive's signature (every RAR volume's does, a 7z
  * set's first).
  */
 internal object VolumeNames {
@@ -23,7 +22,7 @@ internal object VolumeNames {
      * The file descriptions in the PAR2 data of [files], every PAR2 file's (a season pack can have
      * an index per episode), each by the name its path ends in; none from data that doesn't parse.
      * An index made over a folder names its files with their path in it
-     * (Show.S01/Show.S01E02.part3.rar), which no name they were posted under has (NR-11).
+     * (Show.S01/Show.S01E02.part3.rar), which no name they were posted under has.
      */
     fun descriptions(files: List<NzbFile>): List<Par2Parser.Par2FileDescription> =
         files.mapNotNull { it.par2Data }.flatMap { data ->
@@ -41,7 +40,7 @@ internal object VolumeNames {
 
     /**
      * The names [descriptions] give files, each by its first 16 KB and its length: none to files
-     * that start alike and are as long, which several with different names describe (NR-8).
+     * that start alike and are as long, which several with different names describe.
      */
     fun names(descriptions: List<Par2Parser.Par2FileDescription>): Par2FileNames = Par2FileNames(descriptions)
 

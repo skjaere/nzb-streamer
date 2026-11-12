@@ -18,7 +18,7 @@ import kotlin.test.assertIs
 
 /**
  * A release of files posted as they are (no archive) lists them by the best name it has for each:
- * the PAR2 index's first, which survives a poster's obfuscation (library issue N54).
+ * the PAR2 index's first, which survives a poster's obfuscation.
  */
 class RawReleaseNamesTest {
     private val articles = mutableMapOf<String, ByteArray>()
@@ -67,7 +67,7 @@ class RawReleaseNamesTest {
     /**
      * Disc images start alike (their first 32 KB are zeros), so the PAR2 index's descriptions of
      * both give the same first 16 KB: their lengths tell them apart, and where they don't either,
-     * no description names either (NR-8).
+     * no description names either.
      */
     @ParameterizedTest
     @CsvSource("300000, 350000, false", "300000, 300000, false", "300000, 350000, true")
@@ -85,7 +85,7 @@ class RawReleaseNamesTest {
         }
     }
 
-    /** A DVD's VIDEO_TS.BUP is a copy of its VIDEO_TS.IFO (and VTS_01_0.BUP of VTS_01_0.IFO): each keeps its name (NR-12). */
+    /** A DVD's VIDEO_TS.BUP is a copy of its VIDEO_TS.IFO (and VTS_01_0.BUP of VTS_01_0.IFO): each keeps its name. */
     @Test
     fun `a DVD folder posted as it is lists each file under its own name`() {
         val ifo = Random(1).nextBytes(12_000)

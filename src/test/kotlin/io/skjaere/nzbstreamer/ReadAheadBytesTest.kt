@@ -35,7 +35,7 @@ import org.junit.jupiter.api.Test
 /**
  * A stream's read-ahead in bytes ([StreamingConfig.readAheadBytes]). Counted in segments only, a
  * release posted in 3.84 MB parts held twelve of them ahead of its reader, 46 MB, beside the
- * player's own buffer: on a TV box's 192 MB heap the app ran out of memory. These streams start
+ * player's own buffer: an Android app on a TV box's 192 MB heap ran out of memory. These streams start
  * their whole read-ahead at once (no [StreamingConfig.initialReadAheadSegments]), so it can be
  * counted before anything is read; ReadAheadStartTest has it bound a stream that started small.
  */
@@ -73,7 +73,7 @@ class ReadAheadBytesTest {
             .also { runBlocking { it.connect() } }
     }
 
-    /** Starts streaming [queue] (every segment) from a session coroutine, as the app does; the settings are the service's. */
+    /** Starts streaming [queue] (every segment) from a session coroutine, as an Android app does; the settings are the service's. */
     private suspend fun start(service: NntpStreamingService, queue: Flow<SegmentQueueItem> = SegmentQueueService.createFileQueue(file, 0, 0L)): WriterJob {
         val writer = CompletableDeferred<WriterJob>()
         sessions.launch {

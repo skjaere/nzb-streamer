@@ -25,7 +25,7 @@ class VerificationService(
     private val verificationSegments = registry.counter("nzb.verification.segments")
     private val verificationMissing = registry.counter("nzb.verification.missing")
 
-    // Mutable so the live override path in debridav can bump it without restarting.
+    // Mutable so a caller can raise it while running, without a restart.
     // Read fresh into the per-call Semaphore below; in-flight verifications keep their
     // existing semaphore. Volatile is sufficient — single-int write, no compound
     // check-then-act on the field itself.

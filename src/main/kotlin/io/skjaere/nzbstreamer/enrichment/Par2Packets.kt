@@ -9,9 +9,9 @@ import java.nio.ByteOrder
 
 /**
  * Reads the FileDesc packets of a PAR2 file as it streams, without holding the rest: a recovery
- * volume's recovery blocks can be tens of MB each (library issue N53). One reader reads one file,
+ * volume's recovery blocks can be tens of MB each. One reader reads one file,
  * in one read or several ([read]): a recovery slice need not be read at all, as its length is in its
- * header, so a read can stop there and the next start past it (NR-7).
+ * header, so a read can stop there and the next start past it.
  */
 internal class Par2Packets {
     private val kept = ByteArrayOutputStream()
@@ -47,7 +47,7 @@ internal class Par2Packets {
      * Reads the packets [channel] delivers, the file's from byte [from] on (a packet's start), up to
      * its end, the first bytes that aren't a packet, or a recovery block once the descriptions it
      * read cover every file the Main packet lists: a recovery volume names its files before or after
-     * its blocks, or spreads them between its blocks as par2cmdline does (NR-4, NR-6). A recovery
+     * its blocks, or spreads them between its blocks as par2cmdline does. A recovery
      * slice of [skipOver] bytes or more before then ends the read too ([Stop.Next]): the next read
      * starts past it. Other packets are skipped, but for the Main packet's list of file ids.
      */
@@ -106,7 +106,7 @@ internal class Par2Packets {
         /** The FileDesc packets [channel] delivers, read as [read] reads them, or null when it delivers none. */
         suspend fun fileDescriptions(channel: ByteReadChannel): ByteArray? = Par2Packets().apply { read(channel, 0) }.descriptions
 
-        /** Whether [bytes], a PAR2 file's first, start with a recovery slice: a recovery volume's, whatever it is named (NR-9). */
+        /** Whether [bytes], a PAR2 file's first, start with a recovery slice: a recovery volume's, whatever it is named. */
         fun startsWithRecoverySlice(bytes: ByteArray): Boolean =
             bytes.size >= HEADER && bytes.copyOf(MAGIC.size).contentEquals(MAGIC) &&
                 bytes.copyOfRange(48, HEADER).contentEquals(RECOVERY_SLICE)

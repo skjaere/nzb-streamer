@@ -110,7 +110,7 @@ class SegmentCache(private val config: SegmentCacheConfig) : AutoCloseable {
     // global `singleflightLock` mutex whose critical section included a disk-I/O recheck
     // (get → readEntry → withContext(Dispatchers.IO) { path.readBytes() }) — that
     // serialized every concurrent fetch across the cache, observed in prod as 51-199s
-    // stream-startup stalls when Plex fired its parallel range probes.
+    // stream-startup stalls when a media server fired its parallel range probes.
     private val inFlight = java.util.concurrent.ConcurrentHashMap<String, CompletableDeferred<ByteArray>>()
     private val totalBytes = AtomicLong(0)
     private val maxBytes = AtomicLong(config.maxBytes)
@@ -221,8 +221,8 @@ class SegmentCache(private val config: SegmentCacheConfig) : AutoCloseable {
 
     /**
      * The segment files under the cache directory, by name; temporary files are deleted on the way.
-     * One deleted meanwhile, or its shard's directory (as Android deletes cache files to free storage,
-     * the app running), is left out.
+     * One deleted meanwhile, or its shard's directory (as Android deletes cache files to free storage
+     * while their app runs), is left out.
      */
     private fun scanSegmentFiles(): Map<String, BasicFileAttributes> =
         shards()
@@ -340,7 +340,7 @@ class SegmentCache(private val config: SegmentCacheConfig) : AutoCloseable {
     /**
      * [path]'s bytes, read straight into the array. Path.readBytes reads through a temporary direct
      * buffer of the file's size, which the JDK keeps for the thread's next read: Java heap on ART, a
-     * 3.84 MB one on every IO thread that had read a segment (library issue N98).
+     * 3.84 MB one on every IO thread that had read a segment.
      */
     private fun readWhole(path: Path): ByteArray = RandomAccessFile(path.toFile(), "r").use { file ->
         val length = file.length()

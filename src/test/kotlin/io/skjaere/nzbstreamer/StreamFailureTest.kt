@@ -63,7 +63,7 @@ class StreamFailureTest {
     // Hold back the answers to the segments a test wants late; opened in tearDown at the latest.
     private val gates = (0 until 6).map { CountDownLatch(1) }
 
-    // Where the app starts its streams: a session coroutine of their own, whose failure is only logged.
+    // Where an Android app starts its streams: a session coroutine of their own, whose failure is only logged.
     private val sessions = CoroutineScope(SupervisorJob() + Dispatchers.IO + CoroutineExceptionHandler { _, _ -> })
 
     @AfterEach
@@ -98,7 +98,7 @@ class StreamFailureTest {
         NntpConfig("127.0.0.1", server.port, "", "", useTls = false, maxConnections = 4)
     ).also { runBlocking { it.connect() } }
 
-    /** Starts streaming every segment from a session coroutine, as the app does. */
+    /** Starts streaming every segment from a session coroutine, as an Android app does. */
     private suspend fun startStream(service: NntpStreamingService): WriterJob {
         val writer = CompletableDeferred<WriterJob>()
         sessions.launch {

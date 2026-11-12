@@ -1,13 +1,16 @@
 # Gradle
 .gradle/
 build/
+.kotlin/
 
 # IDE
 .idea/
+*.iml
 
-# Environment
-.env
-/.idea/
+# Local settings and secrets
+local.properties
+.env*
+.claude/
 
 # Tests
 src/test/kotlin/io/skjaere/nzbstreamer/NzbStreamerRawFileTest.kt

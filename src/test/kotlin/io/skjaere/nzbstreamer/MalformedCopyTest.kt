@@ -30,9 +30,9 @@ import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.Test
 
 /**
- * A copy of an article whose yEnc header can't be read (K55: an empty or non-numeric number) is a bad copy on that
+ * A copy of an article whose yEnc header can't be read (an empty or non-numeric number) is a bad copy on that
  * provider, not the provider failing: the next pool is tried, and the first pool's circuit breaker isn't told. With no
- * readable copy on any pool, the read fails as a malformed article (the app's "corrupt"), never as a missing one.
+ * readable copy on any pool, the read fails as a malformed article (corrupt, to a caller), never as a missing one.
  */
 class MalformedCopyTest {
     private val servers = mutableListOf<FakeNntpServer>()
@@ -50,7 +50,7 @@ class MalformedCopyTest {
 
     private fun good(data: ByteArray) = YencEncoder.encodeSinglePart(data, "data.bin").data
 
-    /** [data]'s article with its =ybegin line's size left empty, as K55's provider served one. */
+    /** [data]'s article with its =ybegin line's size left empty, as a provider was seen to serve one. */
     private fun malformed(data: ByteArray): ByteArray {
         val article = String(good(data), Charsets.ISO_8859_1)
         val size = " size=${data.size} name="
@@ -165,7 +165,7 @@ class MalformedCopyTest {
 
     /**
      * A provider whose connection dropped may have a good copy: that says more than another's malformed one, whichever
-     * pool comes first, as for a segment. The failure is then the provider's (the app rechecks its providers), not a
+     * pool comes first, as for a segment. The failure is then the provider's (a caller may recheck its providers), not a
      * corrupt release.
      */
     @Test

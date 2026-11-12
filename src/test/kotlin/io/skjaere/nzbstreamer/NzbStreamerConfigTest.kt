@@ -159,8 +159,8 @@ class NzbStreamerConfigTest {
     }
 
     /**
-     * Pools built from a config that says nothing of them (debridav's) keep the NNTP client's own timings: a DATE a
-     * minute to the connections idle that long, given 10 s to answer, and no check before a connection is lent.
+     * Pools built from a config that says nothing of them, as a server's may, keep the NNTP client's own timings: a
+     * DATE a minute to the connections idle that long, given 10 s to answer, and no check before a connection is lent.
      */
     @Test
     fun `a streaming config's pool tuning is the NNTP client's own by default`() {
@@ -170,7 +170,7 @@ class NzbStreamerConfigTest {
         )
     }
 
-    /** A config that says nothing of it (debridav's) fails a segment at its first timeout, as before. */
+    /** A config that says nothing of it, as a server's may, fails a segment at its first timeout, as before. */
     @Test
     fun `a streaming config tries no timed-out segment again by default`() {
         assertEquals(0, StreamingConfig().segmentTimeoutRetries)

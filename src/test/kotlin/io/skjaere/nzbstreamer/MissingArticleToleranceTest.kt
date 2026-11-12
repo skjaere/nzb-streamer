@@ -59,7 +59,7 @@ class MissingArticleToleranceTest {
     /** Articles every provider answers 430 for (to BODY and STAT). */
     private val missing: MutableSet<String> = ConcurrentHashMap.newKeySet()
 
-    /** Articles every provider serves with a =ybegin size that can't be read (K55). */
+    /** Articles every provider serves with a =ybegin size that can't be read. */
     private val malformed: MutableSet<String> = ConcurrentHashMap.newKeySet()
     private val files = mutableListOf<String>()
     private val servers = mutableListOf<FakeNntpServer>()
@@ -345,7 +345,7 @@ class MissingArticleToleranceTest {
         }
     }
 
-    /** N93: a pool passed over by its breaker is asked before zeros stand in for what it may have. */
+    /** A pool passed over by its breaker is asked before zeros stand in for what it may have. */
     @Test
     fun `a pool its breaker passed over is asked before a gap is filled`() = runBlocking<Unit> {
         post(name, movie)
@@ -400,9 +400,9 @@ class MissingArticleToleranceTest {
         }
     }
 
-    /** debridav streams so: streamName named, consume a trailing lambda. */
+    /** Callers stream so: streamName named, consume a trailing lambda. */
     @Test
-    fun `a call with a trailing lambda binds it to consume, as debridav's does`() = runBlocking<Unit> {
+    fun `a call with a trailing lambda binds it to consume, as a caller's does`() = runBlocking<Unit> {
         post(name, movie)
         streamer(MissingArticlePolicy.FAIL).use { streamer ->
             val prepared = assertIs<PrepareResult.Success>(streamer.prepare(nzb()))

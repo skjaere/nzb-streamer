@@ -29,7 +29,7 @@ import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.Test
 
 /**
- * N93: a pool whose circuit breaker is open is passed over, so it was never asked. An article the pools that were asked
+ * A pool whose circuit breaker is open is passed over, so it was never asked. An article the pools that were asked
  * lack is therefore asked of it once (its breaker aside, within the segment timeout as any pool) before it is called
  * missing: an article is missing only when every pool answered 430. When the skipped pool fails instead, the article is
  * unavailable, not missing. Prepare is then no worse off than before that pool was asked: a file the release opens

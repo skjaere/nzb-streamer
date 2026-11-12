@@ -68,7 +68,7 @@ class EncryptedStreamTest {
     private val servers = mutableListOf<FakeNntpServer>()
     private val gate = CountDownLatch(1)
 
-    // Where the app starts its streams; anything that reaches the handler is recorded.
+    // Where an Android app starts its streams; anything that reaches the handler is recorded.
     private val uncaught = CopyOnWriteArrayList<Throwable>()
     private val sessions = CoroutineScope(SupervisorJob() + Dispatchers.IO + CoroutineExceptionHandler { _, e -> uncaught += e })
 
@@ -160,7 +160,7 @@ class EncryptedStreamTest {
         NntpConfig("127.0.0.1", server.port, "", "", useTls = false, maxConnections = 4)
     ).also { runBlocking { it.connect() } }
 
-    /** Starts streaming the decrypted file from a session coroutine (in [context]), as the app does. */
+    /** Starts streaming the decrypted file from a session coroutine (in [context]), as an Android app does. */
     private suspend fun startStream(
         service: NntpStreamingService,
         split: SplitInfo = this.split,

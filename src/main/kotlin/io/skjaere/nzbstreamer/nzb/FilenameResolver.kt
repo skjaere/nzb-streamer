@@ -221,7 +221,7 @@ object FilenameResolver {
 
     /**
      * Index a par2 byte blob by the MD5-of-first-16KB of each described file. The keys
-     * are the same `hash16k` field used by [Par2Parser]; debridav callers compute it
+     * are the same `hash16k` field used by [Par2Parser]; callers compute it
      * from the NZB file's first 16KB and look up the matching descriptor here. A hash
      * that descriptions with different names share (files that start alike: a DVD's
      * VIDEO_TS.IFO and its copy VIDEO_TS.BUP, disc images) names nothing: it would name

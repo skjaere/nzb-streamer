@@ -134,7 +134,7 @@ class UnlistedPartsTest {
             it.connect()
             val stream = NntpSeekableInputStream(nzb, it)
             stream.seek(4L * partSize + 100)
-            // The stream throws the download's failure itself (library issue N29).
+            // The stream throws the download's failure itself.
             val result = try {
                 stream.read(ByteArray(100), 0, 100)
             } catch (e: CancellationException) {
@@ -163,7 +163,7 @@ class UnlistedPartsTest {
         }
     }
 
-    /** The availability check finds the parts an NZB doesn't list missing (library issue N35). */
+    /** The availability check finds the parts an NZB doesn't list missing. */
     @Test
     fun `the check of an enriched NZB finds the parts it lacks by the yEnc sizes`() {
         post("Movie.2020.mkv", movie, unlisted = setOf(3), counted = false)

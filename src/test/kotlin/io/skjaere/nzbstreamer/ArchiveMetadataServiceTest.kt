@@ -99,8 +99,8 @@ class ArchiveMetadataServiceTest {
     }
 
     /**
-     * Regression guard. Production incident: 21 NZBs landed in debridav with
-     * usenet_download.status=COMPLETED but zero files behind them, because
+     * Regression guard. Production incident: a caller marked 21 NZBs as
+     * downloaded with zero files behind them, because
      * `prepare()` returned `Success(Raw(emptyList()))` on the empty-files path
      * (ArchiveMetadataService.kt — the `if (enrichedNzb.files.isEmpty())` branch
      * inside the EnrichmentResult.Success arm) instead of surfacing the missing

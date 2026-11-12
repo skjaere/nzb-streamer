@@ -217,8 +217,8 @@ class NntpStreamingService(
      * (the pool's copy of that article is damaged or can't be read, the pool is fine). The breaker
      * is inert when only one pool is configured, see [executeWithCircuitBreaker].
      *
-     * [currentCircuitBreakerConfig] is mutable so the live override path in
-     * debridav can re-tune thresholds without a restart. Each [circuitBreakerFor]
+     * [currentCircuitBreakerConfig] is mutable so a caller can re-tune
+     * thresholds while running, without a restart. Each [circuitBreakerFor]
      * call hands out the breaker for that pool using whatever config the registry
      * currently holds for that name; [setCircuitBreakerConfig] swaps the config
      * and removes existing breakers so the next acquisition re-creates them with
@@ -627,7 +627,7 @@ class NntpStreamingService(
      *  - [kotlinx.coroutines.CancellationException] — structured-concurrency
      *    cancellation, not our exception to swallow.
      *
-     * A pool whose breaker passes it over was never asked (N93): when every pool asked lacks the
+     * A pool whose breaker passes it over was never asked: when every pool asked lacks the
      * article or has only a bad copy of it, those passed over are asked once, their breakers aside,
      * before the call fails on that. Where [block] fetches the article [articleId], each such ask has
      * the time a segment's fetch has in all (twice the segment fetch timeout, as [fetchSegmentFromNntp]
@@ -694,7 +694,7 @@ class NntpStreamingService(
         if (result != null) return result
         if (lastException != null && passedOver.isNotEmpty() && !poolFailed) {
             // The pools asked lack it, or have only bad copies of it: a pool passed over may have it, so it isn't missing
-            // (or unreadable everywhere) until that pool has been asked too (N93).
+            // (or unreadable everywhere) until that pool has been asked too.
             logger.debug(
                 "{} not served by the pools asked; asking the {} passed over by their breakers",
                 logPrefix, passedOver.size,
@@ -800,7 +800,7 @@ class NntpStreamingService(
             null
         } catch (e: YencDecodingException) {
             // A bad copy of the article: damaged (its CRC isn't its =yend line's, read to its end), or
-            // its yEnc header can't be read (K55). The pool is healthy, its copy isn't. Like a clean
+            // its yEnc header can't be read. The pool is healthy, its copy isn't. Like a clean
             // 430, nothing the breaker records; another pool may have a good copy.
             breaker?.releasePermission()
             recordException(e)
@@ -1726,7 +1726,7 @@ class NntpStreamingService(
         var firstError: Exception? = null
         // Pools whose copy is damaged, in the order tried, with the mismatch.
         val mismatched = mutableListOf<Pair<String, YencCrcMismatchException>>()
-        // Pools whose copy can't be read (K55), in the order tried.
+        // Pools whose copy can't be read, in the order tried.
         val unreadable = mutableListOf<YencDecodingException>()
         var anyAttempted = false
         // Pools their open breaker passed over, never asked.
@@ -1765,8 +1765,8 @@ class NntpStreamingService(
                 fetchFrom(pools, useBreakers = false)
             }
             // The pools asked lack it, or have only bad copies of it: a pool passed over may have
-            // it, so it isn't missing (nor bad everywhere) until that pool has been asked too
-            // (N93). Once, its breaker aside, within the segment timeout as any pool.
+            // it, so it isn't missing (nor bad everywhere) until that pool has been asked too.
+            // Once, its breaker aside, within the segment timeout as any pool.
             passedOver.isNotEmpty() && firstTimeout == null && firstError == null -> {
                 logger.debug(
                     "Segment <{}> not served by the pools asked; asking the {} passed over by their breakers",
@@ -1872,7 +1872,7 @@ class NntpStreamingService(
             }
             null
         } catch (e: YencDecodingException) {
-            // A copy whose yEnc header can't be read (K55): the pool answered, its copy of the
+            // A copy whose yEnc header can't be read: the pool answered, its copy of the
             // article is bad, as with a damaged one. Nor a pool health signal, so the finally
             // releases the permit without recording it.
             onFailure(e)

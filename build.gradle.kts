@@ -45,9 +45,9 @@ dependencies {
 
 tasks.test {
     useJUnitPlatform()
-    val libPath = System.getenv("RAPIDYENC_LIB_PATH")
-        ?: "${System.getProperty("user.home")}/rapidyenc/build"
-    systemProperty("jna.library.path", libPath)
+    // The yEnc decoder loads the librapidyenc.so its wrapper bundles. RAPIDYENC_LIB_PATH points the tests at a folder
+    // holding another build of it.
+    System.getenv("RAPIDYENC_LIB_PATH")?.let { systemProperty("jna.library.path", it) }
     systemProperty("kotlinx.coroutines.test.default.timeout", "PT5M")
     // SegmentCacheTest looks at the temporary direct buffers the JDK keeps per thread (sun.nio.ch.Util).
     jvmArgs("--add-opens", "java.base/sun.nio.ch=ALL-UNNAMED")

@@ -21,10 +21,10 @@ import kotlin.test.assertTrue
  * A connection whose STAT got an error answer (`500 Command not recognized`, as the mock server
  * gave every STAT it had no mock for) serves the next BODY on it with that BODY's own answer.
  *
- * Seen once on a device (library-issues N3): after STATs got 500, the next release's BODY for an
+ * Seen once on a device: after STATs got 500, the next release's BODY for an
  * article the server had failed as "not found on any pool". A STAT cancelled while its answer was
- * on the way left its connection in the pool with that answer owed (K14), so the BODY after it read
- * the STAT's 500; nzb-streamer then reported any failure as not found (N27).
+ * on the way left its connection in the pool with that answer owed, so the BODY after it read
+ * the STAT's 500; nzb-streamer then reported any failure as not found.
  */
 class StatErrorConnectionReuseTest {
     private val servers = mutableListOf<FakeNntpServer>()

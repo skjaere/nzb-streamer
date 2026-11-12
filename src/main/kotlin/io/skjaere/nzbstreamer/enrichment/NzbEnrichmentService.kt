@@ -46,7 +46,7 @@ class NzbEnrichmentService(
 
         // How many bytes of a PAR2 file are read for its file descriptions past what is held of it, in
         // how many reads: one, and one past each recovery slice skipped ([SKIP_OVER]), whose bytes
-        // aren't read (NR-7).
+        // aren't read.
         private const val PAR2_READ_LIMIT = 16L * 1024 * 1024
         private const val MAX_PAR2_READS = 16
 
@@ -96,7 +96,7 @@ class NzbEnrichmentService(
      * be a volume posted under another extension and tells by the PAR2 index or its content whether
      * it is one ([ReleaseFiles.Volumes]). Files whose names tell nothing that are bigger than an index
      * can be, which may be recovery volumes, are fetched once the PAR2 index among the rest is read,
-     * and then only those it may describe ([ReleaseFiles.deferred], library issue N99); the others
+     * and then only those it may describe ([ReleaseFiles.deferred]); the others
      * are left out. The enriched NZB holds those files, the volumes found among
      * the last too, but for any left out: a file the release opens without (a PAR2 file, another
      * episode's video or archive set) that lacks its first article, or another episode's set that
@@ -104,18 +104,18 @@ class NzbEnrichmentService(
      * volume its PAR2 index names that it doesn't hold, is MissingArticles, the latter's cause an
      * [ArchiveVolumeNotInNzbException] where no provider can supply it; a volume posted under a name
      * that doesn't place it, with no PAR2 index to, is Failure, its cause an
-     * [UnplacedArchiveVolumeException] (NR-18).
+     * [UnplacedArchiveVolumeException].
      */
     suspend fun enrich(nzb: NzbDocument): EnrichmentResult {
         val sample = Timer.start(registry)
         val release = ReleaseFiles(nzb.files)
         // Files that lack their first article, and sets that lack a volume, with the cause.
         val lacking = ConcurrentHashMap<Int, Exception>()
-        // The first articles, whole, of the PAR2 files by name, which their reads start from (NR-10):
-        // not those of recovery volumes posted under an index's name, which aren't read (NR-9).
+        // The first articles, whole, of the PAR2 files by name, which their reads start from:
+        // not those of recovery volumes posted under an index's name, which aren't read.
         val heads = ConcurrentHashMap<Int, ByteArray>()
         // Files that may be recovery volumes wait for the PAR2 data of the others, which tells which
-        // of them may be content (N99).
+        // of them may be content.
         val first = release.toFetch.filterNot { it in release.deferred }
         fetchFirst(nzb, release, first, lacking, heads)?.let { return it }
 
@@ -138,7 +138,7 @@ class NzbEnrichmentService(
         val kept = kept(release, fetched, lacking)
 
         // A recovery set's smallest volume stands in for its index when that names nothing
-        // ([readStandIns]), where the release needs names (NR-10).
+        // ([readStandIns]), where the release needs names.
         var standIns = emptyList<Int>()
         try {
             if (release.needsNames(nzb.files, kept)) standIns = readStandIns(nzb, release, heads)
@@ -151,7 +151,7 @@ class NzbEnrichmentService(
         // The first articles not read (another set's stand-ins, or all where no names are needed) aren't held on.
         heads.clear()
 
-        // Then the volumes posted under another extension (library issue N52), which the PAR2 index
+        // Then the volumes posted under another extension, which the PAR2 index
         // names or their content shows to be: a file that may be one is fetched only when the index
         // names a volume no file holds, or doesn't name every volume the release has.
         val volumes = release.Volumes(nzb.files, named)
@@ -229,7 +229,7 @@ class NzbEnrichmentService(
      * file counts as an index when it is named as one (and is PAR2), or else when its first 16 KB
      * name files, read packet by packet without taking their lengths on trust; only its descriptions
      * are held ([readPar2]). An index over a thousand files or more names none in its first 16 KB,
-     * its Main packet's list of them longer (NR-9), but a recovery volume posted under an index's
+     * its Main packet's list of them longer, but a recovery volume posted under an index's
      * name (<hash>.par2) starts with its recovery slice: it counts as one only as any other file
      * does. The failure, or null.
      */
@@ -265,7 +265,7 @@ class NzbEnrichmentService(
      * Fetches the first article of each file of [nzb] at [indices], at most enrichmentConcurrency at a
      * time, each passed to [fetched] whole, decoded, with its index. One that lacks it goes to
      * [lacks], which may throw to fail them all, with its cause: the 430, or where a pool its breaker
-     * passed over couldn't serve it once the others answered 430, that pool's failure (N93).
+     * passed over couldn't serve it once the others answered 430, that pool's failure.
      */
     private suspend fun fetchFirstArticles(
         nzb: NzbDocument,
@@ -362,7 +362,7 @@ class NzbEnrichmentService(
     /**
      * Whether to hold [article], fetched as file [i]'s first, for its PAR2 read: a recovery volume's,
      * and an index's by its name, but for one that starts with a recovery slice, a recovery volume
-     * posted under an index's name, which is read only when its first 16 KB name files (NR-9).
+     * posted under an index's name, which is read only when its first 16 KB name files.
      */
     private fun holds(release: ReleaseFiles, i: Int, article: ByteArray): Boolean =
         release.isRecovery(i) || release.isIndex(i) && !Par2Packets.startsWithRecoverySlice(article)
@@ -378,8 +378,8 @@ class NzbEnrichmentService(
     /**
      * Reads recovery volumes' file descriptions in place of the PAR2 index of each recovery set
      * ([ReleaseFiles.standIns]) that has none, or whose index named nothing (it lacks an article):
-     * its smallest volume's, and the next-smallest's when that names nothing, each set's apart
-     * (NR-5). Another set's index (a sample's) names only its own set's files. Those that named files.
+     * its smallest volume's, and the next-smallest's when that names nothing, each set's apart.
+     * Another set's index (a sample's) names only its own set's files. Those that named files.
      * [heads] holds the first articles fetched with the rest.
      */
     private suspend fun readStandIns(nzb: NzbDocument, release: ReleaseFiles, heads: MutableMap<Int, ByteArray>): List<Int> =
@@ -395,9 +395,9 @@ class NzbEnrichmentService(
      * Reads the file descriptions of recovery volume [i] into its par2Data, in place of its set's
      * PAR2 index's, fetching its first article first when it wasn't with the rest ([head], when held
      * whole); whether it named files. It is read as [readPar2] reads a PAR2 file, from that article:
-     * its recovery block not read at all, however big (NR-7). As the index's, a read that lacks an
+     * its recovery block not read at all, however big. As the index's, a read that lacks an
      * article (its first included) leaves it naming nothing, and one that fails any other way fails
-     * prepare: the volumes may need its names for their order, and it may be tried again (NR-7).
+     * prepare: the volumes may need its names for their order, and it may be tried again.
      */
     private suspend fun readStandIn(nzb: NzbDocument, release: ReleaseFiles, i: Int, head: ByteArray?): Boolean {
         val file = nzb.files[i]
@@ -427,15 +427,15 @@ class NzbEnrichmentService(
 
     /**
      * Reads the file descriptions (its FileDesc packets) of the PAR2 file [file] into its par2Data
-     * ([Par2Packets]): from its first article, [head], when held whole (it isn't fetched again,
-     * NR-10), else its first 16 KB, then as it streams from where those end, its other packets
+     * ([Par2Packets]): from its first article, [head], when held whole (it isn't fetched
+     * again), else its first 16 KB, then as it streams from where those end, its other packets
      * skipped, never held. A recovery slice in the way of them, whose length its header gives,
      * isn't read at all when it is [SKIP_OVER] bytes or more (or runs past what is held): the next
-     * read starts past it, so a recovery volume's block is never downloaded (NR-7). No more
+     * read starts past it, so a recovery volume's block is never downloaded. No more
      * than [PAR2_READ_LIMIT] bytes are read, in [MAX_PAR2_READS] reads ([readFrom]), nor any more once
      * one gets nothing past where it starts (a file that holds fewer bytes than its size claims), and
-     * what fails past where they stop is none of theirs (NR-15); nor is what fails once they cover
-     * every file the Main packet lists ([Par2Packets.complete], NR-7). It only names files: one that
+     * what fails past where they stop is none of theirs; nor is what fails once they cover
+     * every file the Main packet lists ([Par2Packets.complete]). It only names files: one that
      * lacks an article before then is left without, and the release opens without it. One whose read
      * fails any other way fails prepare, as the release may need its names to order its volumes.
      */
@@ -482,8 +482,8 @@ class NzbEnrichmentService(
      * one ahead of it ([NntpStreamingService.fetchSegment], through the segment cache and provider
      * fallback); where it stopped. An article that fails ends the bytes there, all of them up to it
      * delivered, and is thrown only when [packets] read on to that end ([Par2Packets.Stop.End]): one
-     * that stopped before, by its own rule, never wanted what failed past it, whenever it failed
-     * (NR-15). A stream ([NntpStreamingService.streamSegments]) drops what its reader hasn't taken
+     * that stopped before, by its own rule, never wanted what failed past it, whenever it failed.
+     * A stream ([NntpStreamingService.streamSegments]) drops what its reader hasn't taken
      * yet when a failure closes it, so a read-ahead article's failure could lose descriptions read
      * whole, or not, by the timing.
      */

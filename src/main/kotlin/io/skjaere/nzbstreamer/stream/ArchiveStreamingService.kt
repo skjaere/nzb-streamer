@@ -204,7 +204,7 @@ class ArchiveStreamingService(
      * Each [SplitInfo] points at the IV of an encrypted block (one per volume for a split file);
      * `Rar5DataAreaDecryptor` reads ciphertext from `NntpSeekableInputStream` in 64 KiB chunks,
      * decrypts, and writes plaintext to the output channel. Memory bound is the chunk size,
-     * not the requested range — important for video seeking where Plex issues multi-MB ranges.
+     * not the requested range — important for video seeking where media servers ask for multi-MB ranges.
      */
     private suspend fun streamEncrypted(
         archiveNzb: NzbDocument,

@@ -30,11 +30,11 @@ import kotlin.math.abs
  * half as big, so a subtitle or a trailer doesn't stand in for the movie. Any other file that lacks
  * it fails the release.
  *
- * A volume posted under another extension than its archive's isn't one by its name (library issue
- * N52): once those files are fetched, [Volumes] finds it among the videos and other files beside
+ * A volume posted under another extension than its archive's isn't one by its name: once
+ * those files are fetched, [Volumes] finds it among the videos and other files beside
  * the archives ([mayHideVolume]), by the PAR2 data or by its content. A volume the PAR2 index names
  * that the release doesn't hold leaves its set out where an episode's may be, and fails it elsewhere,
- * and so does one a set's names or RAR5 headers show it lacks (NR-13).
+ * and so does one a set's names or RAR5 headers show it lacks.
  */
 internal class ReleaseFiles(private val files: List<NzbFile>) {
     private enum class Role { ARCHIVE, VIDEO, PAR2, RECOVERY, SIDE, OTHER, UNKNOWN }
@@ -51,7 +51,7 @@ internal class ReleaseFiles(private val files: List<NzbFile>) {
     /**
      * The recovery volumes that name the files in place of a PAR2 index (each carries its index's
      * file descriptions), by recovery set: the name its volumes share but for .volNN+MM.par2, in
-     * lower case, and those volumes, smallest first (NR-5). A sample's set names only the sample:
+     * lower case, and those volumes, smallest first. A sample's set names only the sample:
      * it is none beside another. The smallest of them is fetched with the rest when the release has
      * no index, and a set's are read after them when it has none or the one it has names nothing
      * (it lacks an article).
@@ -78,7 +78,7 @@ internal class ReleaseFiles(private val files: List<NzbFile>) {
 
     /**
      * Indices of the files of [toFetch] that may be PAR2 recovery volumes, whose first articles wait
-     * until the PAR2 data of the others is read (library issue N99): their names tell nothing or are
+     * until the PAR2 data of the others is read: their names tell nothing or are
      * an index's (an obfuscating poster names every PAR2 file so), and they are bigger than an index
      * can be ([INDEX_LIMIT]) by the sizes the NZB gives each of their articles. An obfuscated post
      * names none of its files, so its recovery volumes, whose first articles are as big as any, were
@@ -164,7 +164,7 @@ internal class ReleaseFiles(private val files: List<NzbFile>) {
     /**
      * The names archive set [set]'s volumes go by but for their volume suffix: their subjects', and,
      * once fetched, their yEnc names', which the archive is ordered by and which an indexer that
-     * rewrites subjects leaves as posted (NR-14).
+     * rewrites subjects leaves as posted.
      */
     private fun stemsOf(set: List<Int>): Set<String> = set
         .flatMap { listOfNotNull(names[it], files[it].yencHeaders?.name) }
@@ -183,9 +183,9 @@ internal class ReleaseFiles(private val files: List<NzbFile>) {
     /**
      * Whether the release needs the names its PAR2 data gives files, once the files of [kept] are
      * fetched: it has archive volumes (the PAR2 data shows one posted under another name, or one it
-     * lacks, N52), files whose names tell nothing (one may be a volume), or files it would list under
-     * obfuscated names, which the PAR2 data's replace (N54). A release of files posted under their
-     * own names has its names, so no recovery volume is read for them (NR-10).
+     * lacks), files whose names tell nothing (one may be a volume), or files it would list under
+     * obfuscated names, which the PAR2 data's replace. A release of files posted under their
+     * own names has its names, so no recovery volume is read for them.
      */
     fun needsNames(files: List<NzbFile>, kept: List<Int>): Boolean = kept.any { i ->
         when (roles[i]) {
@@ -238,14 +238,15 @@ internal class ReleaseFiles(private val files: List<NzbFile>) {
          * size (a set's last volume is smaller than the rest), or one its name places nowhere (or,
          * where every set the release opens is named obfuscated, in a set of its own) that may be a
          * volume by its size ([mayBeVolume]). One its name places where the release holds a volume,
-         * or in another archive, and one that can't be a volume fail nothing (NR-3, NR-16).
+         * or in another archive, and one that can't be a volume fail nothing.
          * [Found.Unplaced] when nothing tells where a volume goes. One its
          * content shows to be a volume whose name places it in a set the release doesn't open, by
          * any name it goes by ([opened]), is another archive's (an extra's), none of the release's:
-         * it is left as before N52, but where every set the release opens is named obfuscated, so
-         * that a volume of its own may go by a name of its own, where it is [Found.Unplaced] (NR-14).
+         * it is left alone, as files under another extension were before such volumes were looked
+         * for; but where every set the release opens is named obfuscated, so that a volume of its
+         * own may go by a name of its own, it is [Found.Unplaced].
          * A set whose volumes skip one ([skipping]) lacks it as one that lacks a volume the PAR2 data
-         * names does (NR-13). A volume known by its content alone that nothing places, beside
+         * names does. A volume known by its content alone that nothing places, beside
          * others the PAR2 data names, is [Found.Unplaced] too ([unplacedBesideNamed]).
          */
         fun found(unknown: Map<Int, Exception>): Found {
@@ -289,7 +290,7 @@ internal class ReleaseFiles(private val files: List<NzbFile>) {
                 if (volume != null && held.add(volume.lowercase())) found[i] = volume
             }
             for (volume in unheld(opened(hashes, found), hashes)) {
-                // With no file that may be it lacking its first article, no provider can supply it (NR-18).
+                // With no file that may be it lacking its first article, no provider can supply it.
                 val cause = if (unknown.isEmpty()) {
                     ArchiveVolumeNotInNzbException("Archive volume '${volume.printable()}', which the PAR2 index names, isn't in the NZB")
                 } else {
@@ -324,7 +325,7 @@ internal class ReleaseFiles(private val files: List<NzbFile>) {
          * set's last, as big as its biggest ([volumeSizes]) by the size the NZB gives it, within the
          * few bytes yEnc's escapes and names add to a volume posted as big. A bigger file is none of
          * its volumes, and a smaller one could be its last only, which, under a name that doesn't
-         * place it, is seen missing no more than one not posted (NR-3).
+         * place it, is seen missing no more than one not posted.
          */
         private fun mayBeVolume(i: Int, volumeSizes: Map<String, Long>): Boolean =
             volumeSizes.values.any { size -> abs(sizes[i] - size) * SIZE_TOLERANCE <= size }
@@ -333,7 +334,7 @@ internal class ReleaseFiles(private val files: List<NzbFile>) {
          * Of the kept files that are archive volumes by their content alone (posted under names
          * that tell nothing), one that nothing places (no PAR2 name nor its own name, nor a RAR5
          * header that numbers it) while others are named (by the PAR2 data, or their own names):
-         * ordered by those names, it would follow them wherever it goes (NR-4). Null when there is
+         * ordered by those names, it would follow them wherever it goes. Null when there is
          * none, or none of them is named. RAR5 volumes are placed by their headers, the named and
          * the unnamed together.
          */
@@ -349,7 +350,7 @@ internal class ReleaseFiles(private val files: List<NzbFile>) {
 
         /**
          * The sets the release opens, by their names (not obfuscated ones), whose volumes skip one,
-         * each by its first file with the cause (NR-13). A set's volumes are its files, the volumes
+         * each by its first file with the cause. A set's volumes are its files, the volumes
          * of [found] (found among the others, by the name that places them) in it, and the files of
          * [kept] the PAR2 data names into it, posted under names that tell nothing or obfuscated by
          * themselves, as the archive is ordered. Their places are those their RAR5 headers give
@@ -404,7 +405,7 @@ internal class ReleaseFiles(private val files: List<NzbFile>) {
         /**
          * The sets whose volumes the release opens: those of [kept], and of [found], by every name
          * they go by: the PAR2 data's or their subjects', and their yEnc names', which the archive is
-         * ordered by (NR-14).
+         * ordered by.
          */
         private fun opened(hashes: Map<Int, String>, found: Map<Int, String>): Set<String> =
             (kept.flatMap { listOfNotNull(par2Name(it, hashes) ?: names[it], files[it].yencHeaders?.name) } + found.values)
@@ -441,9 +442,9 @@ internal class ReleaseFiles(private val files: List<NzbFile>) {
 
         /**
          * The release can't open whole: [cause] is an [ArticleNotFoundException], or an
-         * [ArchiveVolumeNotInNzbException] where no provider can supply what it lacks (NR-18), or
+         * [ArchiveVolumeNotInNzbException] where no provider can supply what it lacks, or
          * where a provider its breaker passed over couldn't serve a first article the others lack,
-         * that provider's failure (N93).
+         * that provider's failure.
          */
         data class Missing(val cause: Exception) : Found
         data class Unplaced(val name: String) : Found

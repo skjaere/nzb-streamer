@@ -447,7 +447,7 @@ class SegmentCacheTest {
     }
 
     /**
-     * Android deletes cache files to free storage, the app running, so one can go between the load's
+     * Android deletes cache files to free storage while their app runs, so one can go between the load's
      * listing of its shard and its stat: the whole load failed, every file left uncounted (and never
      * evicted). A link to nothing, with the segment's name, stands in for the file gone.
      */
@@ -663,7 +663,7 @@ class SegmentCacheTest {
     }
 
     /**
-     * Android deletes files from an app's cache directory when storage runs low, the app running: the
+     * Android deletes files from an app's cache directory when storage runs low, while it runs: the
      * index went on listing them and counting their bytes, so the usage was more than the disk held
      * (and an eviction of them freed nothing). A reconcile drops the entries whose files are gone or
      * aren't the size listed.
@@ -832,7 +832,7 @@ class SegmentCacheTest {
      * Path.readBytes read a segment through a temporary direct buffer of its size, which the JDK keeps
      * for the thread that read (sun.nio.ch.Util's buffer cache) for its next read: on ART that's Java
      * heap, a 3.84 MB buffer on each Dispatchers.IO thread that read a segment, 15-22 MB measured on
-     * an emulator, up to one per IO thread after seeks and replays (library issue N98).
+     * an emulator, up to one per IO thread after seeks and replays.
      */
     @Test
     fun `a cached segment is read without a temporary direct buffer kept on the thread`(@TempDir tmp: Path) = runBlocking<Unit> {

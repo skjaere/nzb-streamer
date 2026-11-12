@@ -107,7 +107,7 @@ class ConnectionWaitTest {
         yencHeaders = YencHeaders(line = 128, size = names.size.toLong() * segmentSize, name = "data.bin", partEnd = segmentSize.toLong()),
     )
 
-    /** Starts streaming [file] from a session coroutine, as the app does, fetching as many at once as the pool has connections. */
+    /** Starts streaming [file] from a session coroutine, as an Android app does, fetching as many at once as the pool has connections. */
     private suspend fun start(service: NntpStreamingService, file: NzbFile): WriterJob {
         val writer = CompletableDeferred<WriterJob>()
         sessions.launch {

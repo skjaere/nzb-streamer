@@ -272,7 +272,7 @@ class FilenameResolverTest {
         assertEquals(emptyMap(), FilenameResolver.indexPar2ByHash16k("not a par2 file".toByteArray()))
     }
 
-    /** VIDEO_TS.BUP is a copy of VIDEO_TS.IFO: their shared hash names neither (NR-8). */
+    /** VIDEO_TS.BUP is a copy of VIDEO_TS.IFO: their shared hash names neither. */
     @Test
     fun `indexPar2ByHash16k names nothing by a hash that descriptions with different names share`() {
         val ifo = kotlin.random.Random(1).nextBytes(20_000)
