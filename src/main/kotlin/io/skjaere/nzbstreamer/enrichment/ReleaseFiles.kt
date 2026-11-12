@@ -247,7 +247,9 @@ internal class ReleaseFiles(private val files: List<NzbFile>) {
          * own may go by a name of its own, it is [Found.Unplaced].
          * A set whose volumes skip one ([skipping]) lacks it as one that lacks a volume the PAR2 data
          * names does. A volume known by its content alone that nothing places, beside
-         * others the PAR2 data names, is [Found.Unplaced] too ([unplacedBesideNamed]).
+         * others the PAR2 data names, is [Found.Unplaced] too ([unplacedBesideNamed]), and so is one
+         * that only its own name places, in a set of its own, where every set the release opens is
+         * named obfuscated ([placedByItsNameAlone]).
          */
         fun found(unknown: Map<Int, Exception>): Found {
             val hashes = hashes()
@@ -272,6 +274,7 @@ internal class ReleaseFiles(private val files: List<NzbFile>) {
                 }
             }
             unplacedBesideNamed(hashes)?.let { return Found.Unplaced(nameOf(it)) }
+            placedByItsNameAlone(hashes)?.let { return Found.Unplaced(nameOf(it)) }
             val found = mutableMapOf<Int, String>()
             for (i in toCheck.filterNot { it in unknown }) {
                 val named = describedAs(i, hashes)
@@ -346,6 +349,29 @@ internal class ReleaseFiles(private val files: List<NzbFile>) {
                 }
             if (named.isEmpty()) return null
             return unnamed.firstOrNull { files[it].first16kb?.let(Rar5Parser::volumeNumber) == null }
+        }
+
+        /**
+         * Of the kept files that are archive volumes by their content alone, one placed by nothing
+         * but its own name (without the extension it was posted under), in a set no other file's
+         * name goes by, while every volume the release opens is named obfuscated ([obfuscatedOnly]).
+         * Its name may be as obfuscated as theirs, so the place it gives can't be trusted:
+         * x7f3k9q2.r00.bin beside a8f7d6e5.rar and c07e4f1a.rar would be ordered after them,
+         * whichever volume it is. Null when there is none. One the PAR2 data names is placed by
+         * that name, and a RAR5 volume whose headers number it by them ([Rar5Parser.volumeNumber]).
+         */
+        private fun placedByItsNameAlone(hashes: Map<Int, String>): Int? {
+            if (!obfuscatedOnly(hashes)) return null
+            return kept.firstOrNull { i ->
+                val placed = (files[i].yencHeaders?.name ?: names[i])?.let(VolumeNames::of)
+                placed != null && roles[i] == Role.UNKNOWN && VolumeNames.isArchive(files[i].first16kb) &&
+                    par2Name(i, hashes)?.let(VolumeNames::isVolume) != true &&
+                    files[i].first16kb?.let(Rar5Parser::volumeNumber) == null &&
+                    kept.none { j ->
+                        j != i && listOfNotNull(par2Name(j, hashes) ?: names[j], files[j].yencHeaders?.name)
+                            .any { VolumeNames.isVolume(it) && stemOf(it) == stemOf(placed) }
+                    }
+            }
         }
 
         /**

@@ -393,11 +393,16 @@ class PrepareNeededFilesTest {
      * Beside volumes obfuscated one by one, with no PAR2 data, a volume posted under another
      * extension whose name places it in a set of its own may be one of theirs, under a name of its
      * own as theirs are: nothing tells where it goes, so the release fails rather than open
-     * without it. A random name under another extension isn't one of its own: it tells
-     * nothing, so the file is fetched as a possible volume of theirs.
+     * without it. So does a RAR4 volume whose random name, posted under another extension, is
+     * all that places it: the name is as obfuscated as theirs.
      */
     @ParameterizedTest
-    @CsvSource("RAR5, x7f3k9q2.part2.avi", "RAR4, Harbor.Lights.r00.bin")
+    @CsvSource(
+        "RAR5, x7f3k9q2.part2.avi",
+        "RAR4, Harbor.Lights.r00.bin",
+        "RAR4, x7f3k9q2.r00.bin",
+        "RAR4, e6f3c8b1.r00.bin",
+    )
     fun `a volume under a name of its own beside volumes obfuscated one by one fails a release without PAR2 data`(
         type: ContainerType,
         postedAs: String,
@@ -409,6 +414,23 @@ class PrepareNeededFilesTest {
             val result = streamer.prepare(nzb())
             val failure = assertIs<PrepareResult.Failure>(result, "prepare: $result")
             assertEquals(postedAs, assertIs<UnplacedArchiveVolumeException>(failure.cause).volume)
+        }
+    }
+
+    /**
+     * A RAR5 volume's headers give its place whatever name it was posted under: one under a random
+     * name and another extension, beside volumes obfuscated one by one, joins them where its
+     * headers put it.
+     */
+    @Test
+    fun `a RAR5 volume under a random name beside volumes obfuscated one by one is placed by its headers`() {
+        val payload = bytes("movie", 200_000)
+        val named = volumes("Movie.2020", "Movie.2020.mkv", payload, ContainerType.RAR5)
+        named.forEachIndexed { v, (_, data) -> post(if (v == 1) "x7f3k9q2.part2.bin" else "${OBFUSCATED[v]}.rar", data) }
+
+        withStreamer { streamer, _ ->
+            val prepared = assertIs<PrepareResult.Success>(streamer.prepare(nzb()), "prepare")
+            assertContentEquals(payload, streamer.streamed(prepared))
         }
     }
 
