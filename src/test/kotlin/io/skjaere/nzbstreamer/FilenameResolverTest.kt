@@ -70,6 +70,21 @@ class FilenameResolverTest {
         assertEquals(expected, FilenameResolver.extractSubjectFilename(subject), subject)
     }
 
+    /**
+     * A volume posted under `.bin`, a disc image and its cue sheet are files a release holds: one
+     * named nearest yEnc wins over an NFO named before it, and over a web address beside it.
+     */
+    @ParameterizedTest
+    @CsvSource(
+        "'Movie.2020.nfo - Movie.2020.r00.bin yEnc (1/50)', Movie.2020.r00.bin",
+        "'Movie.2020.nfo - Movie.2020.img yEnc (1/50)', Movie.2020.img",
+        "'Movie.2020.nfo - Movie.2020.cue yEnc (1/1)', Movie.2020.cue",
+        "'Movie.2020.r00.bin - example.org - yEnc (1/50)', Movie.2020.r00.bin",
+    )
+    fun `a bin, img or cue file in an unquoted subject is a file a release holds`(subject: String, expected: String) {
+        assertEquals(expected, FilenameResolver.extractSubjectFilename(subject), subject)
+    }
+
     @ParameterizedTest
     @ValueSource(
         strings = [

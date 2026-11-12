@@ -69,10 +69,12 @@ object FilenameResolver {
     private val SIZE_UNITS = setOf("b", "kb", "mb", "gb", "tb", "kib", "mib", "gib", "tib", "bytes")
 
     // The file types a release holds, besides archive volumes and split parts: video, disc images
-    // and other archives, PAR2, the files beside them (NFO, checksums, images, subtitles) and audio.
+    // (with a cue sheet) and other archives, volumes posted as .bin, PAR2, the files beside them
+    // (NFO, checksums, images, subtitles) and audio.
     private val KNOWN_EXTENSIONS = setOf(
         "mkv", "mp4", "m4v", "avi", "mov", "wmv", "flv", "webm", "ts", "m2ts", "mts", "mpg", "mpeg", "vob", "ogm", "divx",
-        "iso", "zip", "tar", "gz", "par2", "nfo", "sfv", "srr", "srs", "md5", "sha1", "txt", "url", "nzb", "diz",
+        "iso", "img", "bin", "cue", "zip", "tar", "gz",
+        "par2", "nfo", "sfv", "srr", "srs", "md5", "sha1", "txt", "url", "nzb", "diz",
         "jpg", "jpeg", "png", "gif", "bmp", "webp", "srt", "sub", "idx", "ass", "ssa", "vtt", "sup",
         "mp3", "flac", "m4a", "ogg", "opus", "wav", "mka",
     )
