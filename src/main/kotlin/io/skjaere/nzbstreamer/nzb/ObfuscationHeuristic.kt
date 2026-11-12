@@ -1,20 +1,28 @@
 package io.skjaere.nzbstreamer.nzb
 
 /**
- * Tells a file name a person chose from one a tool generated: a hash, a UUID, or letters and
- * digits in no readable order.
+ * Tells a file name a person chose from one a tool generated: a hash, a UUID, a long number,
+ * letters and digits in no readable order, or letters whose case is noise.
  *
  * The name is judged by its stem: the file's own name without its folder, its extension, and the
- * volume, part and file type suffixes before that. The stem is cut into tokens, each a run of
- * letters and digits. A word or an episode code means a person named the file, whatever else the
- * name holds. Without one, a single token that looks generated makes the name random.
+ * volume, part, recovery and file type suffixes before that ([stemOf]). A name that is empty or
+ * longer than 255 characters is random, and so is one whose stem has no letter or digit, or is a
+ * UUID (bare or in brackets).
+ *
+ * Else the stem is cut into tokens, each a run of letters and digits, and each token is telling,
+ * neutral or random ([kindOf]). An episode code, or a word with nothing random about it, means a
+ * person named the file, whatever else the name holds. Without one, a single random token makes
+ * the name random: a hash, a number of seven digits or more, letters and digits in three runs or
+ * more, or case noise, where the case changes at more than half its letters or breaks a word's
+ * shape again and again ([RandomCase]).
  */
 object ObfuscationHeuristic {
 
-    // File systems cap a name at 255 bytes: anything longer was never a file's name.
+    // File systems cap a name at 255 bytes, so it has 255 characters at most: anything longer was
+    // never a file's name.
     private const val MAX_NAME_LENGTH = 255
 
-    // The last `.x` is the extension when x is this long, in ASCII letters and digits.
+    // The last `.x` is the extension when x is 1 to this many ASCII letters and digits.
     private const val MAX_EXTENSION_LENGTH = 5
 
     private const val UUID_LENGTH = 36
@@ -58,7 +66,10 @@ object ObfuscationHeuristic {
         return random
     }
 
-    /** [name] without its extension, then without each volume, part or file type suffix left at its end. */
+    /**
+     * [name] without its extension (1 to 5 ASCII letters or digits after the last dot), then
+     * without each volume, part, recovery or file type suffix left at its end ([isDroppableSuffix]).
+     */
     private fun stemOf(name: String): String {
         var end = name.length
         val extension = name.substringAfterLast('.', missingDelimiterValue = "")
@@ -72,7 +83,10 @@ object ObfuscationHeuristic {
         }
     }
 
-    /** Whether the lower-case [suffix] is a part, recovery, old-style or split volume marker, or a file type. */
+    /**
+     * Whether the lower-case [suffix] is a part marker (`part01`), a recovery marker (`vol03+04`),
+     * an old-style or split volume marker (`r00`, `s01`, `z01`, `r100`, `001`), or a file type.
+     */
     private fun isDroppableSuffix(suffix: String): Boolean =
         isNumbered(suffix, "part") ||
             isRecoveryMarker(suffix) ||
@@ -114,6 +128,12 @@ object ObfuscationHeuristic {
         return tokens
     }
 
+    /**
+     * What [token] says of the name, by the first rule that fits: an episode code is telling,
+     * `sample` and `proof` are neutral, a hash, a number of seven digits or more, letters and
+     * digits in three runs or more and case noise are random, and three letters in a row (a word)
+     * are telling. Anything else (`x264`, `2019`, `a`) is neutral.
+     */
     private fun kindOf(token: String): Kind = when {
         isEpisodeCode(token) -> Kind.TELLING
         asciiLowercase(token) in GENERIC_WORDS -> Kind.NEUTRAL
@@ -128,6 +148,7 @@ object ObfuscationHeuristic {
     /** `S01`, `S01E02`, `S01E02E03`, `S2019E05` or `1x02`, in any case. */
     private fun isEpisodeCode(token: String): Boolean = isSeasonEpisode(token) || isCrossEpisode(token)
 
+    /** `S` and 1 to 4 digits, then any number of `E` and 1 to 4 digits, in any case. */
     private fun isSeasonEpisode(token: String): Boolean {
         if (token[0] != 's' && token[0] != 'S') return false
         var i = digitsEnd(token, 1)
@@ -141,6 +162,7 @@ object ObfuscationHeuristic {
         return true
     }
 
+    /** 1 or 2 digits, `x` in any case, then 2 or 3 digits. */
     private fun isCrossEpisode(token: String): Boolean {
         val x = digitsEnd(token, 0)
         if (x !in 1..2 || x >= token.length || (token[x] != 'x' && token[x] != 'X')) return false
@@ -148,7 +170,7 @@ object ObfuscationHeuristic {
         return end == token.length && end - (x + 1) in 2..3
     }
 
-    /** A hash: hex digits only, long enough, with both digits and letters. */
+    /** A hash: 8 hex digits or more, with both digits and letters. */
     private fun isLongHex(token: String): Boolean =
         token.length >= LONG_HEX && token.all(::isHexDigit) && token.any(::isDigit) && !token.all(::isDigit)
 
@@ -162,8 +184,9 @@ object ObfuscationHeuristic {
     }
 
     /**
-     * Whether the case changes between neighbouring letters often enough to be noise. The first
-     * pair isn't counted, so an initial capital (or a lower-case first letter) doesn't add one.
+     * Whether the case changes between neighbouring letters often enough to be noise: 4 times or
+     * more, and at more than half as many places as [token] has letters. The first pair isn't
+     * counted, so an initial capital (or a lower-case first letter) doesn't add one.
      */
     private fun hasFrequentCaseChanges(token: String): Boolean {
         var changes = 0
@@ -176,6 +199,7 @@ object ObfuscationHeuristic {
         return changes >= CASE_NOISE_CHANGES && 2 * changes > letters
     }
 
+    /** Whether [token] has [count] letters in a row, of any script. */
     private fun hasLettersInARow(token: String, count: Int): Boolean {
         var row = 0
         for (c in token) {
@@ -185,6 +209,7 @@ object ObfuscationHeuristic {
         return false
     }
 
+    /** Where the run of digits in [text] that starts at [from] ends: [from] when there is none. */
     private fun digitsEnd(text: String, from: Int): Int {
         var i = from
         while (i < text.length && isDigit(text[i])) i++
@@ -194,17 +219,25 @@ object ObfuscationHeuristic {
     /** Whether [text] from [from] on is one or more digits. */
     private fun isAllDigits(text: String, from: Int): Boolean = from < text.length && digitsEnd(text, from) == text.length
 
+    /** [text] with its ASCII capitals in lower case, whatever the locale. */
     private fun asciiLowercase(text: String): String =
         buildString(text.length) { for (c in text) append(if (c in 'A'..'Z') c + ('a' - 'A') else c) }
 
+    /** An ASCII digit: other scripts' digits don't count. */
     private fun isDigit(c: Char): Boolean = c in '0'..'9'
 
+    /** A letter of any script, or an ASCII digit. */
     private fun isLetterOrDigit(c: Char): Boolean = c.isLetter() || isDigit(c)
 
+    /** An ASCII letter or digit. */
     private fun isAsciiLetterOrDigit(c: Char): Boolean = c in 'a'..'z' || c in 'A'..'Z' || isDigit(c)
 
+    /** An ASCII digit, or a letter from `a` to `f` in either case. */
     private fun isHexDigit(c: Char): Boolean = isDigit(c) || c in 'a'..'f' || c in 'A'..'F'
 
-    // Case noise: the case changes often, or breaks a word's shape where no word does (RandomCase).
+    /**
+     * Whether [token]'s case is noise: it changes often ([hasFrequentCaseChanges]), or breaks a
+     * word's shape where no word does ([RandomCase.isRandom]).
+     */
     private fun isCaseNoise(token: String): Boolean = hasFrequentCaseChanges(token) || RandomCase.isRandom(token)
 }
