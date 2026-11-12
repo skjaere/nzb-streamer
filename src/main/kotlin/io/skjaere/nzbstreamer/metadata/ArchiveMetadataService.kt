@@ -210,20 +210,23 @@ class ArchiveMetadataService(
 
     /**
      * The name [file] is ordered by among the volumes: the name the PAR2 data ([par2Names], by the
-     * first 16 KB and the length) gives it, when that is a volume's or its yEnc name isn't one; else
-     * its yEnc name when that is a volume's, else, for an archive by its content posted under
-     * another extension, its name without that extension when that places it ([VolumeNames.of]).
-     * A volume obfuscated by itself keeps its extension (a8f7d6e5.rar, a first
-     * volume's name, as each of its set's is), so only the PAR2 data places it.
+     * first 16 KB and the length) gives it, when that is a volume's; else its yEnc name when that is
+     * one. Else, for an archive by its content posted under another extension, the volume name that
+     * the PAR2 name, or failing that its yEnc name, gives without that extension ([VolumeNames.of]):
+     * an index made over the names a set was posted under names x7f3k9q2.r00.bin, which is ordered
+     * as x7f3k9q2.r00. Else the PAR2 name, or the yEnc name. A volume obfuscated by itself keeps its
+     * extension (a8f7d6e5.rar, a first volume's name, as each of its set's is), so only the PAR2
+     * data places it.
      */
     private fun volumeName(file: NzbFile, par2Names: Par2FileNames): String {
         val name = file.yencHeaders!!.name
         val first16kb = file.first16kb ?: return name
         val described = par2Names.nameOf(first16kb, file.yencHeaders!!.size)
         return when {
-            described != null && (VolumeNames.isVolume(described) || !VolumeNames.isVolume(name)) -> described
+            described != null && VolumeNames.isVolume(described) -> described
             VolumeNames.isVolume(name) -> name
-            else -> VolumeNames.of(name)?.takeIf { VolumeNames.isArchive(first16kb) } ?: name
+            VolumeNames.isArchive(first16kb) -> described?.let(VolumeNames::of) ?: VolumeNames.of(name) ?: described ?: name
+            else -> described ?: name
         }
     }
 

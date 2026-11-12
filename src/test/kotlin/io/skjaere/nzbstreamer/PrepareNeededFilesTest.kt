@@ -533,6 +533,61 @@ class PrepareNeededFilesTest {
     }
 
     /**
+     * A RAR4 set posted wholly under another extension, under one random name or a readable one,
+     * with a PAR2 index made over the names it was posted under (x7f3k9q2.rar.bin,
+     * x7f3k9q2.r00.bin, ...), opens by the names its volumes give without that extension
+     * (x7f3k9q2.rar, .r00, .r01, ...), wherever the NZB lists them. The PAR2 data names each
+     * volume, but not by a volume's name, so that name doesn't give its place.
+     */
+    @ParameterizedTest
+    @CsvSource("x7f3k9q2, as posted", "x7f3k9q2, A to Z", "Movie.2020, A to Z")
+    fun `a set posted wholly under another extension with a PAR2 index over those names opens by its names`(
+        base: String,
+        listed: String,
+    ) {
+        val payload = bytes("movie", 200_000)
+        val named = volumes(base, "Movie.2020.mkv", payload, ContainerType.RAR4)
+        assertEquals(4, named.size)
+        val posted = named.map { (name, data) -> "$name.bin" to data }
+        val order = if (listed == "A to Z") posted.sortedBy { it.first } else posted
+        assertEquals(listed == "A to Z", order.last().first == "$base.rar.bin", "order: ${order.map { it.first }}")
+        order.forEach { (name, data) -> post(name, data) }
+        post("$base.par2", buildPar2File(posted))
+
+        withStreamer { streamer, _ ->
+            val result = streamer.prepare(nzb())
+            val prepared = assertIs<PrepareResult.Success>(result, "prepare: $result")
+            assertEquals(named.map { it.first }, prepared.metadata.response.volumes)
+            assertContentEquals(payload, streamer.streamed(prepared))
+        }
+    }
+
+    /**
+     * A RAR4 set posted wholly under another extension, under one random name or a readable one,
+     * lacks a volume that its PAR2 index, made over the names it was posted under, still names
+     * (x7f3k9q2.r01.bin): the names its volumes give without that extension skip it. The release
+     * doesn't open without it, and the cause's type says no provider can supply it.
+     */
+    @ParameterizedTest
+    @ValueSource(strings = ["x7f3k9q2", "Movie.2020"])
+    fun `a set posted wholly under another extension that lacks a volume its PAR2 index names by a posted name fails the release`(
+        base: String,
+    ) {
+        val named = volumes(base, "Movie.2020.mkv", bytes("movie", 200_000), ContainerType.RAR4)
+        assertEquals(4, named.size)
+        val posted = named.map { (name, data) -> "$name.bin" to data }
+        posted.filterNot { it.first == "$base.r01.bin" }.forEach { (name, data) -> post(name, data) }
+        post("$base.par2", buildPar2File(posted))
+
+        withStreamer { streamer, _ ->
+            val result = streamer.prepare(nzb())
+            val lacked = assertIs<PrepareResult.MissingArticles>(result, "prepare: $result")
+            assertTrue("volume 3 " in lacked.message, lacked.message)
+            assertIs<ArchiveVolumeNotInNzbException>(lacked.cause)
+        }
+    }
+
+    /**
      * A season pack leaves out an episode whose set lacks a volume, the volume found posted under
      * another extension with it, also when that one was found by its yEnc name, which the
      * subjects don't give.

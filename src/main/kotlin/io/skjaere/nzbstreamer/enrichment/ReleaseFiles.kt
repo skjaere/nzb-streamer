@@ -362,13 +362,14 @@ internal class ReleaseFiles(private val files: List<NzbFile>) {
          * one in a set no other kept file gives, or one whose set others give beside a kept volume
          * alone in its set by every name it goes by (one obfuscated by itself, as a8f7d6e5.rar is).
          * Its name may be as obfuscated as theirs, so the place it gives can't be trusted:
-         * x7f3k9q2.r00.bin beside a8f7d6e5.rar and c07e4f1a.rar would be ordered after them,
-         * whichever volume it is, and so would x7f3k9q2.r00.bin and x7f3k9q2.r01.bin, as a set of
-         * their own. A file's sets are those its names give as volume names ([VolumeNames.of]):
+         * x7f3k9q2.r00.bin beside a8f7d6e5.rar and c07e4f1a.rar would be ordered by that name, not
+         * by its place, and so would x7f3k9q2.r00.bin and x7f3k9q2.r01.bin, as a set of their own.
+         * A file's sets are those its names give as volume names ([VolumeNames.of]):
          * x7f3k9q2.rar.bin, x7f3k9q2.r00.bin and x7f3k9q2.r01.bin make one, so a release that is
          * one set, or one volume, posted under another extension opens by its names, and so do
-         * several such sets, none alone. Null when there is none. One the PAR2 data names is placed
-         * by that name, and a RAR5 volume whose headers number it by them ([Rar5Parser.volumeNumber]).
+         * several such sets, none alone. Null when there is none. One the PAR2 data names by a
+         * volume's name is placed by that name, and a RAR5 volume whose headers number it by them
+         * ([Rar5Parser.volumeNumber]).
          */
         private fun placedByItsNameAlone(hashes: Map<Int, String>): Int? {
             if (!obfuscatedOnly(hashes)) return null
@@ -377,7 +378,10 @@ internal class ReleaseFiles(private val files: List<NzbFile>) {
                 listOfNotNull(par2Name(j, hashes) ?: names[j], files[j].yencHeaders?.name)
                     .mapNotNull(VolumeNames::of).map(::stemOf).toSet()
             }
-            // A kept volume no other kept file shares a set with, by any name it goes by.
+            // A kept volume no other kept file shares a set with, by any name it goes by. One whose
+            // names give no set at all (a random name without an extension) counts too, unchecked:
+            // it can only make a volume that its own name alone places fail the release, never open
+            // it in a guessed order.
             val alone = kept.filter { j ->
                 isArchiveVolume(j) && setsOf.getValue(j).none { set -> kept.any { it != j && set in setsOf.getValue(it) } }
             }
@@ -445,9 +449,11 @@ internal class ReleaseFiles(private val files: List<NzbFile>) {
          * those of [found] (found among the others, by the name that places them). A set counts
          * when it holds two volumes or more, or every volume the release holds: a volume alone in
          * its set beside others is ordered with them, not by its name. Not a set [skipping] checks,
-         * nor one any of whose volumes the PAR2 data names, nor one whose RAR5 headers number each
-         * of its volumes: those place them. Null when there is none. A missing last volume isn't
-         * seen this way.
+         * nor one any of whose volumes the PAR2 data names by a volume's name, nor one whose RAR5
+         * headers number each of its volumes: those place them. A set the PAR2 data names by the
+         * names it was posted under (x7f3k9q2.r00.bin, an index made over those) is ordered by the
+         * names they give ([orderedBy]), so its places are checked as without PAR2 data. Null when
+         * there is none. A missing last volume isn't seen this way.
          */
         private fun skippingUnderAnotherExtension(
             hashes: Map<Int, String>,
@@ -458,7 +464,8 @@ internal class ReleaseFiles(private val files: List<NzbFile>) {
             val checked = sets.filterNot { isObfuscatedSet(names[it.first()]!!) }.flatMap(::stemsOf).toSet()
             return volumes.keys.groupBy { stemOf(volumes.getValue(it)) }.firstNotNullOfOrNull { (stem, set) ->
                 val posted = set.any { volumes.getValue(it) != postedName(it) }
-                val placed = set.any { par2Name(it, hashes) != null } || descriptions.any { stemOf(it.filename) == stem } ||
+                val placed = set.any { par2Name(it, hashes)?.let(VolumeNames::isVolume) == true } ||
+                    descriptions.any { VolumeNames.isVolume(it.filename) && stemOf(it.filename) == stem } ||
                     set.all { files[it].first16kb?.let(Rar5Parser::volumeNumber) != null }
                 if (!posted || placed || stem in checked || set.size < 2 && set.size < volumes.size) {
                     return@firstNotNullOfOrNull null
@@ -476,17 +483,21 @@ internal class ReleaseFiles(private val files: List<NzbFile>) {
 
         /**
          * The name the archive orders file [i] by among its volumes: the PAR2 data's when that is a
-         * volume's or [postedName] isn't, else [postedName] when that is one, else, for an archive
-         * by its content, the volume name it gives without the extension it was posted under
-         * ([VolumeNames.of]), else [postedName].
+         * volume's, else [postedName] when that is one. Else, for an archive by its content, the
+         * volume name that the PAR2 data's name, or failing that [postedName], gives without the
+         * extension it was posted under ([VolumeNames.of]): an index made over the names a set was
+         * posted under names x7f3k9q2.r00.bin, which is ordered as x7f3k9q2.r00. Else the PAR2
+         * data's name, or [postedName].
          */
         private fun orderedBy(i: Int, hashes: Map<Int, String>): String {
             val name = postedName(i)
             val described = describedAs(i, hashes)
             return when {
-                described != null && (VolumeNames.isVolume(described) || !VolumeNames.isVolume(name)) -> described
+                described != null && VolumeNames.isVolume(described) -> described
                 VolumeNames.isVolume(name) -> name
-                else -> VolumeNames.of(name)?.takeIf { VolumeNames.isArchive(files[i].first16kb) } ?: name
+                VolumeNames.isArchive(files[i].first16kb) ->
+                    described?.let(VolumeNames::of) ?: VolumeNames.of(name) ?: described ?: name
+                else -> described ?: name
             }
         }
 
