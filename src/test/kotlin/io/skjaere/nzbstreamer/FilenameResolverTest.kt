@@ -103,6 +103,33 @@ class FilenameResolverTest {
         assertNull(FilenameResolver.extractSubjectFilename(subject), subject)
     }
 
+    /** A release name used as the subject ends in a codec or source tag, not an extension: it names no file. */
+    @ParameterizedTest
+    @ValueSource(
+        strings = [
+            "Harbor.Lights.2019.1080p.WEB.x264 yEnc (1/50)",
+            "Harbor.Lights.2019.1080p.WEB.H.264 yEnc (1/50)",
+            "Harbor.Lights.2019.2160p.HEVC yEnc (1/50)",
+            "Harbor.Lights.2019.1080p.WEB yEnc (1/50)",
+            "Copper.Crown.S01E02.720p.HDTV yEnc (1/30)",
+            "Harbor.Lights.2003.DVDRip.XviD yEnc (1/50)",
+            "www.example.org yEnc (1/50)",
+        ],
+    )
+    fun `a release name or a web address in an unquoted subject names nothing`(subject: String) {
+        assertNull(FilenameResolver.extractSubjectFilename(subject), subject)
+    }
+
+    @Test
+    fun `the yEnc name wins over a release name used as the subject`() {
+        val best = FilenameResolver.bestFilename(
+            yencName = "a8f7d6e5.mkv",
+            subject = "Harbor.Lights.2019.1080p.WEB.x264 yEnc (1/50)",
+            par2Filename = null,
+        )
+        assertEquals("a8f7d6e5.mkv", best)
+    }
+
     @Test
     fun `the full yEnc name wins over an unquoted subject that holds a name with spaces`() {
         val best = FilenameResolver.bestFilename(
@@ -340,6 +367,12 @@ class FilenameResolverTest {
             Arguments.of("data.bin", "data.bin"),
             Arguments.of("release.part01.rar", "release.part01.rar"),
             Arguments.of("release.part1.rar", "release.part1.rar"),
+            // A file type a release holds wins over a nearer piece of another type, such as a site's address.
+            Arguments.of("Harbor.Lights.2019.mkv [www.example.org] yEnc (1/50)", "Harbor.Lights.2019.mkv"),
+            Arguments.of("Harbor.Lights.2019.mkv - example.org - yEnc (1/50)", "Harbor.Lights.2019.mkv"),
+            Arguments.of("Harbor.Lights.2019.dat - example.org - yEnc (1/50)", "example.org"),
+            // A split part numbered like a codec is still one.
+            Arguments.of("Movie.2020.7z.264 yEnc (1/400)", "Movie.2020.7z.264"),
             // A count is no part of the name after it.
             Arguments.of("01/50 Harbor.Lights.mkv yEnc (1/50)", "Harbor.Lights.mkv"),
         )

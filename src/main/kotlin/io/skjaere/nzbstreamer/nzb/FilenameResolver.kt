@@ -1,5 +1,6 @@
 package io.skjaere.nzbstreamer.nzb
 
+import io.skjaere.compressionutils.ArchiveService
 import io.skjaere.compressionutils.Par2FileNames
 import io.skjaere.compressionutils.Par2Parser
 import java.security.MessageDigest
@@ -68,6 +69,21 @@ object FilenameResolver {
     // A piece such as `1.37GB` or `700MB` is a size, never a name.
     private val SIZE_UNITS = setOf("b", "kb", "mb", "gb", "tb", "kib", "mib", "gib", "tib", "bytes")
 
+    // The file types a release holds, besides archive volumes and split parts: video, disc images
+    // and other archives, PAR2, the files beside them (NFO, checksums, images, subtitles) and audio.
+    private val KNOWN_EXTENSIONS = setOf(
+        "mkv", "mp4", "m4v", "avi", "mov", "wmv", "flv", "webm", "ts", "m2ts", "mts", "mpg", "mpeg", "vob", "ogm", "divx",
+        "iso", "zip", "tar", "gz", "par2", "nfo", "sfv", "srr", "srs", "md5", "sha1", "txt", "url", "nzb", "diz",
+        "jpg", "jpeg", "png", "gif", "bmp", "webp", "srt", "sub", "idx", "ass", "ssa", "vtt", "sup",
+        "mp3", "flac", "m4a", "ogg", "opus", "wav", "mka",
+    )
+
+    // The codec and source tags a release name ends in, which look like an extension.
+    private val CODEC_TAGS = setOf("x264", "x265", "h264", "h265", "hevc", "avc", "web", "hdtv", "xvid")
+
+    // `H.264` and its kin, whose number looks like a split part's.
+    private val CODEC_NUMBERS = listOf("h.264", "h.265", "x.264", "x.265")
+
     /**
      * Extract a filename from an NZB `<file subject="...">` line.
      *
@@ -95,7 +111,9 @@ object FilenameResolver {
      * The file name in a subject that doesn't quote it, or null. The subject is cut into pieces
      * at separators and split at its anchor: the first `yEnc`, else the last part counter, else
      * nothing. The name is the last file name piece before the anchor, else the first after it,
-     * unless that piece is joined to a word before it ([nameUnlessJoined]).
+     * unless that piece is joined to a word before it ([nameUnlessJoined]). A piece of a type a
+     * release holds ([isKnownType]) goes before a nearer one of another type, such as a site's
+     * address beside the name.
      */
     private fun unquotedFilename(subject: String): String? {
         val pieces = piecesOf(subject)
@@ -110,10 +128,27 @@ object FilenameResolver {
             head = if (counter == null) pieces else pieces.filter { it.last < counter.first }
             tail = if (counter == null) emptyList() else pieces.filter { it.first > counter.last }
         }
-        head.indices.reversed().firstOrNull { fileNameIn(subject, head[it]) != null }
-            ?.let { return nameUnlessJoined(subject, head, it) }
-        return tail.indices.firstOrNull { fileNameIn(subject, tail[it]) != null }
-            ?.let { nameUnlessJoined(subject, tail, it) }
+        nearestName(subject, head, head.indices.reversed())?.let { return nameUnlessJoined(subject, head, it) }
+        return nearestName(subject, tail, tail.indices)?.let { nameUnlessJoined(subject, tail, it) }
+    }
+
+    /**
+     * The first of [order] (indices of [pieces]) whose piece holds a file name of a type a release
+     * holds ([isKnownType]), else the first whose piece holds any file name, or null.
+     */
+    private fun nearestName(subject: String, pieces: List<IntRange>, order: IntProgression): Int? {
+        val named = order.mapNotNull { i -> fileNameIn(subject, pieces[i])?.let { i to it } }
+        return (named.firstOrNull { (_, name) -> isKnownType(name) } ?: named.firstOrNull())?.first
+    }
+
+    /**
+     * Whether [name]'s extension is of a type a release holds: an archive volume's, a split
+     * part's (`001`), or one of [KNOWN_EXTENSIONS].
+     */
+    private fun isKnownType(name: String): Boolean {
+        val extension = name.substringAfterLast('.').lowercase()
+        return ArchiveService.fileHasKnownExtension(name) || extension in KNOWN_EXTENSIONS ||
+            (extension.length == 3 && extension.all(::isDigit))
     }
 
     /**
@@ -183,7 +218,9 @@ object FilenameResolver {
     /**
      * The file name [piece] of [subject] holds, trimmed of punctuation, or null: it must have
      * something before its last dot and an extension after it, must have a letter (`1.234` and
-     * `734.003.200` are numbers), and must not be a size.
+     * `734.003.200` are numbers), and must not be a size, a web address (`www.example.org`) or a
+     * release name, which ends in a codec or source tag (`x264`, `H.264`, `WEB`) and not an
+     * extension.
      */
     private fun fileNameIn(subject: String, piece: IntRange): String? {
         var start = piece.first
@@ -192,11 +229,19 @@ object FilenameResolver {
         while (start < end && subject[start] in TRIMMED_AT_START) start++
         if (end - start > MAX_SUBJECT_NAME_LENGTH) return null
         val name = subject.substring(start, end)
-        if (isSize(name) || name.none { it.isLetter() }) return null
+        if (isSize(name) || name.none { it.isLetter() } || name.startsWith("www.", ignoreCase = true)) return null
         val dot = name.lastIndexOf('.')
-        if (dot < 0 || !isExtension(name.substring(dot + 1))) return null
+        if (dot < 0 || !isExtension(name.substring(dot + 1)) || endsInCodecTag(name, dot)) return null
         if ((0 until dot).none { name[it].isLetter() || isDigit(name[it]) }) return null
         return name
+    }
+
+    /** Whether [name], whose last dot is at [dot], ends in a codec or source tag ([CODEC_TAGS], [CODEC_NUMBERS]). */
+    private fun endsInCodecTag(name: String, dot: Int): Boolean {
+        if (name.substring(dot + 1).lowercase() in CODEC_TAGS) return true
+        return CODEC_NUMBERS.any { tag ->
+            name.endsWith(tag, ignoreCase = true) && (name.length == tag.length || name[name.length - tag.length - 1] == '.')
+        }
     }
 
     /** `mkv`, `r00`, `7z`, `par2`: 2 to 4 ASCII letters or digits with a letter. Or `001`, a split part. */
