@@ -230,6 +230,10 @@ class NntpStreamingService(
     @Volatile
     private var currentCircuitBreakerCooldownMs: Long = streamingConfig.circuitBreakerCooldownMs
 
+    // Set by [close]. A breaker that opened still ends its cooldown on the breakers' scheduler after that.
+    @Volatile
+    private var closed = false
+
     private fun buildCircuitBreakerConfig(failureThreshold: Int, cooldownMs: Long): CircuitBreakerConfig =
         CircuitBreakerConfig.custom()
             .slidingWindowType(CircuitBreakerConfig.SlidingWindowType.COUNT_BASED)
@@ -254,9 +258,11 @@ class NntpStreamingService(
                 streamingConfig.circuitBreakerCooldownMs,
             )
         ).also { reg ->
-            // Surface state changes (closed → open, open → half-open, etc.) in logs.
+            // Surface state changes (closed → open, open → half-open, etc.) in logs, while the service is open: a
+            // closed one's would come long after, as if about a pool still in use.
             reg.eventPublisher.onEntryAdded { event ->
                 event.addedEntry.eventPublisher.onStateTransition { transition ->
+                    if (closed) return@onStateTransition
                     logger.warn(
                         "Circuit breaker {} → {} for pool {}",
                         transition.stateTransition.fromState,
@@ -2041,6 +2047,7 @@ class NntpStreamingService(
     }
 
     override fun close() {
+        closed = true
         poolLock.read {
             pools.forEach { it.pool.close() }
         }
