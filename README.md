@@ -147,7 +147,7 @@ streamer.close()
 - The main code is compiled for Java 17 with a JDK 17 toolchain, which Gradle downloads when none is installed. The Gradle wrapper (Gradle 9.3.1) runs on JDK 17 or newer; CI runs it on JDK 25.
 - The tests compile and run on a JDK 25 toolchain, as the `mock-nntp-server` test dependency is published for Java 25 only. `MultiPoolFallbackTest` starts the mock server's Docker image through Testcontainers, so it needs Docker; the other tests run their NNTP servers in process.
 - yEnc decoding loads the `librapidyenc.so` bundled in [rapidyenc-kotlin-wrapper](https://github.com/skjaere/rapidyenc-kotlin-wrapper). To test with another build of rapidyenc, set `RAPIDYENC_LIB_PATH` to the folder that holds its `librapidyenc.so`.
-- `NestedArchiveTest` reads a real double archive (split 7z volumes holding a RAR set) from the folder named by the environment variable `NZB_STREAMER_DOUBLE_ARCHIVE_DIR` (or the system property `nzbstreamer.doubleArchiveDir`, when run from an IDE). It is skipped when neither is set.
+- `NestedArchiveTest` reads a real double archive (split 7z volumes holding a RAR set) from the folder named by the environment variable `NZB_STREAMER_DOUBLE_ARCHIVE_DIR`, which the build passes to the tests as the system property `nzbstreamer.doubleArchiveDir` (an IDE's run configuration can set either). It is skipped when neither is set.
 - When checkouts of `ktor-nntp-client` or `kotlin-compression-utils` sit beside this one (`../ktor-nntp-client`, `../kotlin-compression-utils`), the build uses them in place of the published versions.
 
 ## License

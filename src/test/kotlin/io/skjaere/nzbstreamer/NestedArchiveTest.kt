@@ -26,7 +26,7 @@ import kotlin.test.assertTrue
  * Tests nested archive support using a real double archive: 11 split 7z volumes (Copy method)
  * containing 52 old-style RAR volumes (.rar + .r00-.r50) plus proof.jpg, sample.mkv, .nfo, and
  * .sfv. The folder holding the 7z volumes comes from the system property [DIR_PROPERTY] or the
- * environment variable [DIR_VARIABLE]; the tests are skipped when neither is set. The
+ * environment variable [DIR_VARIABLE]; the tests are skipped when neither is set, or set blank. The
  * nested-archive tests that need no fixture are in [GeneratedNestedArchiveTest],
  * [ChunkedNestedSeekableInputStreamTest] and, over NNTP, [NestedArchivePrepareIntegrationTest].
  */
@@ -43,7 +43,7 @@ class NestedArchiveTest {
         @JvmStatic
         @BeforeAll
         fun setup() {
-            val dir = System.getProperty(DIR_PROPERTY) ?: System.getenv(DIR_VARIABLE)
+            val dir = (System.getProperty(DIR_PROPERTY) ?: System.getenv(DIR_VARIABLE))?.takeIf { it.isNotBlank() }
             assumeTrue(dir != null, "Set $DIR_PROPERTY or $DIR_VARIABLE to the double archive's folder to run these")
             val archiveDir = File(dir!!)
             check(archiveDir.isDirectory) { "No folder at ${archiveDir.absolutePath}" }

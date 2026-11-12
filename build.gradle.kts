@@ -48,6 +48,11 @@ tasks.test {
     // The yEnc decoder loads the librapidyenc.so its wrapper bundles. RAPIDYENC_LIB_PATH points the tests at a folder
     // holding another build of it.
     System.getenv("RAPIDYENC_LIB_PATH")?.let { systemProperty("jna.library.path", it) }
+    // NestedArchiveTest's fixture folder, passed as a system property so that setting or changing the variable
+    // reruns the tests (Gradle doesn't track a test task's environment).
+    System.getenv("NZB_STREAMER_DOUBLE_ARCHIVE_DIR")?.takeIf { it.isNotBlank() }?.let {
+        systemProperty("nzbstreamer.doubleArchiveDir", it)
+    }
     systemProperty("kotlinx.coroutines.test.default.timeout", "PT5M")
     // SegmentCacheTest looks at the temporary direct buffers the JDK keeps per thread (sun.nio.ch.Util).
     jvmArgs("--add-opens", "java.base/sun.nio.ch=ALL-UNNAMED")
