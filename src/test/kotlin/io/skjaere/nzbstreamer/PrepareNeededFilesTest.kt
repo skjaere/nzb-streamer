@@ -486,6 +486,31 @@ class PrepareNeededFilesTest {
     }
 
     /**
+     * Without PAR2 data, a RAR4 set posted wholly under another extension is ordered by the names
+     * its volumes give without it, under a random name or a readable one: one whose places skip a
+     * volume, or don't start at its first (here one volume, its second), lacks one the NZB doesn't
+     * hold. The release doesn't open without it, and the cause's type says no provider can supply it.
+     */
+    @ParameterizedTest
+    @CsvSource("x7f3k9q2, 023, 2", "x7f3k9q2, 1, 1", "Movie.2020, 023, 2")
+    fun `a set posted wholly under another extension whose names skip a volume fails a release without PAR2 data`(
+        base: String,
+        posted: String,
+        absent: Int,
+    ) {
+        val named = volumes(base, "Movie.2020.mkv", bytes("movie", 200_000), ContainerType.RAR4)
+        assertEquals(4, named.size)
+        posted.map { it.digitToInt() }.forEach { v -> post("${named[v].first}.bin", named[v].second) }
+
+        withStreamer { streamer, _ ->
+            val result = streamer.prepare(nzb())
+            val lacked = assertIs<PrepareResult.MissingArticles>(result, "prepare: $result")
+            assertTrue("volume $absent " in lacked.message, lacked.message)
+            assertIs<ArchiveVolumeNotInNzbException>(lacked.cause)
+        }
+    }
+
+    /**
      * Two RAR4 sets, each posted wholly under another extension under a random name of its own and
      * with no PAR2 data, open as two archives by the names their volumes give: every volume has
      * others of its set beside it.

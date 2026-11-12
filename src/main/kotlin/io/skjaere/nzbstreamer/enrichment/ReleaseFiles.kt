@@ -251,7 +251,8 @@ internal class ReleaseFiles(private val files: List<NzbFile>) {
          * that only its own name places, beside a volume of another set, where every set the release
          * opens is named obfuscated: in a set of its own, or beside a volume alone in its set
          * ([placedByItsNameAlone]). A release that is one set, or one volume, posted under another
-         * extension opens by the names it gives.
+         * extension opens by the names it gives. When those skip a volume or don't start at its
+         * first, the set lacks one: [Found.Missing] ([skippingUnderAnotherExtension]).
          */
         fun found(unknown: Map<Int, Exception>): Found {
             val hashes = hashes()
@@ -312,6 +313,7 @@ internal class ReleaseFiles(private val files: List<NzbFile>) {
                 if (!setsApart) return Found.Missing(cause)
                 incomplete.putIfAbsent(first, cause)
             }
+            skippingUnderAnotherExtension(hashes, found)?.let { return Found.Missing(it) }
             return Found.Volumes(found, incomplete)
         }
 
@@ -433,6 +435,60 @@ internal class ReleaseFiles(private val files: List<NzbFile>) {
                     "Archive volume ${absent + 1} of the set of '${nameOf(set.first())}' isn't in the NZB",
                 )
             }.toMap()
+
+        /**
+         * The cause for a set that volumes posted under another extension make by the names they
+         * are ordered by (their names without that extension, [VolumeNames.of]) whose places skip a
+         * volume or don't start at its first: x7f3k9q2.rar.bin, x7f3k9q2.r01.bin and
+         * x7f3k9q2.r02.bin lack x7f3k9q2.r00, and a lone x7f3k9q2.r00.bin lacks x7f3k9q2.rar. The
+         * volumes are the files of [kept] that are archives by their names or their content, and
+         * those of [found] (found among the others, by the name that places them). A set counts
+         * when it holds two volumes or more, or every volume the release holds: a volume alone in
+         * its set beside others is ordered with them, not by its name. Not a set [skipping] checks,
+         * nor one any of whose volumes the PAR2 data names, nor one whose RAR5 headers number each
+         * of its volumes: those place them. Null when there is none. A missing last volume isn't
+         * seen this way.
+         */
+        private fun skippingUnderAnotherExtension(
+            hashes: Map<Int, String>,
+            found: Map<Int, String>,
+        ): ArchiveVolumeNotInNzbException? {
+            val volumes = kept.filter { roles[it] == Role.ARCHIVE || VolumeNames.isArchive(files[it].first16kb) }
+                .associateWith { orderedBy(it, hashes) } + found
+            val checked = sets.filterNot { isObfuscatedSet(names[it.first()]!!) }.flatMap(::stemsOf).toSet()
+            return volumes.keys.groupBy { stemOf(volumes.getValue(it)) }.firstNotNullOfOrNull { (stem, set) ->
+                val posted = set.any { volumes.getValue(it) != postedName(it) }
+                val placed = set.any { par2Name(it, hashes) != null } || descriptions.any { stemOf(it.filename) == stem } ||
+                    set.all { files[it].first16kb?.let(Rar5Parser::volumeNumber) != null }
+                if (!posted || placed || stem in checked || set.size < 2 && set.size < volumes.size) {
+                    return@firstNotNullOfOrNull null
+                }
+                val places = set.map { VolumeNames.number(volumes.getValue(it)) ?: return@firstNotNullOfOrNull null }
+                val absent = (0..places.max()).firstOrNull { it !in places } ?: return@firstNotNullOfOrNull null
+                ArchiveVolumeNotInNzbException(
+                    "Archive volume ${absent + 1} of the set of '${nameOf(set.first())}' isn't in the NZB",
+                )
+            }
+        }
+
+        /** The name file [i] was posted under: its yEnc name, which the archive is ordered by, else its subject's. */
+        private fun postedName(i: Int): String = files[i].yencHeaders?.name ?: names[i].orEmpty()
+
+        /**
+         * The name the archive orders file [i] by among its volumes: the PAR2 data's when that is a
+         * volume's or [postedName] isn't, else [postedName] when that is one, else, for an archive
+         * by its content, the volume name it gives without the extension it was posted under
+         * ([VolumeNames.of]), else [postedName].
+         */
+        private fun orderedBy(i: Int, hashes: Map<Int, String>): String {
+            val name = postedName(i)
+            val described = describedAs(i, hashes)
+            return when {
+                described != null && (VolumeNames.isVolume(described) || !VolumeNames.isVolume(name)) -> described
+                VolumeNames.isVolume(name) -> name
+                else -> VolumeNames.of(name)?.takeIf { VolumeNames.isArchive(files[i].first16kb) } ?: name
+            }
+        }
 
         // The MD5 of the first 16 KB of each file fetched so far.
         private fun hashes(): Map<Int, String> =
