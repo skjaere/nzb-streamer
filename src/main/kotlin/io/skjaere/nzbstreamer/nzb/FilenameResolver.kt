@@ -18,7 +18,7 @@ import java.security.MessageDigest
  *  3. **yenc header** — the `=ybegin name=...` field on the wire. Always present but
  *     least trusted because it's the on-wire filename and gets obscured most often.
  *
- * Weighting follows nzbdav's GetFilenamePriority (a port of SABnzbd's approach):
+ * Weighting:
  *  - Starting priority: par2=3, subject=2, yenc=1
  *  - `-5000` if blank
  *  - `-1000` if [ObfuscationHeuristic.isProbablyObfuscated] says so
@@ -45,7 +45,6 @@ object FilenameResolver {
     private const val YENC_PRIORITY = 1
 
     // Video and archive containers that we care about ending up visible to clients.
-    // Matches nzbdav's IsImportantFileType.
     private val IMPORTANT_FILE_EXTENSIONS = setOf(
         "mkv", "mp4", "avi", "mov", "wmv", "flv", "m4v", "mpg", "mpeg", "ts", "webm",
         "rar", "zip", "7z", "tar", "gz",
