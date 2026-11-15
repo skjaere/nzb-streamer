@@ -158,6 +158,19 @@ class ArchiveStreamingService(
         namedSplits: NamedSplits,
         range: LongRange? = null,
         onGap: ((Gap) -> Unit)? = null,
+    ): WriterJob = launchStreamFile(archiveNzb, namedSplits, range, StreamOptions(), onGap)
+
+    /**
+     * Like the overload without [options], the stream fetching as they say: at their priority, with
+     * their use of the segment cache, missing-article policy, concurrency and read-ahead. An encrypted
+     * file's stream too.
+     */
+    suspend fun launchStreamFile(
+        archiveNzb: NzbDocument,
+        namedSplits: NamedSplits,
+        range: LongRange? = null,
+        options: StreamOptions,
+        onGap: ((Gap) -> Unit)? = null,
     ): WriterJob {
         val effectiveSplits = if (range != null) {
             adjustSplitsForRange(namedSplits.splits, range.first, range.last - range.first + 1)
@@ -166,7 +179,7 @@ class ArchiveStreamingService(
         }
 
         if (effectiveSplits.any { it.encryption != null }) {
-            return launchEncryptedFileWriter(archiveNzb, effectiveSplits, namedSplits.name, range?.first ?: 0L, onGap)
+            return launchEncryptedFileWriter(archiveNzb, effectiveSplits, namedSplits.name, range?.first ?: 0L, options, onGap)
         }
 
         val combinedQueue = flow {
@@ -178,7 +191,7 @@ class ArchiveStreamingService(
         }
         return streamingService.launchStreamSegments(
             combinedQueue, name = namedSplits.name, initialReadAheadSegments = firstSegmentsFor(range),
-            onGap = onGap?.from(range?.first ?: 0L),
+            options = options, onGap = onGap?.from(range?.first ?: 0L),
         )
     }
 
@@ -216,7 +229,9 @@ class ArchiveStreamingService(
     ) {
         val failure = AtomicReference<Throwable?>()
         val early = coroutineScope {
-            val writerJob = launchEncryptedFileWriter(archiveNzb, splits, name, fileStart, onGap) { failure.compareAndSet(null, it) }
+            val writerJob = launchEncryptedFileWriter(archiveNzb, splits, name, fileStart, StreamOptions(), onGap) {
+                failure.compareAndSet(null, it)
+            }
             try {
                 consume(writerJob.channel)
                 // As in NntpStreamingService.streamSegments: what failed before consume returned is
@@ -240,13 +255,15 @@ class ArchiveStreamingService(
      * [onFailure] gets the writer's failure (not its cancellation) before the channel closes with it,
      * unless the reader has closed the channel first: a write to the closed channel then is not the
      * stream failing. [onGap] gets the plaintext that zeroed ciphertext garbles ([garbledPlaintext]),
-     * as offsets in the file, whose byte [fileStart] the stream starts at.
+     * as offsets in the file, whose byte [fileStart] the stream starts at. The ciphertext's streams
+     * fetch as [options] say.
      */
     private suspend fun launchEncryptedFileWriter(
         archiveNzb: NzbDocument,
         splits: List<SplitInfo>,
         name: String,
         fileStart: Long,
+        options: StreamOptions,
         onGap: ((Gap) -> Unit)?,
         onFailure: (Throwable) -> Unit = {},
     ): WriterJob {
@@ -266,7 +283,9 @@ class ArchiveStreamingService(
                             }
                         }
                     }
-                    val seekableStream = NntpSeekableInputStream(archiveNzb, streamingService, end = splits.maxOf(::encryptedReadEnd), onGap = cipherGaps)
+                    val seekableStream = NntpSeekableInputStream(
+                        archiveNzb, streamingService, end = splits.maxOf(::encryptedReadEnd), options = options, onGap = cipherGaps,
+                    )
                     try {
                         for (split in splits) {
                             val enc = checkNotNull(split.encryption) {
@@ -512,8 +531,18 @@ class ArchiveStreamingService(
         range: LongRange? = null,
         streamName: String? = null,
         onGap: ((Gap) -> Unit)? = null,
+    ): WriterJob = launchStreamFile(archiveNzb, file, range, streamName, StreamOptions(), onGap)
+
+    /** Starts streaming [file] as [options] say; see the [NamedSplits] overloads. */
+    suspend fun launchStreamFile(
+        archiveNzb: NzbDocument,
+        file: StreamableFile,
+        range: LongRange? = null,
+        streamName: String? = null,
+        options: StreamOptions,
+        onGap: ((Gap) -> Unit)? = null,
     ): WriterJob {
         val namedSplits = NamedSplits(file.toSplits(archiveNzb), file.totalSize, streamName ?: file.path)
-        return launchStreamFile(archiveNzb, namedSplits, range, onGap)
+        return launchStreamFile(archiveNzb, namedSplits, range, options, onGap)
     }
 }

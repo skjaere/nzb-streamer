@@ -11,6 +11,7 @@ import io.skjaere.nzbstreamer.nzb.NzbDocument
 import io.skjaere.nzbstreamer.queue.SegmentQueueService
 import io.skjaere.nzbstreamer.stream.Gap
 import io.skjaere.nzbstreamer.stream.NntpStreamingService
+import io.skjaere.nzbstreamer.stream.StreamOptions
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
@@ -36,13 +37,25 @@ private const val FORWARD_THRESHOLD_BYTES = 102400L
  * [io.skjaere.nzbstreamer.config.MissingArticlePolicy.ZERO_FILL], zeros stand in for an article no
  * provider has, and [onGap] gets each stretch they fill as offsets in [nzb]'s files laid end to end.
  * So it is for a file's data, never its headers: those are read strictly ([SegmentRandomAccessStream]).
+ * Its downloads fetch as [options] say ([StreamOptions]): at their priority, with their use of the segment
+ * cache, missing-article policy, concurrency and read-ahead.
  */
 class NntpSeekableInputStream @JvmOverloads constructor(
     private val nzb: NzbDocument,
     private val streamingService: NntpStreamingService,
     end: Long = Long.MAX_VALUE,
+    private val options: StreamOptions,
     private val onGap: ((Gap) -> Unit)? = null,
 ) : SeekableInputStream {
+    /** Its downloads fetch as every stream did (`StreamOptions()`). */
+    @JvmOverloads
+    constructor(
+        nzb: NzbDocument,
+        streamingService: NntpStreamingService,
+        end: Long = Long.MAX_VALUE,
+        onGap: ((Gap) -> Unit)? = null,
+    ) : this(nzb, streamingService, end, StreamOptions(), onGap)
+
     private val logger = LoggerFactory.getLogger(NntpSeekableInputStream::class.java)
     private val forwardThresholdBytes: Long = FORWARD_THRESHOLD_BYTES
     private val totalSize: Long = SegmentQueueService.getTotalDecodedSize(nzb)
@@ -131,7 +144,7 @@ class NntpSeekableInputStream @JvmOverloads constructor(
             val gaps = onGap?.let { listener ->
                 { gap: Gap -> listener(gap.copy(fileRange = gap.fileRange.first + position..gap.fileRange.last + position)) }
             }
-            streamingService.streamSegments(queue, name = "seek", onGap = gaps) { channel ->
+            streamingService.streamSegments(queue, name = "seek", onGap = gaps, options = options) { channel ->
                 channelReady.complete(channel)
                 suspendCancellableCoroutine<Unit> { }
             }

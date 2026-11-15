@@ -100,6 +100,18 @@ streamer.streamFile(metadata, file, range) { channel ->
 }
 ```
 
+### Stream beside a player
+
+```kotlin
+// A file saved whole while a player streams: its fetches wait for the player's, and the segment cache isn't filled.
+val writer = streamer.launchStreamFile(
+    metadata, file,
+    options = StreamOptions(priority = StreamOptions.BACKGROUND_PRIORITY, cache = CacheUse.READ_ONLY),
+)
+```
+
+`StreamOptions` set how one stream fetches: its priority with the servers' connections, whether it stores what it fetches in the segment cache, its missing-article policy, concurrency and read-ahead. A null field is the streamer's own setting, and the overloads without options stream with `StreamOptions()`. A stream below `NntpPriority.STREAMING` waits for a connection as long as it takes, and that wait never counts against a server's circuit breaker.
+
 ### Stream a raw archive volume
 
 ```kotlin
@@ -136,6 +148,7 @@ streamer.close()
 | `ExtractedMetadata` | Enriched NZB + archive file entries + JSON-serializable response |
 | `NzbMetadataResponse` | Serializable archive metadata (volumes, entries, obfuscation status) |
 | `StreamableFile` | A file the release lists, with its path and size, to stream |
+| `StreamOptions` / `CacheUse` | How one stream fetches: priority, segment cache use, missing-article policy, concurrency, read-ahead |
 | `FileResolveResult` | Sealed type: `Streamable` (with the file's `NamedSplits`), `NotFound`, `IsDirectory`, `Compressed` |
 | `NntpConfig` / `StreamingConfig` / `PrepareConfig` | Configuration data classes |
 

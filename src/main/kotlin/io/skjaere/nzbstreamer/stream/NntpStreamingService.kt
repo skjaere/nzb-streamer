@@ -17,6 +17,8 @@ import io.micrometer.core.instrument.Tags
 import io.micrometer.core.instrument.Timer
 import io.skjaere.nntp.ArticleNotFoundException
 import io.skjaere.nntp.NntpClientPool
+import io.skjaere.nntp.NntpConnectionException
+import io.skjaere.nntp.NntpConnectionLostException
 import io.skjaere.nntp.NntpDispatchers
 import io.skjaere.nntp.NntpException
 import io.skjaere.nntp.StatResult
@@ -74,6 +76,9 @@ import kotlin.concurrent.write
 
 /** Smallest STAT batch worth a pipeline of its own. */
 private const val STAT_CHUNK_MIN = 32
+
+/** How a stream fetches unless it says otherwise: as every stream did. */
+private val DEFAULT_OPTIONS = StreamOptions()
 
 /** What a stream's read-ahead in bytes ([StreamingConfig.readAheadBytes]) is counted in. */
 private const val HELD_UNIT_BYTES = 64L * 1024
@@ -147,11 +152,11 @@ private fun headersKey(articleId: String) = "$articleId\u0000yenc-headers"
 internal class FetchedArticle(val article: YencArticle, val storable: Boolean)
 
 /**
- * How a segment's fetch on one pool went ([NntpStreamingService.withConnectionWithin]): how many tries it made, how
+ * How a segment's fetch on one pool went ([withConnectionWithin]): how many tries it made, how
  * many of them the pool handed a connection, and whether the last still held its own. A timeout's message says from
  * them what ran out.
  */
-private class Tries {
+internal class Tries {
     @Volatile
     var made = 0
 
@@ -162,6 +167,10 @@ private class Tries {
     // on (its command retry). A try whose time runs out then was waiting for a connection, not on one.
     @Volatile
     var holding = false
+
+    // When the pool first handed a try a connection (System.nanoTime), 0 before.
+    @Volatile
+    var connectedAtNs = 0L
 
     /** What ran out, in a timeout's words, given [timeoutMs] a try. Only a try that had a connection is tried again. */
     fun ranOut(timeoutMs: Long): String {
@@ -1359,13 +1368,33 @@ class NntpStreamingService(
         initialReadAheadSegments: Int? = currentInitialReadAheadSegments,
         onGap: ((Gap) -> Unit)? = null,
         consume: suspend (ByteReadChannel) -> Unit
+    ) = streamSegments(queue, concurrency, readAheadSegments, name, readAheadBytes, initialReadAheadSegments, onGap, StreamOptions(), consume)
+
+    /**
+     * Like the overload without [options], the stream fetching as they say ([StreamOptions]): at their priority, with
+     * their use of the segment cache and their missing-article policy, and with their concurrency, read-ahead segments
+     * and bytes where they set them, in place of [concurrency], [readAheadSegments] and [readAheadBytes].
+     */
+    suspend fun streamSegments(
+        queue: Flow<SegmentQueueItem>,
+        concurrency: Int = currentConcurrency,
+        readAheadSegments: Int = currentReadAheadSegments,
+        name: String = "unknown",
+        readAheadBytes: Long? = currentReadAheadBytes,
+        initialReadAheadSegments: Int? = currentInitialReadAheadSegments,
+        onGap: ((Gap) -> Unit)? = null,
+        options: StreamOptions,
+        consume: suspend (ByteReadChannel) -> Unit
     ) {
         val bitrate = acquireBitrateState(name)
         activeStreams.incrementAndGet()
         val failure = java.util.concurrent.atomic.AtomicReference<Throwable?>()
         try {
             val early = coroutineScope {
-                val writerJob = launchStreamSegments(queue, concurrency, readAheadSegments, readAheadBytes, initialReadAheadSegments, bitrate, name, onGap) {
+                val writerJob = launchStreamSegments(
+                    queue, options.concurrency ?: concurrency, options.readAheadSegments ?: readAheadSegments,
+                    options.readAheadBytes ?: readAheadBytes, initialReadAheadSegments, bitrate, name, options, onGap,
+                ) {
                     failure.compareAndSet(null, it)
                 }
                 try {
@@ -1413,9 +1442,28 @@ class NntpStreamingService(
         readAheadBytes: Long? = currentReadAheadBytes,
         initialReadAheadSegments: Int? = currentInitialReadAheadSegments,
         onGap: ((Gap) -> Unit)? = null,
+    ): WriterJob = launchStreamSegments(queue, concurrency, readAheadSegments, name, readAheadBytes, initialReadAheadSegments, StreamOptions(), onGap)
+
+    /**
+     * Like the overload without [options], the stream fetching as they say ([StreamOptions]): at their priority, with
+     * their use of the segment cache and their missing-article policy, and with their concurrency, read-ahead segments
+     * and bytes where they set them, in place of [concurrency], [readAheadSegments] and [readAheadBytes].
+     */
+    suspend fun launchStreamSegments(
+        queue: Flow<SegmentQueueItem>,
+        concurrency: Int = currentConcurrency,
+        readAheadSegments: Int = currentReadAheadSegments,
+        name: String = "unknown",
+        readAheadBytes: Long? = currentReadAheadBytes,
+        initialReadAheadSegments: Int? = currentInitialReadAheadSegments,
+        options: StreamOptions,
+        onGap: ((Gap) -> Unit)? = null,
     ): WriterJob {
         val bitrate = acquireBitrateState(name)
-        val writerJob = launchStreamSegments(queue, concurrency, readAheadSegments, readAheadBytes, initialReadAheadSegments, bitrate, name, onGap)
+        val writerJob = launchStreamSegments(
+            queue, options.concurrency ?: concurrency, options.readAheadSegments ?: readAheadSegments,
+            options.readAheadBytes ?: readAheadBytes, initialReadAheadSegments, bitrate, name, options, onGap,
+        )
         writerJob.job.invokeOnCompletion { releaseBitrateState(name) }
         return writerJob
     }
@@ -1423,7 +1471,8 @@ class NntpStreamingService(
     /**
      * [onFailure] gets the writer's failure (not its cancellation) before the channel closes with it,
      * unless the reader has closed the channel first: what fails then (a write to the closed
-     * channel, a download nobody reads any more) is not the stream failing.
+     * channel, a download nobody reads any more) is not the stream failing. [options] give the
+     * stream's priority, use of the cache and missing-article policy; its counts come resolved.
      */
     @Suppress("LongParameterList")
     private suspend fun launchStreamSegments(
@@ -1434,10 +1483,12 @@ class NntpStreamingService(
         initialReadAheadSegments: Int?,
         bitrate: BitrateState,
         name: String,
+        options: StreamOptions,
         onGap: ((Gap) -> Unit)?,
         onFailure: (Throwable) -> Unit = {},
     ): WriterJob {
-        val fill = currentMissingArticles == MissingArticlePolicy.ZERO_FILL
+        val fill = (options.missingArticles ?: currentMissingArticles) == MissingArticlePolicy.ZERO_FILL
+        if (options != DEFAULT_OPTIONS) logger.debug("Stream [{}] opened with {}", name, options)
         val callerScope = CoroutineScope(currentCoroutineContext())
         return callerScope.writer(autoFlush = false) {
             // Once the channel is closed (by the reader, or below by a failed download that has
@@ -1530,7 +1581,7 @@ class NntpStreamingService(
                                 }
                                 val deferred = this@supervisorScope.async {
                                     try {
-                                        Downloaded(downloadSegment(item.segment.articleId), zeros = false)
+                                        Downloaded(downloadSegment(item.segment.articleId, options), zeros = false)
                                     } catch (e: CancellationException) {
                                         throw e
                                     } catch (@Suppress("TooGenericExceptionCaught") e: Exception) {
@@ -1675,7 +1726,8 @@ class NntpStreamingService(
         cache.getOrFetch(headersKey(articleId)) { Json.encodeToString(CachedYencHeaders(headers)).encodeToByteArray() }
     }
 
-    private suspend fun downloadSegment(articleId: String): ByteArray {
+    /** [articleId]'s bytes, through the segment cache as [options] use it, fetched at their priority. */
+    private suspend fun downloadSegment(articleId: String, options: StreamOptions = DEFAULT_OPTIONS): ByteArray {
         if (segmentCache != null) {
             val getSample = Timer.start(registry)
             val cached = segmentCache.get(articleId)
@@ -1685,19 +1737,25 @@ class NntpStreamingService(
                 return cached
             }
             segmentCacheMisses.increment()
+            // Nothing stored: a stream whose bytes go elsewhere would push out what plays keep. Nor does it join a
+            // fetch of the same article under way, which would store it.
+            if (options.cache == CacheUse.READ_ONLY) return fetchSegmentFromNntp(articleId, options.priority).bytes
             // Singleflight in SegmentCache dedupes concurrent fetches for the same article.
             val getOrFetchSample = Timer.start(registry)
             try {
-                return segmentCache.getOrFetchStorable(articleId) { fetchSegmentFromNntp(articleId) }
+                return segmentCache.getOrFetchStorable(articleId) { fetchSegmentFromNntp(articleId, options.priority) }
             } finally {
                 getOrFetchSample.stop(segmentCacheGetOrFetchTimer)
             }
         }
-        return fetchSegmentFromNntp(articleId).bytes
+        return fetchSegmentFromNntp(articleId, options.priority).bytes
     }
 
-    /** [articleId]'s bytes, from the first pool with a good copy; or, with none, a damaged one not to be cached ([tolerated]). */
-    private suspend fun fetchSegmentFromNntp(articleId: String): SegmentCache.Fetched {
+    /**
+     * [articleId]'s bytes, from the first pool with a good copy; or, with none, a damaged one not to be cached
+     * ([tolerated]). Each pool is asked for a connection at [priority].
+     */
+    private suspend fun fetchSegmentFromNntp(articleId: String, priority: Int): SegmentCache.Fetched {
         val sample = Timer.start(registry)
         // The id as logged and reported: an NZB can put a CR/LF in it (it's never sent then).
         val shown = articleId.printable()
@@ -1749,7 +1807,7 @@ class NntpStreamingService(
                 return@firstNotNullOfOrNull null
             }
             anyAttempted = true
-            fetchFromPool(articleId, entry, index, snapshot.size, breaker, timeoutMs) { e ->
+            fetchFromPool(articleId, entry, index, snapshot.size, breaker, timeoutMs, priority) { e ->
                 when {
                     e is YencCrcMismatchException -> mismatched += entry.name to e
                     e is YencDecodingException -> unreadable += e
@@ -1805,7 +1863,9 @@ class NntpStreamingService(
      * included ([StreamingConfig.segmentTimeoutRetries]), reporting to [breaker] (if any) how it went.
      * Returns null to move on to the next pool; a failure other than a clean 430 (a timeout, as a
      * [SegmentTimeoutException], a connection that dropped, a damaged copy or one that can't be
-     * read) also goes to [onFailure].
+     * read) also goes to [onFailure]. The pool is asked for a connection at [priority]: below
+     * [NntpPriority.STREAMING], the wait for one has no limit ([withConnectionWithin]), and the
+     * breaker hears how long the call took from when the pool handed one over.
      */
     @Suppress("LongParameterList", "LongMethod")
     private suspend fun fetchFromPool(
@@ -1815,9 +1875,10 @@ class NntpStreamingService(
         poolCount: Int,
         breaker: CircuitBreaker?,
         timeoutMs: Long,
+        priority: Int,
         onFailure: (Exception) -> Unit,
     ): ByteArray? {
-        val callStart = System.nanoTime()
+        val background = priority < NntpPriority.STREAMING.value
         val shown = articleId.printable()
         // Set once the breaker has heard how the call went. Any other way out (cancelled as the
         // reader seeks or stops, the pool closed, an error no arm below expects) hands the permit
@@ -1825,6 +1886,9 @@ class NntpStreamingService(
         // half-open with none and this pool is skipped until the process restarts.
         var settled = false
         val tries = Tries()
+        // How long the call took, for the breaker: a background fetch's wait behind the others is not the pool's.
+        val callStart = System.nanoTime()
+        fun took() = System.nanoTime() - (tries.connectedAtNs.takeIf { background && it != 0L } ?: callStart)
         return try {
             // Read inside withClient, not through pool.bodyYenc: there a connection that drops
             // mid-article fails only the Body channel's reader, outside withClient, and the
@@ -1833,7 +1897,8 @@ class NntpStreamingService(
             // before the whole segment is read, so no byte is delivered twice. Read whole, it
             // is decoded straight into one array, not through a channel and copied out of it.
             val payload = withConnectionWithin(
-                entry.pool, timeoutMs, streamingConfig.segmentTimeoutRetries, tries,
+                { block -> entry.pool.withClient(priority, block) },
+                timeoutMs, streamingConfig.segmentTimeoutRetries, tries, background,
                 onRetry = {
                     countTimeout(entry.name, timeoutMs)
                     logger.warn(
@@ -1845,7 +1910,7 @@ class NntpStreamingService(
                 client.bodyYencBytes("<$articleId>").data
             }
             breaker?.onResult(
-                System.nanoTime() - callStart,
+                took(),
                 java.util.concurrent.TimeUnit.NANOSECONDS,
                 payload,
             )
@@ -1898,7 +1963,7 @@ class NntpStreamingService(
             val what = tries.ranOut(timeoutMs)
             val timeout = SegmentTimeoutException(articleId, timeoutMs, "Segment <$shown> $what on pool[$index] ($poolName)", e)
             breaker?.onError(
-                System.nanoTime() - callStart,
+                took(),
                 java.util.concurrent.TimeUnit.NANOSECONDS,
                 timeout,
             )
@@ -1923,7 +1988,7 @@ class NntpStreamingService(
             null
         } catch (e: NntpException) {
             breaker?.onError(
-                System.nanoTime() - callStart,
+                took(),
                 java.util.concurrent.TimeUnit.NANOSECONDS,
                 e,
             )
@@ -1947,7 +2012,7 @@ class NntpStreamingService(
             null
         } catch (e: IOException) {
             breaker?.onError(
-                System.nanoTime() - callStart,
+                took(),
                 java.util.concurrent.TimeUnit.NANOSECONDS,
                 e,
             )
@@ -1990,62 +2055,6 @@ class NntpStreamingService(
         bodyDurationTimerFor(poolName).record(timeoutMs, java.util.concurrent.TimeUnit.MILLISECONDS)
     }
 
-    /**
-     * [fetch] on one of [pool]'s connections, given [timeoutMs] from when the pool hands one over.
-     * The wait for it (every connection fetching, or still reading off what a cancelled fetch left
-     * on the wire, or connecting) doesn't use that time up, and has [timeoutMs] of its own. A fetch
-     * that runs out of its time on a connection is tried again, up to [retries] times, [onRetry]
-     * called before each. The pool keeps the connection it timed out on while it reads off the
-     * answer owed, and drops it if none comes, so the next try is given another. The whole call,
-     * the pool's fetch again after a connection dropped included, has twice [timeoutMs]. Any of them
-     * running out throws a [TimeoutCancellationException]; [tries] says how they went.
-     */
-    private suspend fun <T> withConnectionWithin(
-        pool: NntpClientPool,
-        timeoutMs: Long,
-        retries: Int,
-        tries: Tries,
-        onRetry: () -> Unit,
-        fetch: suspend (io.skjaere.nntp.NntpClient) -> T,
-    ): T {
-        suspend fun untilServed(): T {
-            while (true) {
-                // Completed once the pool has handed this try a connection: a timeout before that was the wait for one.
-                val connected = CompletableDeferred<Unit>()
-                tries.made++
-                tries.holding = false
-                try {
-                    return coroutineScope {
-                        val call = async {
-                            pool.withClient(NntpPriority.STREAMING.value) { client ->
-                                if (connected.complete(Unit)) tries.connected++
-                                tries.holding = true
-                                try {
-                                    withTimeout(timeoutMs.milliseconds) { fetch(client) }
-                                } catch (e: Throwable) {
-                                    // Cancelled: its time ran out on this connection (or the caller's did), so it
-                                    // still had one. Anything else lost it, and the pool may fetch again on another.
-                                    if (e !is CancellationException) tries.holding = false
-                                    throw e
-                                }
-                            }
-                        }
-                        // A call that fails before it has a connection fails this scope, which ends the wait.
-                        withTimeout(timeoutMs.milliseconds) { connected.await() }
-                        call.await()
-                    }
-                } catch (e: TimeoutCancellationException) {
-                    // Only a try that ran out of its own time on a connection goes again: the whole call's running out
-                    // (or a caller's cancellation) has cancelled this coroutine too, and goes on up.
-                    currentCoroutineContext().ensureActive()
-                    if (!connected.isCompleted || tries.made > retries) throw e
-                    onRetry()
-                }
-            }
-        }
-        return withTimeout(timeoutMs.milliseconds * 2) { untilServed() }
-    }
-
     override fun close() {
         closed = true
         poolLock.read {
@@ -2062,3 +2071,104 @@ class NntpStreamingService(
     }
 
 }
+
+/**
+ * [fetch] on a connection [withClient] lends (a pool's), given [timeoutMs] from when it is handed over.
+ * The wait for it (every connection fetching, or still reading off what a cancelled fetch left
+ * on the wire, or connecting) doesn't use that time up, and has [timeoutMs] of its own. A fetch
+ * that runs out of its time on a connection is tried again, up to [retries] times, [onRetry]
+ * called before each. The pool keeps the connection it timed out on while it reads off the
+ * answer owed, and drops it if none comes, so the next try is given another. The whole call,
+ * the pool's fetch again after a connection dropped included, has twice [timeoutMs]. Any of them
+ * running out throws a [TimeoutCancellationException]; [tries] says how they went.
+ *
+ * A [background] fetch (a stream below [NntpPriority.STREAMING]) waits for its first connection
+ * as long as it takes: that wait has no time of its own, and the whole call's twice [timeoutMs]
+ * counts from the hand-over. The pool's own wait for a connection running out (30 s, and as long
+ * again on its retry) asks it again; any other failure before the hand-over (the pool closed,
+ * no connection to be had) ends the call with it, as for any fetch.
+ */
+@Suppress("LongParameterList")
+internal suspend fun <C, T> withConnectionWithin(
+    withClient: suspend (block: suspend (C) -> T) -> T,
+    timeoutMs: Long,
+    retries: Int,
+    tries: Tries,
+    background: Boolean,
+    onRetry: () -> Unit,
+    fetch: suspend (C) -> T,
+): T {
+    // Completed once the pool has handed the call its first connection.
+    val handedOver = CompletableDeferred<Unit>()
+
+    suspend fun untilServed(): T {
+        while (true) {
+            // Completed once the pool has handed this try a connection: a timeout before that was the wait for one.
+            val connected = CompletableDeferred<Unit>()
+            tries.made++
+            tries.holding = false
+            try {
+                return coroutineScope {
+                    val call = async {
+                        lent(withClient, background, connected) { client ->
+                            if (connected.complete(Unit)) tries.connected++
+                            if (handedOver.complete(Unit)) tries.connectedAtNs = System.nanoTime()
+                            tries.holding = true
+                            try {
+                                withTimeout(timeoutMs.milliseconds) { fetch(client) }
+                            } catch (e: Throwable) {
+                                // Cancelled: its time ran out on this connection (or the caller's did), so it
+                                // still had one. Anything else lost it, and the pool may fetch again on another.
+                                if (e !is CancellationException) tries.holding = false
+                                throw e
+                            }
+                        }
+                    }
+                    // A call that fails before it has a connection fails this scope, which ends the wait.
+                    if (!background) withTimeout(timeoutMs.milliseconds) { connected.await() }
+                    call.await()
+                }
+            } catch (e: TimeoutCancellationException) {
+                // Only a try that ran out of its own time on a connection goes again: the whole call's running out
+                // (or a caller's cancellation) has cancelled this coroutine too, and goes on up.
+                currentCoroutineContext().ensureActive()
+                if (!connected.isCompleted || tries.made > retries) throw e
+                onRetry()
+            }
+        }
+    }
+    if (!background) return withTimeout(timeoutMs.milliseconds * 2) { untilServed() }
+    return coroutineScope {
+        val served = async { untilServed() }
+        // A call that fails before the hand-over fails this scope, which ends the wait.
+        handedOver.await()
+        withTimeout(timeoutMs.milliseconds * 2) { served.await() }
+    }
+}
+
+/**
+ * [block] on a connection [withClient] lends. For a [background] fetch, asked again while the pool's own wait for a
+ * connection runs out before [connected]: its wait has no limit.
+ */
+private suspend fun <C, T> lent(
+    withClient: suspend (block: suspend (C) -> T) -> T,
+    background: Boolean,
+    connected: CompletableDeferred<Unit>,
+    block: suspend (C) -> T,
+): T {
+    while (true) {
+        try {
+            return withClient(block)
+        } catch (e: NntpConnectionException) {
+            if (!background || connected.isCompleted || !e.isPoolWaitRunOut()) throw e
+        }
+    }
+}
+
+/**
+ * Whether this is the pool's own wait for a connection running out (ktor-nntp-client's NntpClientPool, its
+ * ACQUIRE_TIMEOUT_MS): its connections all lent, none free in time. Told by its message, as the pool throws a plain
+ * NntpConnectionException for it, as for a connect that failed. A lost connection never is.
+ */
+internal fun NntpConnectionException.isPoolWaitRunOut(): Boolean =
+    this !is NntpConnectionLostException && message.orEmpty().startsWith("Timed out waiting for connection")

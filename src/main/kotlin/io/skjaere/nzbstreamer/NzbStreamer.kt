@@ -25,6 +25,7 @@ import io.skjaere.nzbstreamer.stream.NamedSplits
 import io.skjaere.nzbstreamer.stream.NntpPriority
 import io.skjaere.nzbstreamer.stream.NntpStreamingService
 import io.skjaere.nzbstreamer.stream.SegmentCache
+import io.skjaere.nzbstreamer.stream.StreamOptions
 import io.skjaere.nzbstreamer.stream.StreamableFile
 import kotlinx.coroutines.runBlocking
 import java.io.Closeable
@@ -138,8 +139,20 @@ class NzbStreamer private constructor(
         namedSplits: NamedSplits,
         range: LongRange? = null,
         onGap: ((Gap) -> Unit)? = null,
+    ): WriterJob = launchStreamFile(metadata, namedSplits, range, StreamOptions(), onGap)
+
+    /**
+     * Like the overload without [options], the stream fetching as they say: at their priority, with
+     * their use of the segment cache, missing-article policy, concurrency and read-ahead.
+     */
+    suspend fun launchStreamFile(
+        metadata: ExtractedMetadata,
+        namedSplits: NamedSplits,
+        range: LongRange? = null,
+        options: StreamOptions,
+        onGap: ((Gap) -> Unit)? = null,
     ): WriterJob {
-        return archiveStreamingService.launchStreamFile(metadata.orderedArchiveNzb, namedSplits, range, onGap)
+        return archiveStreamingService.launchStreamFile(metadata.orderedArchiveNzb, namedSplits, range, options, onGap)
     }
 
     fun resolveStreamableFiles(metadata: ExtractedMetadata): List<StreamableFile> {
@@ -221,8 +234,18 @@ class NzbStreamer private constructor(
         range: LongRange? = null,
         streamName: String? = null,
         onGap: ((Gap) -> Unit)? = null,
+    ): WriterJob = launchStreamFile(metadata, file, range, streamName, StreamOptions(), onGap)
+
+    /** Starts streaming [file] as [options] say; see the [NamedSplits] overloads. */
+    suspend fun launchStreamFile(
+        metadata: ExtractedMetadata,
+        file: StreamableFile,
+        range: LongRange? = null,
+        streamName: String? = null,
+        options: StreamOptions,
+        onGap: ((Gap) -> Unit)? = null,
     ): WriterJob {
-        return archiveStreamingService.launchStreamFile(metadata.orderedArchiveNzb, file, range, streamName, onGap)
+        return archiveStreamingService.launchStreamFile(metadata.orderedArchiveNzb, file, range, streamName, options, onGap)
     }
 
     /** Starts streaming [file]; see the [NamedSplits] overload for the writer's lifetime and failures. */
@@ -232,8 +255,18 @@ class NzbStreamer private constructor(
         range: LongRange? = null,
         streamName: String? = null,
         onGap: ((Gap) -> Unit)? = null,
+    ): WriterJob = launchStreamFile(nzbDocument, file, range, streamName, StreamOptions(), onGap)
+
+    /** Starts streaming [file] as [options] say; see the [NamedSplits] overloads. */
+    suspend fun launchStreamFile(
+        nzbDocument: NzbDocument,
+        file: StreamableFile,
+        range: LongRange? = null,
+        streamName: String? = null,
+        options: StreamOptions,
+        onGap: ((Gap) -> Unit)? = null,
     ): WriterJob {
-        return archiveStreamingService.launchStreamFile(nzbDocument, file, range, streamName, onGap)
+        return archiveStreamingService.launchStreamFile(nzbDocument, file, range, streamName, options, onGap)
     }
 
     suspend fun streamVolume(
