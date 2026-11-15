@@ -615,6 +615,39 @@ class StreamOptionsTest {
         }
     }
 
+    /**
+     * Two pools of one connection each, the first's breaker half-open: it lets one call through, whose outcome says
+     * whether plays use the pool again. A download's fetch waits for the first pool's connection, held by a play's slow
+     * fetch, behind the plays; it must not hold that one call meanwhile, or every play goes to the second pool.
+     */
+    @Test
+    fun `a background fetch waiting on a half-open pool leaves its trial call to a play`() = runBlocking<Unit> {
+        val first = server(answer = { name -> if (name == "slow") gate.await(30, TimeUnit.SECONDS) })
+        val second = server()
+        // Time enough that nothing here times out.
+        service(first, second, connections = 1, streaming = StreamingConfig(segmentFetchTimeoutMs = 30_000)).use { service ->
+            val breaker = service.breakerOf(first)
+            val held = service.start(nzb("slow"), options = null)
+            awaitBodies(first, "slow")
+            breaker.transitionToOpenState()
+            breaker.transitionToHalfOpenState()
+            val download = service.start(nzb("saved"), StreamOptions(priority = BACKGROUND_PRIORITY))
+            awaitWaiting(first, 1)
+
+            val play = service.start(nzb("probe"), options = null)
+            withTimeout(10_000) { while (waiting(first) < 2 && second.bodiesRead.isEmpty()) delay(10) }
+            assertEquals(emptyList(), second.bodiesRead.toList(), "BODYs the second pool's server read: the play was refused the first")
+            gate.countDown()
+            assertContentEquals(contentOf("slow"), held.channel.readToEnd().first)
+            assertContentEquals(contentOf("probe"), play.channel.readToEnd().first)
+            val (saved, cause) = download.channel.readToEnd()
+            assertNull(cause, "the download failed: ${cause.chain()}")
+            assertContentEquals(contentOf("saved"), saved)
+            assertEquals(listOf("<slow@test>", "<probe@test>", "<saved@test>"), first.bodiesRead.toList(), "BODYs the first pool's server read")
+            assertEquals(CircuitBreaker.State.CLOSED, breaker.state, "the first pool's breaker, its trial call served")
+        }
+    }
+
     /** What the pool says when its own wait for a connection (30 s, and as long again on its retry) runs out. */
     private fun poolWaitRanOut() = NntpConnectionException("Timed out waiting for connection to 127.0.0.1:119 (30000ms)")
 

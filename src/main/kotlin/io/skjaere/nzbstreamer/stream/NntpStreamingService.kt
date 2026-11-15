@@ -1797,9 +1797,15 @@ class NntpStreamingService(
         var anyAttempted = false
         // Pools their open breaker passed over, never asked.
         val passedOver = mutableListOf<IndexedValue<PoolEntry>>()
+        // A fetch below STREAMING may wait long for a connection, so it never takes a half-open breaker's one trial call,
+        // which a play or a check needs to put the pool back in use: it asks that pool without the breaker. Nor does it
+        // ask an open breaker for a permit, which moves it to half-open once its wait is over and takes that call.
+        val background = priority < NntpPriority.STREAMING.value
         suspend fun fetchFrom(entries: List<IndexedValue<PoolEntry>>, useBreakers: Boolean): ByteArray? = entries.firstNotNullOfOrNull { (index, entry) ->
-            val breaker = if (useBreakers) circuitBreakerFor(entry) else null
-            if (breaker != null && !breaker.tryAcquirePermission()) {
+            val gate = if (useBreakers) circuitBreakerFor(entry) else null
+            val state = gate?.state
+            val breaker = gate.takeUnless { background && state == CircuitBreaker.State.HALF_OPEN }
+            if (breaker != null && (background && state == CircuitBreaker.State.OPEN || !breaker.tryAcquirePermission())) {
                 logger.debug(
                     "Segment <{}> skipping pool[{}] ({}:{}) — circuit breaker is {}",
                     shown, index, entry.config.host, entry.config.port, breaker.state
