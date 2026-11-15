@@ -42,6 +42,7 @@ import io.skjaere.nzbstreamer.stream.StreamableFile
 import io.skjaere.nzbstreamer.stream.Tries
 import io.skjaere.nzbstreamer.stream.isPoolWaitRunOut
 import io.skjaere.nzbstreamer.stream.withConnectionWithin
+import io.skjaere.yenc.RapidYenc
 import io.skjaere.yenc.YencEncoder
 import java.io.ByteArrayOutputStream
 import java.io.IOException
@@ -321,7 +322,7 @@ class StreamOptionsTest {
      * joined the background fetch, it would wait as long, with no time limit, and fail with it.
      */
     @Test
-    fun `a play never shares a background stream's fetch of the same article, and what the stream fetches is stored`(@TempDir dir: Path) = runBlocking<Unit> {
+    fun `a play never shares a background stream's fetch of the same article`(@TempDir dir: Path) = runBlocking<Unit> {
         val server = server(answer = { name -> if (name == "slow") gate.await(30, TimeUnit.SECONDS) })
         SegmentCache(SegmentCacheConfig(dir, maxBytes = 10L * 1024 * 1024)).use { cache ->
             streamer(server, connections = 1, streaming = StreamingConfig(segmentFetchTimeoutMs = 30_000), cache = cache).use { streamer ->
@@ -339,7 +340,37 @@ class StreamOptionsTest {
                 assertContentEquals(contentOf("shared"), play.channel.readToEnd().first)
                 assertContentEquals(contentOf("shared"), prefetch.channel.readToEnd().first)
                 assertEquals(listOf("BODY <slow@test>", "BODY <shared@test>", "BODY <shared@test>"), commands.toList())
-                assertContentEquals(bytesOf("shared"), cache.get("shared@test"), "the article stored")
+            }
+        }
+    }
+
+    /** [data]'s article with the CRC its =yend line gives a bit off: a damaged copy, as a provider may hold one. */
+    private fun damaged(data: ByteArray): ByteArray {
+        fun field(crc: UInt) = "crc32=" + crc.toString(16).padStart(8, '0')
+        val crc = RapidYenc.crc32(data)
+        val article = String(YencEncoder.encodeSinglePart(data, "Harbor.Lights.mkv").data, Charsets.ISO_8859_1)
+        check(field(crc) in article) { "test setup: the article's crc32" }
+        return article.replace(field(crc), field(crc xor 1u)).toByteArray(Charsets.ISO_8859_1)
+    }
+
+    /**
+     * A background stream that stores what it fetches, alone: it shares no fetch, so it stores each article itself. A
+     * damaged copy, used for want of a good one, is never stored, so a later play asks for the article again.
+     */
+    @Test
+    fun `a background stream that stores what it fetches stores each good copy itself, and never a damaged one`(@TempDir dir: Path) = runBlocking<Unit> {
+        val server = FakeNntpServer(body = { id ->
+            val name = nameOf(id)
+            if (name == "damaged") damaged(bytesOf(name)) else YencEncoder.encodeSinglePart(bytesOf(name), "Harbor.Lights.mkv").data
+        }).also { servers += it }
+        SegmentCache(SegmentCacheConfig(dir, maxBytes = 10L * 1024 * 1024)).use { cache ->
+            streamer(server, cache = cache).use { streamer ->
+                val prefetch = streamer.start(nzb("own", "damaged"), StreamOptions(priority = BACKGROUND_PRIORITY, cache = CacheUse.READ_WRITE))
+                val (fetched, cause) = prefetch.channel.readToEnd()
+                assertNull(cause, "the stream failed: ${cause.chain()}")
+                assertContentEquals(contentOf("own", "damaged"), fetched)
+                assertContentEquals(bytesOf("own"), cache.get("own@test"), "the good copy the stream fetched, as stored")
+                assertNull(cache.get("damaged@test"), "the damaged copy was stored")
             }
         }
     }
