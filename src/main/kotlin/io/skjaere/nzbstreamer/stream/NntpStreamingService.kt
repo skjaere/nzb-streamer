@@ -1740,8 +1740,14 @@ class NntpStreamingService(
             }
             segmentCacheMisses.increment()
             // Nothing stored: a stream whose bytes go elsewhere would push out what plays keep. Nor does it join a
-            // fetch of the same article under way, which would store it.
-            if (options.cache == CacheUse.READ_ONLY) return fetchSegmentFromNntp(articleId, options.priority).bytes
+            // fetch of the same article under way, which would store it. A stream below STREAMING shares no fetch
+            // either, and stores what it gets itself: a play joining its fetch would wait as long as it does, with no
+            // time limit, and it, joining a play's, would fail with that fetch's timeout.
+            if (options.cache == CacheUse.READ_ONLY || options.priority < NntpPriority.STREAMING.value) {
+                val fetched = fetchSegmentFromNntp(articleId, options.priority)
+                if (options.cache == CacheUse.READ_WRITE && fetched.storable) segmentCache.put(articleId, fetched.bytes)
+                return fetched.bytes
+            }
             // Singleflight in SegmentCache dedupes concurrent fetches for the same article.
             val getOrFetchSample = Timer.start(registry)
             try {

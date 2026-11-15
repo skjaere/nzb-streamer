@@ -67,6 +67,7 @@ import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.currentTime
 import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.withTimeoutOrNull
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
@@ -294,6 +295,35 @@ class StreamOptionsTest {
                 val readWrite = streamer.start(nzb("played"), StreamOptions(cache = CacheUse.READ_WRITE))
                 assertContentEquals(contentOf("played"), readWrite.channel.readToEnd().first)
                 assertContentEquals(bytesOf("played"), cache.get("played@test"), "a read-write stream stores what it fetches")
+            }
+        }
+    }
+
+    /**
+     * A background stream that stores what it fetches (a prefetch) waits behind the plays for one connection, held by
+     * a play's slow fetch. A play asking for the same article then must ask the pool itself, at its own priority: had it
+     * joined the background fetch, it would wait as long, with no time limit, and fail with it.
+     */
+    @Test
+    fun `a play never shares a background stream's fetch of the same article, and what the stream fetches is stored`(@TempDir dir: Path) = runBlocking<Unit> {
+        val server = server(answer = { name -> if (name == "slow") gate.await(30, TimeUnit.SECONDS) })
+        SegmentCache(SegmentCacheConfig(dir, maxBytes = 10L * 1024 * 1024)).use { cache ->
+            streamer(server, connections = 1, streaming = StreamingConfig(segmentFetchTimeoutMs = 30_000), cache = cache).use { streamer ->
+                val held = streamer.start(nzb("slow"))
+                awaitBodies(server, "slow")
+                val prefetch = streamer.start(nzb("shared"), StreamOptions(priority = BACKGROUND_PRIORITY))
+                awaitWaiting(server, 1)
+                val play = streamer.start(nzb("shared"))
+                // Its own ask comes at once; joined to the background fetch, it never makes one.
+                withTimeoutOrNull(5_000) { while (waiting(server) < 2) delay(10) }
+                assertEquals(2, waiting(server), "fetches waiting for the connection: the play's own, or it joined the background one")
+
+                gate.countDown()
+                assertContentEquals(contentOf("slow"), held.channel.readToEnd().first)
+                assertContentEquals(contentOf("shared"), play.channel.readToEnd().first)
+                assertContentEquals(contentOf("shared"), prefetch.channel.readToEnd().first)
+                assertEquals(listOf("BODY <slow@test>", "BODY <shared@test>", "BODY <shared@test>"), commands.toList())
+                assertContentEquals(bytesOf("shared"), cache.get("shared@test"), "the article stored")
             }
         }
     }

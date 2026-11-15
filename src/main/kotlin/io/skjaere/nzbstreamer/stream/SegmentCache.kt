@@ -448,6 +448,12 @@ class SegmentCache(private val config: SegmentCacheConfig) : AutoCloseable {
         }
     }
 
+    /**
+     * Stores [bytes] as [articleId]'s, outside the single fetch [getOrFetch] shares: for a fetch that may wait long for
+     * a connection, which another stream asking for the same article must not wait on.
+     */
+    internal suspend fun put(articleId: String, bytes: ByteArray) = store(articleId, bytes)
+
     /** [leader]'s bytes, or null if it was cancelled and we weren't. */
     private suspend fun follow(leader: CompletableDeferred<ByteArray>): ByteArray? = try {
         leader.await()

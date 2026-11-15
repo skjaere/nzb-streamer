@@ -18,7 +18,8 @@ import io.skjaere.nzbstreamer.config.MissingArticlePolicy
  *   waits for each connection for as long as it takes: its waits have no limit of their own, and
  *   never count against a pool's circuit breaker or its timeouts. Its fetch on a connection has the
  *   segment fetch timeout as any, and its fetch on one pool twice that in all, counting only its
- *   time on connections.
+ *   time on connections. It never shares a fetch of an article with another stream, so a play never
+ *   waits on one of its fetches, nor it on a play's.
  * @property cache whether the stream stores what it fetches in the segment cache ([CacheUse.READ_WRITE],
  *   as every stream did) or only reads it ([CacheUse.READ_ONLY]).
  * @property missingArticles what the stream does with a segment no pool can give; null: the
