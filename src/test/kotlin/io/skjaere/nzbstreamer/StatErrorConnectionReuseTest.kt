@@ -11,6 +11,8 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.Test
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import kotlin.random.Random
 import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
@@ -56,9 +58,11 @@ class StatErrorConnectionReuseTest {
 
     @Test
     fun `STATs cancelled while their 500 is on its way leave no connection out of step for the BODYs after them`() = runBlocking<Unit> {
-        // The first STAT's 500 comes at once; the others' come later, while they are cancelled.
+        // The first STAT's 500 comes once all three STATs are in; the others' come later, while they are cancelled.
+        val statsIn = CountDownLatch(3)
         val server = server { id ->
-            if (id != "<first@test>") Thread.sleep(300)
+            statsIn.countDown()
+            if (id == "<first@test>") statsIn.await(5, TimeUnit.SECONDS) else Thread.sleep(300)
             "500 Command not recognized"
         }
         val service = service(server, maxConnections = 3)
