@@ -42,6 +42,7 @@ import io.skjaere.yenc.YencEncoder
 import java.io.ByteArrayOutputStream
 import java.io.IOException
 import java.nio.file.Path
+import java.time.Duration
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
@@ -640,6 +641,8 @@ class StreamOptionsTest {
      * Two pools of one connection each. A play's fetch holds the first one's past the timeout: its answer is held back,
      * so it times out there and goes to the second, and the pool keeps the connection while it reads off the answer
      * owed. A download's fetch waits for that connection meanwhile, and so does another play's, whose wait runs out.
+     * The first pool's breaker hears how long the download's call took on its connection, not its wait for one, which a
+     * long play makes longer than the breaker's slow-call rule (a minute).
      */
     @Test
     fun `a background fetch waits out a held connection without failing or counting against its pool`() = runBlocking<Unit> {
@@ -647,8 +650,11 @@ class StreamOptionsTest {
         val second = server()
         service(first, second, connections = 1, streaming = StreamingConfig(segmentFetchTimeoutMs = TIMEOUT_MS)).use { service ->
             val breaker = service.breakerOf(first)
+            val served = CopyOnWriteArrayList<Duration>()
+            breaker.eventPublisher.onSuccess { served += it.elapsedDuration }
             val play = service.start(nzb("slow"), options = null)
             awaitBodies(first, "slow")
+            val asked = System.nanoTime()
             val download = service.start(nzb("saved"), StreamOptions(priority = BACKGROUND_PRIORITY))
             awaitWaiting(first, 1)
             assertContentEquals(contentOf("slow"), play.channel.readToEnd().first)
@@ -657,6 +663,9 @@ class StreamOptionsTest {
             assertContentEquals(contentOf("next"), next.channel.readToEnd().first)
             assertFalse(download.job.isCompleted, "the download's fetch ended before the connection was free")
 
+            // At least the next play's wait for the connection, which ran out.
+            val waited = Duration.ofNanos(System.nanoTime() - asked)
+            assertTrue(waited >= Duration.ofMillis(TIMEOUT_MS), "the download waited $waited")
             gate.countDown()
             val (saved, cause) = download.channel.readToEnd()
             assertNull(cause, "the download failed: ${cause.chain()}")
@@ -666,6 +675,8 @@ class StreamOptionsTest {
             // The plays' two timeouts count against the first pool, and nothing of the download's.
             assertEquals(2.0, registry.counter("nzb.segments.body_timeouts", "pool.name", poolOf(first)).count(), "timeouts counted")
             assertEquals(2, breaker.metrics.numberOfFailedCalls, "failures the first pool's breaker counted")
+            // Its one call served there took a BODY's time on a loopback connection, not its wait.
+            assertTrue(served.single() < Duration.ofMillis(TIMEOUT_MS), "the download's call as the breaker heard it: $served, after a wait of $waited")
         }
     }
 
