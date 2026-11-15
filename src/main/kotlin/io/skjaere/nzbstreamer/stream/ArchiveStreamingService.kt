@@ -163,14 +163,15 @@ class ArchiveStreamingService(
     /**
      * Like the overload without [options], the stream fetching as they say: at their priority, with
      * their use of the segment cache, missing-article policy, concurrency and read-ahead. An encrypted
-     * file's stream too.
+     * file's stream too. [onGap] has no default here (null for none), so a call without options always
+     * takes the overload without them.
      */
     suspend fun launchStreamFile(
         archiveNzb: NzbDocument,
         namedSplits: NamedSplits,
         range: LongRange? = null,
         options: StreamOptions,
-        onGap: ((Gap) -> Unit)? = null,
+        onGap: ((Gap) -> Unit)?,
     ): WriterJob {
         val effectiveSplits = if (range != null) {
             adjustSplitsForRange(namedSplits.splits, range.first, range.last - range.first + 1)
@@ -540,7 +541,7 @@ class ArchiveStreamingService(
         range: LongRange? = null,
         streamName: String? = null,
         options: StreamOptions,
-        onGap: ((Gap) -> Unit)? = null,
+        onGap: ((Gap) -> Unit)?,
     ): WriterJob {
         val namedSplits = NamedSplits(file.toSplits(archiveNzb), file.totalSize, streamName ?: file.path)
         return launchStreamFile(archiveNzb, namedSplits, range, options, onGap)

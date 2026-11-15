@@ -107,10 +107,11 @@ streamer.streamFile(metadata, file, range) { channel ->
 val writer = streamer.launchStreamFile(
     metadata, file,
     options = StreamOptions(priority = StreamOptions.BACKGROUND_PRIORITY, cache = CacheUse.READ_ONLY),
+    onGap = null,
 )
 ```
 
-`StreamOptions` set how one stream fetches: its priority with the servers' connections, whether it stores what it fetches in the segment cache, its missing-article policy, concurrency and read-ahead. A null field is the streamer's own setting, and the overloads without options stream with `StreamOptions()`. A stream below `NntpPriority.STREAMING` waits for its connections as long as it takes, and those waits never count against a server's circuit breaker or its timeouts.
+`StreamOptions` set how one stream fetches: its priority with the servers' connections, whether it stores what it fetches in the segment cache, its missing-article policy, concurrency and read-ahead. A null field is the streamer's own setting, and the overloads without options stream with `StreamOptions()`. The overloads with them take `onGap` with no default, so a call without options always takes the overload it took before. A stream below `NntpPriority.STREAMING` waits for its connections as long as it takes, and those waits never count against a server's circuit breaker or its timeouts.
 
 ### Stream a raw archive volume
 

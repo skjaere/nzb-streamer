@@ -143,14 +143,15 @@ class NzbStreamer private constructor(
 
     /**
      * Like the overload without [options], the stream fetching as they say: at their priority, with
-     * their use of the segment cache, missing-article policy, concurrency and read-ahead.
+     * their use of the segment cache, missing-article policy, concurrency and read-ahead. [onGap] has
+     * no default here (null for none), so a call without options always takes the overload without them.
      */
     suspend fun launchStreamFile(
         metadata: ExtractedMetadata,
         namedSplits: NamedSplits,
         range: LongRange? = null,
         options: StreamOptions,
-        onGap: ((Gap) -> Unit)? = null,
+        onGap: ((Gap) -> Unit)?,
     ): WriterJob {
         return archiveStreamingService.launchStreamFile(metadata.orderedArchiveNzb, namedSplits, range, options, onGap)
     }
@@ -243,7 +244,7 @@ class NzbStreamer private constructor(
         range: LongRange? = null,
         streamName: String? = null,
         options: StreamOptions,
-        onGap: ((Gap) -> Unit)? = null,
+        onGap: ((Gap) -> Unit)?,
     ): WriterJob {
         return archiveStreamingService.launchStreamFile(metadata.orderedArchiveNzb, file, range, streamName, options, onGap)
     }
@@ -264,7 +265,7 @@ class NzbStreamer private constructor(
         range: LongRange? = null,
         streamName: String? = null,
         options: StreamOptions,
-        onGap: ((Gap) -> Unit)? = null,
+        onGap: ((Gap) -> Unit)?,
     ): WriterJob {
         return archiveStreamingService.launchStreamFile(nzbDocument, file, range, streamName, options, onGap)
     }

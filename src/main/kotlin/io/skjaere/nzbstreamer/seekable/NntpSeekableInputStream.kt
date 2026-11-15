@@ -38,14 +38,15 @@ private const val FORWARD_THRESHOLD_BYTES = 102400L
  * provider has, and [onGap] gets each stretch they fill as offsets in [nzb]'s files laid end to end.
  * So it is for a file's data, never its headers: those are read strictly ([SegmentRandomAccessStream]).
  * Its downloads fetch as [options] say ([StreamOptions]): at their priority, with their use of the segment
- * cache, missing-article policy, concurrency and read-ahead.
+ * cache, missing-article policy, concurrency and read-ahead. With options, [onGap] has no default (null
+ * for none), so a call without them always takes the constructor without them.
  */
 class NntpSeekableInputStream @JvmOverloads constructor(
     private val nzb: NzbDocument,
     private val streamingService: NntpStreamingService,
     end: Long = Long.MAX_VALUE,
     private val options: StreamOptions,
-    private val onGap: ((Gap) -> Unit)? = null,
+    private val onGap: ((Gap) -> Unit)?,
 ) : SeekableInputStream {
     /** Its downloads fetch as every stream did (`StreamOptions()`). */
     @JvmOverloads

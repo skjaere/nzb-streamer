@@ -20,13 +20,16 @@ import io.skjaere.nzbstreamer.config.NntpConfig
 import io.skjaere.nzbstreamer.config.SegmentCacheConfig
 import io.skjaere.nzbstreamer.config.StreamingConfig
 import io.skjaere.nzbstreamer.enrichment.VerificationResult
+import io.skjaere.nzbstreamer.metadata.ExtractedMetadata
 import io.skjaere.nzbstreamer.nzb.NzbDocument
 import io.skjaere.nzbstreamer.nzb.NzbFile
 import io.skjaere.nzbstreamer.nzb.NzbSegment
 import io.skjaere.nzbstreamer.queue.SegmentQueueService
 import io.skjaere.nzbstreamer.seekable.NntpSeekableInputStream
+import io.skjaere.nzbstreamer.stream.ArchiveStreamingService
 import io.skjaere.nzbstreamer.stream.CacheUse
 import io.skjaere.nzbstreamer.stream.Gap
+import io.skjaere.nzbstreamer.stream.NamedSplits
 import io.skjaere.nzbstreamer.stream.NntpPriority
 import io.skjaere.nzbstreamer.stream.NntpStreamingService
 import io.skjaere.nzbstreamer.stream.SegmentCache
@@ -578,7 +581,7 @@ class StreamOptionsTest {
             // A seekable stream, with options or without.
             for (stream in listOf(
                 NntpSeekableInputStream(nzb, service),
-                NntpSeekableInputStream(nzb, service, options = StreamOptions()),
+                NntpSeekableInputStream(nzb, service, options = StreamOptions(), onGap = null),
             )) {
                 val buffer = ByteArray(filled.size)
                 var at = 0
@@ -591,6 +594,27 @@ class StreamOptionsTest {
                 assertContentEquals(filled, buffer)
             }
         }
+    }
+
+    /** An argument of whatever type its place takes, as a mocking library's any() is; never called. */
+    private fun <T> anything(): T = throw AssertionError("never called")
+
+    /**
+     * Checked by compiling: each call, with an argument of any type in each place, matched one overload before the
+     * options came, and still matches only that one, as a caller stubbing them with a mocking library has it.
+     */
+    @Test
+    fun `calls with arguments of any type in the old overloads' places still pick the old overloads`() {
+        val calls = listOf<suspend () -> Any>(
+            { anything<NzbStreamer>().launchStreamFile(anything<ExtractedMetadata>(), anything<NamedSplits>(), anything(), anything()) },
+            { anything<NzbStreamer>().launchStreamFile(anything<ExtractedMetadata>(), anything<StreamableFile>(), anything(), anything(), anything()) },
+            { anything<NzbStreamer>().launchStreamFile(anything<NzbDocument>(), anything<StreamableFile>(), anything(), anything(), anything()) },
+            { anything<ArchiveStreamingService>().launchStreamFile(anything(), anything<NamedSplits>(), anything(), anything()) },
+            { anything<ArchiveStreamingService>().launchStreamFile(anything(), anything<StreamableFile>(), anything(), anything(), anything()) },
+            { anything<NntpStreamingService>().launchStreamSegments(anything(), anything(), anything(), anything(), anything(), anything(), anything()) },
+            { NntpSeekableInputStream(anything(), anything(), anything(), anything()) },
+        )
+        assertEquals(7, calls.size)
     }
 
     // A background stream's wait for a connection.
@@ -606,7 +630,7 @@ class StreamOptionsTest {
         sessions.launch {
             val queue = SegmentQueueService.createFileQueue(nzb.files.single(), 0, 0L)
             writer.complete(
-                if (options == null) launchStreamSegments(queue, name = "play") else launchStreamSegments(queue, name = "download", options = options)
+                if (options == null) launchStreamSegments(queue, name = "play") else launchStreamSegments(queue, name = "download", options = options, onGap = null)
             )
         }
         return withTimeout(10_000) { writer.await() }

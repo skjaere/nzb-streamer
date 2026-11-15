@@ -1450,6 +1450,8 @@ class NntpStreamingService(
      * Like the overload without [options], the stream fetching as they say ([StreamOptions]): at their priority, with
      * their use of the segment cache and their missing-article policy, and with their concurrency, read-ahead segments
      * and bytes where they set them, in place of [concurrency], [readAheadSegments] and [readAheadBytes].
+     * [onGap] has no default here (null for none), so a call without options always takes the overload
+     * without them.
      */
     suspend fun launchStreamSegments(
         queue: Flow<SegmentQueueItem>,
@@ -1459,7 +1461,7 @@ class NntpStreamingService(
         readAheadBytes: Long? = currentReadAheadBytes,
         initialReadAheadSegments: Int? = currentInitialReadAheadSegments,
         options: StreamOptions,
-        onGap: ((Gap) -> Unit)? = null,
+        onGap: ((Gap) -> Unit)?,
     ): WriterJob {
         val bitrate = acquireBitrateState(name)
         val writerJob = launchStreamSegments(
