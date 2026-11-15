@@ -64,6 +64,7 @@ import kotlinx.coroutines.flow.toList
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.withTimeout
 import kotlin.time.Duration.Companion.milliseconds
+import kotlin.time.Duration.Companion.nanoseconds
 import org.slf4j.LoggerFactory
 import java.io.Closeable
 import java.util.concurrent.ConcurrentHashMap
@@ -168,9 +169,10 @@ internal class Tries {
     @Volatile
     var holding = false
 
-    // When the pool first handed a try a connection (System.nanoTime), 0 before.
+    // How long the tries held connections, in all, in nanoseconds: a background call's time limit counts this, not its
+    // waits for them.
     @Volatile
-    var connectedAtNs = 0L
+    var heldNs = 0L
 
     /** What ran out, in a timeout's words, given [timeoutMs] a try. Only a try that had a connection is tried again. */
     fun ranOut(timeoutMs: Long): String {
@@ -1864,8 +1866,8 @@ class NntpStreamingService(
      * Returns null to move on to the next pool; a failure other than a clean 430 (a timeout, as a
      * [SegmentTimeoutException], a connection that dropped, a damaged copy or one that can't be
      * read) also goes to [onFailure]. The pool is asked for a connection at [priority]: below
-     * [NntpPriority.STREAMING], the wait for one has no limit ([withConnectionWithin]), and the
-     * breaker hears how long the call took from when the pool handed one over.
+     * [NntpPriority.STREAMING], the waits for one have no limit ([withConnectionWithin]), and the
+     * breaker hears how long the call held connections.
      */
     @Suppress("LongParameterList", "LongMethod")
     private suspend fun fetchFromPool(
@@ -1886,9 +1888,10 @@ class NntpStreamingService(
         // half-open with none and this pool is skipped until the process restarts.
         var settled = false
         val tries = Tries()
-        // How long the call took, for the breaker: a background fetch's wait behind the others is not the pool's.
+        // How long the call took, for the breaker: a background fetch's waits behind the others are not the pool's doing,
+        // so only its time on connections.
         val callStart = System.nanoTime()
-        fun took() = System.nanoTime() - (tries.connectedAtNs.takeIf { background && it != 0L } ?: callStart)
+        fun took() = if (background) tries.heldNs else System.nanoTime() - callStart
         return try {
             // Read inside withClient, not through pool.bodyYenc: there a connection that drops
             // mid-article fails only the Body channel's reader, outside withClient, and the
@@ -2082,11 +2085,13 @@ class NntpStreamingService(
  * the pool's fetch again after a connection dropped included, has twice [timeoutMs]. Any of them
  * running out throws a [TimeoutCancellationException]; [tries] says how they went.
  *
- * A [background] fetch (a stream below [NntpPriority.STREAMING]) waits for its first connection
- * as long as it takes: that wait has no time of its own, and the whole call's twice [timeoutMs]
- * counts from the hand-over. The pool's own wait for a connection running out (30 s, and as long
- * again on its retry) asks it again; any other failure before the hand-over (the pool closed,
- * no connection to be had) ends the call with it, as for any fetch.
+ * A [background] fetch (a stream below [NntpPriority.STREAMING]) waits for each connection as
+ * long as it takes: its first, the next try's after a timeout on one, and the pool's for its
+ * fetch again after one dropped. Those waits have no time of their own, and the call's twice
+ * [timeoutMs] counts its time on connections alone ([Tries.heldNs], read off [clock]), so what
+ * runs out of time was never waiting. The pool's own wait for a connection running out (30 s,
+ * and as long again on its retry) asks it again; any other failure before a hand-over (the pool
+ * closed, no connection to be had) ends the call with it, as for any fetch.
  */
 @Suppress("LongParameterList")
 internal suspend fun <C, T> withConnectionWithin(
@@ -2096,10 +2101,12 @@ internal suspend fun <C, T> withConnectionWithin(
     tries: Tries,
     background: Boolean,
     onRetry: () -> Unit,
+    clock: () -> Long = System::nanoTime,
     fetch: suspend (C) -> T,
 ): T {
-    // Completed once the pool has handed the call its first connection.
-    val handedOver = CompletableDeferred<Unit>()
+    val timeout = timeoutMs.milliseconds
+    // A background call's time on connections, in all.
+    val budgetNs = (timeout * 2).inWholeNanoseconds
 
     suspend fun untilServed(): T {
         while (true) {
@@ -2110,57 +2117,57 @@ internal suspend fun <C, T> withConnectionWithin(
             try {
                 return coroutineScope {
                     val call = async {
-                        lent(withClient, background, connected) { client ->
+                        lent(withClient, background) { client ->
                             if (connected.complete(Unit)) tries.connected++
-                            if (handedOver.complete(Unit)) tries.connectedAtNs = System.nanoTime()
                             tries.holding = true
+                            // A background call's fetch has what is left of its time on connections, where that is less.
+                            val limit = if (background) minOf(timeout, (budgetNs - tries.heldNs).nanoseconds) else timeout
+                            val start = clock()
                             try {
-                                withTimeout(timeoutMs.milliseconds) { fetch(client) }
+                                withTimeout(limit) { fetch(client) }
                             } catch (e: Throwable) {
                                 // Cancelled: its time ran out on this connection (or the caller's did), so it
                                 // still had one. Anything else lost it, and the pool may fetch again on another.
                                 if (e !is CancellationException) tries.holding = false
                                 throw e
+                            } finally {
+                                tries.heldNs += clock() - start
                             }
                         }
                     }
                     // A call that fails before it has a connection fails this scope, which ends the wait.
-                    if (!background) withTimeout(timeoutMs.milliseconds) { connected.await() }
+                    if (!background) withTimeout(timeout) { connected.await() }
                     call.await()
                 }
             } catch (e: TimeoutCancellationException) {
                 // Only a try that ran out of its own time on a connection goes again: the whole call's running out
-                // (or a caller's cancellation) has cancelled this coroutine too, and goes on up.
+                // (or a caller's cancellation) has cancelled this coroutine too, and goes on up, as does a
+                // background call's once its time on connections is spent.
                 currentCoroutineContext().ensureActive()
-                if (!connected.isCompleted || tries.made > retries) throw e
+                if (!connected.isCompleted || tries.made > retries || background && tries.heldNs >= budgetNs) throw e
                 onRetry()
             }
         }
     }
-    if (!background) return withTimeout(timeoutMs.milliseconds * 2) { untilServed() }
-    return coroutineScope {
-        val served = async { untilServed() }
-        // A call that fails before the hand-over fails this scope, which ends the wait.
-        handedOver.await()
-        withTimeout(timeoutMs.milliseconds * 2) { served.await() }
-    }
+    // A background call's time limit is on its connections alone, above.
+    return if (background) untilServed() else withTimeout(timeout * 2) { untilServed() }
 }
 
 /**
- * [block] on a connection [withClient] lends. For a [background] fetch, asked again while the pool's own wait for a
- * connection runs out before [connected]: its wait has no limit.
+ * [block] on a connection [withClient] lends. For a [background] fetch, asked again whenever the pool's own wait for a
+ * connection runs out, before its first hand-over or before the pool's fetch again after a connection dropped: its
+ * waits have no limit.
  */
 private suspend fun <C, T> lent(
     withClient: suspend (block: suspend (C) -> T) -> T,
     background: Boolean,
-    connected: CompletableDeferred<Unit>,
     block: suspend (C) -> T,
 ): T {
     while (true) {
         try {
             return withClient(block)
         } catch (e: NntpConnectionException) {
-            if (!background || connected.isCompleted || !e.isPoolWaitRunOut()) throw e
+            if (!background || !e.isPoolWaitRunOut()) throw e
         }
     }
 }

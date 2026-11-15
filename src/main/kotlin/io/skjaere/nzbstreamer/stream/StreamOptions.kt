@@ -15,10 +15,10 @@ import io.skjaere.nzbstreamer.config.MissingArticlePolicy
  *   higher number first, and asks of one number in turn. [NntpPriority.STREAMING] by default; prepare
  *   asks at [NntpPriority.PREPARE] and the checks at [NntpPriority.HEALTH_CHECK], so a stream at
  *   [BACKGROUND_PRIORITY] waits for every one of them. A stream below [NntpPriority.STREAMING] also
- *   waits for a connection for as long as it takes: its wait has no limit of its own, and never
- *   counts against a pool's circuit breaker or its timeouts. Its fetch on the connection has the
- *   segment fetch timeout as any, and a fetch on one pool twice that in all, counted from when the
- *   pool hands it a connection.
+ *   waits for each connection for as long as it takes: its waits have no limit of their own, and
+ *   never count against a pool's circuit breaker or its timeouts. Its fetch on a connection has the
+ *   segment fetch timeout as any, and its fetch on one pool twice that in all, counting only its
+ *   time on connections.
  * @property cache whether the stream stores what it fetches in the segment cache ([CacheUse.READ_WRITE],
  *   as every stream did) or only reads it ([CacheUse.READ_ONLY]).
  * @property missingArticles what the stream does with a segment no pool can give; null: the

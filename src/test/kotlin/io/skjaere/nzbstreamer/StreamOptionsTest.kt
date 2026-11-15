@@ -13,6 +13,7 @@ import io.skjaere.compressionutils.SplitEncryptionInfo
 import io.skjaere.compressionutils.SplitInfo
 import io.skjaere.nntp.ArticleNotFoundException
 import io.skjaere.nntp.NntpConnectionException
+import io.skjaere.nntp.NntpConnectionLostException
 import io.skjaere.nntp.YencHeaders
 import io.skjaere.nzbstreamer.config.MissingArticlePolicy
 import io.skjaere.nzbstreamer.config.NntpConfig
@@ -638,6 +639,86 @@ class StreamOptionsTest {
         assertEquals(3 * 60_000 + TIMEOUT_MS - 1, currentTime)
         assertEquals(1, tries.made)
         assertEquals(1, tries.connected)
+    }
+
+    @Test
+    fun `a background fetch waits as long as it takes for the pool's fetch again after its connection dropped`() = runTest {
+        var calls = 0
+        val tries = Tries()
+        val served = withConnectionWithin<Unit, String>(
+            // As the pool does: an article whose connection dropped is fetched again on another, once one is free.
+            withClient = { block ->
+                try {
+                    block(Unit)
+                } catch (_: NntpConnectionLostException) {
+                    delay(60_000)
+                    block(Unit)
+                }
+            },
+            timeoutMs = TIMEOUT_MS, retries = 0, tries = tries, background = true, onRetry = {},
+        ) {
+            if (++calls == 1) throw NntpConnectionLostException("Connection reset in the middle of an article")
+            "served"
+        }
+        assertEquals("served", served)
+        assertEquals(60_000, currentTime)
+        assertEquals(1, tries.made)
+    }
+
+    @Test
+    fun `a background fetch's next try after a timeout on its connection waits as long as it takes`() = runTest {
+        var asks = 0
+        var retried = 0
+        val tries = Tries()
+        val served = withConnectionWithin<Unit, String>(
+            withClient = { block ->
+                // The next try's connection comes once the plays are done with them.
+                if (++asks == 2) delay(60_000)
+                block(Unit)
+            },
+            timeoutMs = TIMEOUT_MS, retries = 1, tries = tries, background = true, onRetry = { retried++ },
+        ) {
+            if (asks == 1) awaitCancellation()
+            "served"
+        }
+        assertEquals("served", served)
+        assertEquals(1, retried, "timeouts on a connection counted")
+        assertEquals(TIMEOUT_MS + 60_000, currentTime)
+        assertEquals(2, tries.made)
+        assertEquals(2, tries.connected)
+    }
+
+    @Test
+    fun `a background fetch's time on its connections still has twice the timeout in all`() = runTest {
+        var calls = 0
+        var retried = 0
+        val tries = Tries()
+        assertFailsWith<TimeoutCancellationException> {
+            withConnectionWithin<Unit, String>(
+                // Each connection a minute coming, the pool's fetch again after one dropped included.
+                withClient = { block ->
+                    delay(60_000)
+                    try {
+                        block(Unit)
+                    } catch (_: NntpConnectionLostException) {
+                        delay(60_000)
+                        block(Unit)
+                    }
+                },
+                timeoutMs = TIMEOUT_MS, retries = 1, tries = tries, background = true, onRetry = { retried++ },
+                clock = { testScheduler.currentTime * 1_000_000 },
+            ) {
+                if (++calls == 1) {
+                    delay(400)
+                    throw NntpConnectionLostException("Connection reset in the middle of an article")
+                }
+                awaitCancellation()
+            }
+        }
+        // 400 ms on the first connection, its own 500 on the next one, and on the next try's the 100 left of the 1,000.
+        assertEquals(60_000 + 400 + 60_000 + TIMEOUT_MS + 60_000 + 100, currentTime)
+        assertEquals(1, retried, "timeouts on a connection counted before the last")
+        assertEquals(2 * TIMEOUT_MS * 1_000_000, tries.heldNs)
     }
 
     @Test

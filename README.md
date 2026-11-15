@@ -110,7 +110,7 @@ val writer = streamer.launchStreamFile(
 )
 ```
 
-`StreamOptions` set how one stream fetches: its priority with the servers' connections, whether it stores what it fetches in the segment cache, its missing-article policy, concurrency and read-ahead. A null field is the streamer's own setting, and the overloads without options stream with `StreamOptions()`. A stream below `NntpPriority.STREAMING` waits for a connection as long as it takes, and that wait never counts against a server's circuit breaker.
+`StreamOptions` set how one stream fetches: its priority with the servers' connections, whether it stores what it fetches in the segment cache, its missing-article policy, concurrency and read-ahead. A null field is the streamer's own setting, and the overloads without options stream with `StreamOptions()`. A stream below `NntpPriority.STREAMING` waits for its connections as long as it takes, and those waits never count against a server's circuit breaker or its timeouts.
 
 ### Stream a raw archive volume
 
