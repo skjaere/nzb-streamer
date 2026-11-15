@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.12.0](https://github.com/skjaere/nzb-streamer/compare/v0.11.0...v0.12.0) (2026-11-15)
+
+
+### Features
+
+* **stream:** give each stream its own options: priority, cache use, missing articles, concurrency, read-ahead ([94122e5](https://github.com/skjaere/nzb-streamer/commit/94122e5ed399ae01d8fc0f007c0db840f82d77f8))
+
+
+### Bug Fixes
+
+* **stream:** count a background fetch's time limit on its connections alone ([40cabc7](https://github.com/skjaere/nzb-streamer/commit/40cabc75021d840cb4f182d720986dca1d8a2320))
+* **stream:** keep background streams out of the segment cache's shared fetches ([480eb86](https://github.com/skjaere/nzb-streamer/commit/480eb862e2074d19aa3fe0def1ce9f5582ead2f7))
+* **stream:** keep calls without options on the old overloads, whatever their arguments' types ([e7edc65](https://github.com/skjaere/nzb-streamer/commit/e7edc6558cd76aa8b2b87ba742d404f2d87a1b63))
+* **stream:** leave a half-open breaker's trial call to plays while a background fetch waits ([f999d1a](https://github.com/skjaere/nzb-streamer/commit/f999d1a96d0ff56be25a4ca883e6506f5557725b))
+* **stream:** let a background fetch tell a half-open breaker how it went, once its call has ended ([1f24039](https://github.com/skjaere/nzb-streamer/commit/1f240393900f08e42e6f29b58571313e66f8617e))
+
 ## [0.11.0](https://github.com/skjaere/nzb-streamer/compare/v0.10.0...v0.11.0) (2026-11-12)
 
 
