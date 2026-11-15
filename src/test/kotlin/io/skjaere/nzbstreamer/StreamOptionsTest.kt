@@ -2,6 +2,7 @@ package io.skjaere.nzbstreamer
 
 import io.github.resilience4j.circuitbreaker.CircuitBreaker
 import io.github.resilience4j.circuitbreaker.CircuitBreakerRegistry
+import io.ktor.network.selector.SelectorManager
 import io.ktor.utils.io.ByteReadChannel
 import io.ktor.utils.io.WriterJob
 import io.ktor.utils.io.readAvailable
@@ -12,6 +13,8 @@ import io.skjaere.compressionutils.Rar5Crypto
 import io.skjaere.compressionutils.SplitEncryptionInfo
 import io.skjaere.compressionutils.SplitInfo
 import io.skjaere.nntp.ArticleNotFoundException
+import io.skjaere.nntp.NntpClient
+import io.skjaere.nntp.NntpClientPool
 import io.skjaere.nntp.NntpConnectionException
 import io.skjaere.nntp.NntpConnectionLostException
 import io.skjaere.nntp.YencHeaders
@@ -37,6 +40,7 @@ import io.skjaere.nzbstreamer.stream.StreamOptions
 import io.skjaere.nzbstreamer.stream.StreamOptions.Companion.BACKGROUND_PRIORITY
 import io.skjaere.nzbstreamer.stream.StreamableFile
 import io.skjaere.nzbstreamer.stream.Tries
+import io.skjaere.nzbstreamer.stream.isPoolWaitRunOut
 import io.skjaere.nzbstreamer.stream.withConnectionWithin
 import io.skjaere.yenc.YencEncoder
 import java.io.ByteArrayOutputStream
@@ -69,6 +73,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.currentTime
+import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.withTimeoutOrNull
@@ -737,6 +742,45 @@ class StreamOptionsTest {
         assertEquals(3 * 60_000 + TIMEOUT_MS - 1, currentTime)
         assertEquals(1, tries.made)
         assertEquals(1, tries.connected)
+    }
+
+    /**
+     * The pool's own wait for a connection (30 s, and as long again on its retry), run out on a real pool of one
+     * connection, on virtual time: a background fetch asks again on that failure alone, told by its message, so the
+     * message must be what the pool throws. A background fetch through the pool then waits out a holder of minutes.
+     */
+    @Test
+    fun `a background fetch asks a real pool again when the pool's own wait for a connection runs out`() {
+        val server = server()
+        val selector = SelectorManager(Dispatchers.IO)
+        val poolScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+        val pool = NntpClientPool("127.0.0.1", server.port, selector, maxConnections = 1, scope = poolScope)
+        try {
+            // Its connection made before the virtual clock starts, which would skip a connect's real wait.
+            runBlocking { pool.withClient { } }
+            runTest {
+                val holder = launch { pool.withClient { awaitCancellation() } }
+                runCurrent()
+                val ranOut = assertFailsWith<NntpConnectionException> { pool.withClient(BACKGROUND_PRIORITY) { } }
+                assertTrue(ranOut.isPoolWaitRunOut(), "what the pool threw: $ranOut")
+                assertEquals(2 * NntpClientPool.ACQUIRE_TIMEOUT_MS, currentTime)
+
+                launch {
+                    delay(150_000)
+                    holder.cancel()
+                }
+                val served = withConnectionWithin<NntpClient, String>(
+                    withClient = { block -> pool.withClient(BACKGROUND_PRIORITY, block) },
+                    timeoutMs = TIMEOUT_MS, retries = 0, tries = Tries(), background = true, onRetry = {},
+                ) { "served" }
+                assertEquals("served", served)
+                assertEquals(2 * NntpClientPool.ACQUIRE_TIMEOUT_MS + 150_000, currentTime)
+            }
+        } finally {
+            pool.close()
+            poolScope.cancel()
+            selector.close()
+        }
     }
 
     @Test
