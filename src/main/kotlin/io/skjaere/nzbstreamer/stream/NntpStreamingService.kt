@@ -81,6 +81,9 @@ private const val STAT_CHUNK_MIN = 32
 /** How a stream fetches unless it says otherwise: as every stream did. */
 private val DEFAULT_OPTIONS = StreamOptions()
 
+/** A breaker's states that refuse every call: a pool a background fetch passes over without asking for a permit. */
+private val OPEN_STATES = setOf(CircuitBreaker.State.OPEN, CircuitBreaker.State.FORCED_OPEN)
+
 /** What a stream's read-ahead in bytes ([StreamingConfig.readAheadBytes]) is counted in. */
 private const val HELD_UNIT_BYTES = 64L * 1024
 
@@ -1805,18 +1808,23 @@ class NntpStreamingService(
         var anyAttempted = false
         // Pools their open breaker passed over, never asked.
         val passedOver = mutableListOf<IndexedValue<PoolEntry>>()
-        // A fetch below STREAMING may wait long for a connection, so it never takes a half-open breaker's one trial call,
-        // which a play or a check needs to put the pool back in use: it asks that pool without the breaker. Nor does it
-        // ask an open breaker for a permit, which moves it to half-open once its wait is over and takes that call.
+        // A fetch below STREAMING may wait long for a connection, so it holds no permit while it waits: a half-open
+        // breaker's one trial call, held that long, would send every play to the next pool meanwhile. It asks the pool
+        // without one and tells the breaker how it went at its end, if the breaker lets a call through then
+        // ([fetchFromPool]). It passes an open breaker's pool over without asking for a permit, which moves the breaker
+        // to half-open once its wait is over and takes that call.
         val background = priority < NntpPriority.STREAMING.value
         suspend fun fetchFrom(entries: List<IndexedValue<PoolEntry>>, useBreakers: Boolean): ByteArray? = entries.firstNotNullOfOrNull { (index, entry) ->
-            val gate = if (useBreakers) circuitBreakerFor(entry) else null
-            val state = gate?.state
-            val breaker = gate.takeUnless { background && state == CircuitBreaker.State.HALF_OPEN }
-            if (breaker != null && (background && state == CircuitBreaker.State.OPEN || !breaker.tryAcquirePermission())) {
+            val breaker = if (useBreakers) circuitBreakerFor(entry) else null
+            val refused = when {
+                breaker == null -> false
+                background -> breaker.state in OPEN_STATES
+                else -> !breaker.tryAcquirePermission()
+            }
+            if (refused) {
                 logger.debug(
                     "Segment <{}> skipping pool[{}] ({}:{}) — circuit breaker is {}",
-                    shown, index, entry.config.host, entry.config.port, breaker.state
+                    shown, index, entry.config.host, entry.config.port, breaker?.state
                 )
                 segmentsFallback.increment()
                 passedOver += IndexedValue(index, entry)
@@ -1881,7 +1889,9 @@ class NntpStreamingService(
      * [SegmentTimeoutException], a connection that dropped, a damaged copy or one that can't be
      * read) also goes to [onFailure]. The pool is asked for a connection at [priority]: below
      * [NntpPriority.STREAMING], the waits for one have no limit ([withConnectionWithin]), and the
-     * breaker hears how long the call held connections.
+     * breaker hears how long the call held connections. Such a call holds no permit of [breaker]'s:
+     * it asks for one once it has ended, and the breaker hears how it went only if it lets a call
+     * through then.
      */
     @Suppress("LongParameterList", "LongMethod")
     private suspend fun fetchFromPool(
@@ -1899,13 +1909,18 @@ class NntpStreamingService(
         // Set once the breaker has heard how the call went. Any other way out (cancelled as the
         // reader seeks or stops, the pool closed, an error no arm below expects) hands the permit
         // back in the finally: a HALF_OPEN breaker has one, and if it's kept, the breaker stays
-        // half-open with none and this pool is skipped until the process restarts.
+        // half-open with none and this pool is skipped until the process restarts. A background
+        // call holds none to hand back.
         var settled = false
         val tries = Tries()
         // How long the call took, for the breaker: a background fetch's waits behind the others are not the pool's doing,
         // so only its time on connections.
         val callStart = System.nanoTime()
         fun took() = if (background) tries.heldNs else System.nanoTime() - callStart
+        // The breaker to tell how the call went. A play's call took its permit before it asked the pool; a background
+        // call asks for one now it has ended, so that a download running alone still opens a half-open breaker again or
+        // closes it. Refused (a play's trial call under way, or the breaker open again), the breaker hears nothing of it.
+        fun told(): CircuitBreaker? = if (background) breaker?.takeIf { it.tryAcquirePermission() } else breaker
         return try {
             // Read inside withClient, not through pool.bodyYenc: there a connection that drops
             // mid-article fails only the Body channel's reader, outside withClient, and the
@@ -1926,7 +1941,7 @@ class NntpStreamingService(
             ) { client ->
                 client.bodyYencBytes("<$articleId>").data
             }
-            breaker?.onResult(
+            told()?.onResult(
                 took(),
                 java.util.concurrent.TimeUnit.NANOSECONDS,
                 payload,
@@ -1979,7 +1994,7 @@ class NntpStreamingService(
             val poolName = entry.name
             val what = tries.ranOut(timeoutMs)
             val timeout = SegmentTimeoutException(articleId, timeoutMs, "Segment <$shown> $what on pool[$index] ($poolName)", e)
-            breaker?.onError(
+            told()?.onError(
                 took(),
                 java.util.concurrent.TimeUnit.NANOSECONDS,
                 timeout,
@@ -2004,7 +2019,7 @@ class NntpStreamingService(
             }
             null
         } catch (e: NntpException) {
-            breaker?.onError(
+            told()?.onError(
                 took(),
                 java.util.concurrent.TimeUnit.NANOSECONDS,
                 e,
@@ -2028,7 +2043,7 @@ class NntpStreamingService(
             }
             null
         } catch (e: IOException) {
-            breaker?.onError(
+            told()?.onError(
                 took(),
                 java.util.concurrent.TimeUnit.NANOSECONDS,
                 e,
@@ -2051,7 +2066,7 @@ class NntpStreamingService(
             }
             null
         } finally {
-            if (!settled) breaker?.releasePermission()
+            if (!settled && !background) breaker?.releasePermission()
         }
     }
 

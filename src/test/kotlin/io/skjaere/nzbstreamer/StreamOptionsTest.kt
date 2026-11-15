@@ -126,9 +126,15 @@ class StreamOptionsTest {
 
     /**
      * Serves `<name@test>` as [bytesOf] name, [size] bytes, and finds it to a STAT, but answers 430 for the names
-     * [lacks] picks; [answer] runs before each BODY's answer and may block.
+     * [lacks] picks; [answer] runs before each BODY's answer and may block. A connection drops part way through an
+     * article whose name [dropAfter] gives a byte count for, after that many bytes.
      */
-    private fun server(size: Int = segmentSize, lacks: (String) -> Boolean = { false }, answer: (String) -> Unit = {}) = FakeNntpServer(
+    private fun server(
+        size: Int = segmentSize,
+        lacks: (String) -> Boolean = { false },
+        dropAfter: (String) -> Int? = { null },
+        answer: (String) -> Unit = {},
+    ) = FakeNntpServer(
         stat = { id ->
             commands += "STAT $id"
             !lacks(nameOf(id))
@@ -139,6 +145,7 @@ class StreamOptionsTest {
             answer(name)
             if (lacks(name)) null else YencEncoder.encodeSinglePart(bytesOf(name, size), "Harbor.Lights.mkv").data
         },
+        dropAfter = { id -> dropAfter(nameOf(id)) },
     ).also { servers += it }
 
     private fun config(server: FakeNntpServer, connections: Int) =
@@ -715,6 +722,50 @@ class StreamOptionsTest {
             assertContentEquals(contentOf("saved"), saved)
             assertEquals(listOf("<slow@test>", "<probe@test>", "<saved@test>"), first.bodiesRead.toList(), "BODYs the first pool's server read")
             assertEquals(CircuitBreaker.State.CLOSED, breaker.state, "the first pool's breaker, its trial call served")
+        }
+    }
+
+    /**
+     * Two pools, the first's breaker half-open, and no play, prepare or check running, as through a night's download:
+     * only a download's fetches ask the first pool, so their outcome must reach its breaker, though none held its one
+     * trial call while it waited. The first pool drops each connection part way through an article: one download's
+     * fetch there opens its breaker again, and the next download's goes straight to the second pool.
+     */
+    @Test
+    fun `a background fetch alone opens a half-open breaker again when its pool still fails`() = runBlocking<Unit> {
+        val first = server(dropAfter = { 100 })
+        val second = server()
+        service(first, second, connections = 1).use { service ->
+            val breaker = service.breakerOf(first)
+            breaker.transitionToOpenState()
+            breaker.transitionToHalfOpenState()
+            val download = service.start(nzb("saved0"), StreamOptions(priority = BACKGROUND_PRIORITY))
+            val (saved, cause) = download.channel.readToEnd()
+            assertNull(cause, "the download failed: ${cause.chain()}")
+            assertContentEquals(contentOf("saved0"), saved)
+            assertEquals(CircuitBreaker.State.OPEN, breaker.state, "the first pool's breaker, after the download's fetch failed there")
+
+            val next = service.start(nzb("saved1"), StreamOptions(priority = BACKGROUND_PRIORITY))
+            assertContentEquals(contentOf("saved1"), next.channel.readToEnd().first)
+            assertFalse("<saved1@test>" in first.bodiesRead, "the first pool was asked for the next download's article")
+            assertEquals(listOf("<saved0@test>", "<saved1@test>"), second.bodiesRead.toList(), "BODYs the second pool's server read")
+        }
+    }
+
+    /** As above, the first pool healthy again: a download's fetch served there puts it back in use. */
+    @Test
+    fun `a background fetch alone closes a half-open breaker when its pool serves it`() = runBlocking<Unit> {
+        val first = server()
+        val second = server()
+        service(first, second, connections = 1).use { service ->
+            val breaker = service.breakerOf(first)
+            breaker.transitionToOpenState()
+            breaker.transitionToHalfOpenState()
+            val download = service.start(nzb("saved"), StreamOptions(priority = BACKGROUND_PRIORITY))
+            assertContentEquals(contentOf("saved"), download.channel.readToEnd().first)
+            assertEquals(listOf("<saved@test>"), first.bodiesRead.toList(), "BODYs the first pool's server read")
+            assertEquals(emptyList(), second.bodiesRead.toList(), "BODYs the second pool's server read")
+            assertEquals(CircuitBreaker.State.CLOSED, breaker.state, "the first pool's breaker, after the download's fetch was served there")
         }
     }
 
